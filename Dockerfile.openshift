@@ -8,6 +8,8 @@ FROM registry.svc.ci.openshift.org/ocp/4.7:base
 # Get mkfs & blkid
 RUN yum update -y && \
     yum install --setopt=tsflags=nodocs -y e2fsprogs xfsprogs util-linux && \
-    yum clean all && rm -rf /var/cache/yum/*
+    yum clean all && rm -rf /var/cache/yum/* && \
+    mkdir -p /lib/udev_containerized && cp /usr/lib/udev/scsi_id /lib/udev_containerized/scsi_id # The driver assumes this path
+
 COPY --from=builder /go/src/github.com/kubernetes-sigs/gcp-compute-persistent-disk-csi-driver/bin/gce-pd-csi-driver  /usr/bin/
 ENTRYPOINT ["/usr/bin/gce-pd-csi-driver"]
