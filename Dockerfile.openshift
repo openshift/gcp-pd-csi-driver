@@ -7,7 +7,7 @@ RUN make gce-pd-driver
 FROM registry.svc.ci.openshift.org/ocp/4.7:base
 # Get mkfs & blkid
 RUN yum update -y && \
-    yum install --setopt=tsflags=nodocs -y e2fsprogs xfsprogs util-linux && \
+    yum install --setopt=tsflags=nodocs -y e2fsprogs xfsprogs util-linux systemd-udev && \
     yum clean all && rm -rf /var/cache/yum/* && \
     mkdir -p /lib/udev_containerized && cp /usr/lib/udev/scsi_id /lib/udev_containerized/scsi_id # The driver assumes this path
 
