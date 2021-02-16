@@ -462,6 +462,8 @@ k8s.io/client-go/util/homedir
 k8s.io/client-go/util/jsonpath
 k8s.io/client-go/util/keyutil
 k8s.io/client-go/util/workqueue
+# k8s.io/component-base v0.18.0 => k8s.io/component-base v0.18.0
+k8s.io/component-base/cli/flag
 # k8s.io/klog v1.0.0
 k8s.io/klog
 # k8s.io/kubernetes v1.18.0
