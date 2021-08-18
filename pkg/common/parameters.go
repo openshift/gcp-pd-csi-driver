@@ -125,9 +125,6 @@ func ExtractAndDefaultParameters(parameters map[string]string, driverName string
 	if len(p.Tags) > 0 {
 		p.Tags[tagKeyCreatedBy] = driverName
 	}
-	for k, v := range extraVolumeLabels {
-		p.Labels[k] = v
-	}
 	return p, nil
 }
 

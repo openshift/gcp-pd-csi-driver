@@ -58,7 +58,6 @@ func init() {
 }
 
 func main() {
-	flag.Var(cliflag.NewMapStringString(&extraVolumeLabels), "extra-labels", "Extra labels to attach to each PD created. It is a comma separated list of key value pairs like '<key1>=<value1>,<key2>=<value2>'")
 	flag.Parse()
 	rand.Seed(time.Now().UnixNano())
 	handle()
