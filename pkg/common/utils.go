@@ -18,6 +18,7 @@ package common
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/GoogleCloudPlatform/k8s-cloud-provider/pkg/cloud/meta"
@@ -38,20 +39,42 @@ const (
 	// Snapshot ID
 	snapshotTotalElements = 5
 	snapshotTopologyKey   = 2
+	snapshotProjectKey    = 1
 
 	// Node ID Expected Format
 	// "projects/{projectName}/zones/{zoneName}/disks/{diskName}"
 	nodeIDFmt           = "projects/%s/zones/%s/instances/%s"
+	nodeIDProjectValue  = 1
 	nodeIDZoneValue     = 3
 	nodeIDNameValue     = 5
 	nodeIDTotalElements = 6
 
 	regionalDeviceNameSuffix = "_regional"
+
+	// Snapshot storage location format
+	// Reference: https://cloud.google.com/storage/docs/locations
+	// Example: us
+	multiRegionalLocationFmt = "^[a-z]+$"
+	// Example: us-east1
+	regionalLocationFmt = "^[a-z]+-[a-z]+[0-9]$"
 )
 
-func BytesToGb(bytes int64) int64 {
+var (
+	multiRegionalPattern = regexp.MustCompile(multiRegionalLocationFmt)
+	regionalPattern      = regexp.MustCompile(regionalLocationFmt)
+)
+
+func BytesToGbRoundDown(bytes int64) int64 {
 	// TODO: Throw an error when div to 0
 	return bytes / (1024 * 1024 * 1024)
+}
+
+func BytesToGbRoundUp(bytes int64) int64 {
+	re := bytes / (1024 * 1024 * 1024)
+	if (bytes % (1024 * 1024 * 1024)) != 0 {
+		re++
+	}
+	return re
 }
 
 func GbToBytes(Gb int64) int64 {
@@ -59,17 +82,17 @@ func GbToBytes(Gb int64) int64 {
 	return Gb * 1024 * 1024 * 1024
 }
 
-func VolumeIDToKey(id string) (*meta.Key, error) {
+func VolumeIDToKey(id string) (string, *meta.Key, error) {
 	splitId := strings.Split(id, "/")
 	if len(splitId) != volIDTotalElements {
-		return nil, fmt.Errorf("failed to get id components. Expected projects/{project}/zones/{zone}/disks/{name}. Got: %s", id)
+		return "", nil, fmt.Errorf("failed to get id components. Expected projects/{project}/zones/{zone}/disks/{name}. Got: %s", id)
 	}
 	if splitId[volIDToplogyKey] == "zones" {
-		return meta.ZonalKey(splitId[volIDDiskNameValue], splitId[volIDToplogyValue]), nil
+		return splitId[nodeIDProjectValue], meta.ZonalKey(splitId[volIDDiskNameValue], splitId[volIDToplogyValue]), nil
 	} else if splitId[volIDToplogyKey] == "regions" {
-		return meta.RegionalKey(splitId[volIDDiskNameValue], splitId[volIDToplogyValue]), nil
+		return splitId[nodeIDProjectValue], meta.RegionalKey(splitId[volIDDiskNameValue], splitId[volIDToplogyValue]), nil
 	} else {
-		return nil, fmt.Errorf("could not get id components, expected either zones or regions, got: %v", splitId[volIDToplogyKey])
+		return "", nil, fmt.Errorf("could not get id components, expected either zones or regions, got: %v", splitId[volIDToplogyKey])
 	}
 }
 
@@ -91,15 +114,15 @@ func GenerateUnderspecifiedVolumeID(diskName string, isZonal bool) string {
 	return fmt.Sprintf(volIDRegionalFmt, UnspecifiedValue, UnspecifiedValue, diskName)
 }
 
-func SnapshotIDToKey(id string) (string, error) {
+func SnapshotIDToProjectKey(id string) (string, string, error) {
 	splitId := strings.Split(id, "/")
 	if len(splitId) != snapshotTotalElements {
-		return "", fmt.Errorf("failed to get id components. Expected projects/{project}/global/snapshot/{name}. Got: %s", id)
+		return "", "", fmt.Errorf("failed to get id components. Expected projects/{project}/global/snapshot/{name}. Got: %s", id)
 	}
 	if splitId[snapshotTopologyKey] == "global" {
-		return splitId[snapshotTotalElements-1], nil
+		return splitId[snapshotProjectKey], splitId[snapshotTotalElements-1], nil
 	} else {
-		return "", fmt.Errorf("could not get id components, expected global, got: %v", splitId[snapshotTopologyKey])
+		return "", "", fmt.Errorf("could not get id components, expected global, got: %v", splitId[snapshotTopologyKey])
 	}
 }
 
@@ -147,4 +170,71 @@ func CreateNodeID(project, zone, name string) string {
 
 func CreateZonalVolumeID(project, zone, name string) string {
 	return fmt.Sprintf(volIDZonalFmt, project, zone, name)
+}
+
+// ConvertLabelsStringToMap converts the labels from string to map
+// example: "key1=value1,key2=value2" gets converted into {"key1": "value1", "key2": "value2"}
+// See https://cloud.google.com/compute/docs/labeling-resources#label_format for details.
+func ConvertLabelsStringToMap(labels string) (map[string]string, error) {
+	const labelsDelimiter = ","
+	const labelsKeyValueDelimiter = "="
+
+	labelsMap := make(map[string]string)
+	if labels == "" {
+		return labelsMap, nil
+	}
+
+	regexKey, _ := regexp.Compile(`^\p{Ll}[\p{Ll}0-9_-]{0,62}$`)
+	checkLabelKeyFn := func(key string) error {
+		if !regexKey.MatchString(key) {
+			return fmt.Errorf("label value %q is invalid (should start with lowercase letter / lowercase letter, digit, _ and - chars are allowed / 1-63 characters", key)
+		}
+		return nil
+	}
+
+	regexValue, _ := regexp.Compile(`^[\p{Ll}0-9_-]{0,63}$`)
+	checkLabelValueFn := func(value string) error {
+		if !regexValue.MatchString(value) {
+			return fmt.Errorf("label value %q is invalid (lowercase letter, digit, _ and - chars are allowed / 0-63 characters", value)
+		}
+
+		return nil
+	}
+
+	keyValueStrings := strings.Split(labels, labelsDelimiter)
+	for _, keyValue := range keyValueStrings {
+		keyValue := strings.Split(keyValue, labelsKeyValueDelimiter)
+
+		if len(keyValue) != 2 {
+			return nil, fmt.Errorf("labels %q are invalid, correct format: 'key1=value1,key2=value2'", labels)
+		}
+
+		key := strings.TrimSpace(keyValue[0])
+		if err := checkLabelKeyFn(key); err != nil {
+			return nil, err
+		}
+
+		value := strings.TrimSpace(keyValue[1])
+		if err := checkLabelValueFn(value); err != nil {
+			return nil, err
+		}
+
+		labelsMap[key] = value
+	}
+
+	const maxNumberOfLabels = 64
+	if len(labelsMap) > maxNumberOfLabels {
+		return nil, fmt.Errorf("more than %d labels is not allowed, given: %d", maxNumberOfLabels, len(labelsMap))
+	}
+
+	return labelsMap, nil
+}
+
+// ProcessStorageLocations trims and normalizes storage location to lower letters.
+func ProcessStorageLocations(storageLocations string) ([]string, error) {
+	normalizedLoc := strings.ToLower(strings.TrimSpace(storageLocations))
+	if !multiRegionalPattern.MatchString(normalizedLoc) && !regionalPattern.MatchString(normalizedLoc) {
+		return []string{}, fmt.Errorf("invalid location for snapshot: %q", storageLocations)
+	}
+	return []string{normalizedLoc}, nil
 }

@@ -292,6 +292,46 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		}()
 	})
 
+	It("Should create and delete disk with labels", func() {
+		Expect(testContexts).ToNot(BeEmpty())
+		testContext := getRandomTestContext()
+
+		p, z, _ := testContext.Instance.GetIdentity()
+		client := testContext.Client
+
+		// Create Disk
+		volName := testNamePrefix + string(uuid.NewUUID())
+		params := map[string]string{
+			common.ParameterKeyLabels: "key1=value1,key2=value2",
+		}
+		volID, err := client.CreateVolume(volName, params, defaultSizeGb, nil)
+		Expect(err).To(BeNil(), "CreateVolume failed with error: %v", err)
+
+		// Validate Disk Created
+		cloudDisk, err := computeService.Disks.Get(p, z, volName).Do()
+		Expect(err).To(BeNil(), "Could not get disk from cloud directly")
+		Expect(cloudDisk.Type).To(ContainSubstring(standardDiskType))
+		Expect(cloudDisk.Status).To(Equal(readyState))
+		Expect(cloudDisk.SizeGb).To(Equal(defaultSizeGb))
+		Expect(cloudDisk.Labels).To(Equal(map[string]string{
+			"key1": "value1",
+			"key2": "value2",
+			// The label below is added as an --extra-label driver command line argument.
+			testutils.DiskLabelKey: testutils.DiskLabelValue,
+		}))
+		Expect(cloudDisk.Name).To(Equal(volName))
+
+		defer func() {
+			// Delete Disk
+			err := client.DeleteVolume(volID)
+			Expect(err).To(BeNil(), "DeleteVolume failed")
+
+			// Validate Disk Deleted
+			_, err = computeService.Disks.Get(p, z, volName).Do()
+			Expect(gce.IsGCEError(err, "notFound")).To(BeTrue(), "Expected disk to not be found")
+		}()
+	})
+
 	// Test volume already exists idempotency
 
 	// Test volume with op pending
@@ -508,10 +548,10 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		nodeID := testContext.Instance.GetNodeID()
 
 		_, volID := createAndValidateUniqueZonalDisk(client, p, z)
-		defer deleteVolumeOrError(client, volID, p)
+		defer deleteVolumeOrError(client, volID)
 
 		_, secondVolID := createAndValidateUniqueZonalDisk(client, p, z)
-		defer deleteVolumeOrError(client, secondVolID, p)
+		defer deleteVolumeOrError(client, secondVolID)
 
 		// Attach volID to current instance
 		err := client.ControllerPublishVolume(volID, nodeID)
@@ -781,6 +821,61 @@ var _ = Describe("GCE PD CSI Driver", func() {
 			Expect(gce.IsGCEError(err, "notFound")).To(BeTrue(), "Expected disk to not be found")
 		}()
 	})
+
+	// Use the region of the test location.
+	It("Should successfully create snapshot with storage locations", func() {
+		testContext := getRandomTestContext()
+
+		p, z, _ := testContext.Instance.GetIdentity()
+		client := testContext.Client
+
+		// Create Disk
+		volName, volID := createAndValidateUniqueZonalDisk(client, p, z)
+
+		// Create Snapshot
+		snapshotName := testNamePrefix + string(uuid.NewUUID())
+
+		// Convert GCP zone to region, e.g. us-central1-a => us-central1
+		// This is safe because we hardcode the zones.
+		snapshotLocation := z[:len(z)-2]
+
+		snapshotParams := map[string]string{common.ParameterKeyStorageLocations: snapshotLocation}
+		snapshotID, err := client.CreateSnapshot(snapshotName, volID, snapshotParams)
+		Expect(err).To(BeNil(), "CreateSnapshot failed with error: %v", err)
+
+		// Validate Snapshot Created
+		snapshot, err := computeService.Snapshots.Get(p, snapshotName).Do()
+		Expect(err).To(BeNil(), "Could not get snapshot from cloud directly")
+		Expect(snapshot.Name).To(Equal(snapshotName))
+
+		err = wait.Poll(10*time.Second, 3*time.Minute, func() (bool, error) {
+			snapshot, err := computeService.Snapshots.Get(p, snapshotName).Do()
+			Expect(err).To(BeNil(), "Could not get snapshot from cloud directly")
+			if snapshot.Status == "READY" {
+				return true, nil
+			}
+			return false, nil
+		})
+		Expect(err).To(BeNil(), "Could not wait for snapshot be ready")
+
+		defer func() {
+			// Delete Disk
+			err := client.DeleteVolume(volID)
+			Expect(err).To(BeNil(), "DeleteVolume failed")
+
+			// Validate Disk Deleted
+			_, err = computeService.Disks.Get(p, z, volName).Do()
+			Expect(gce.IsGCEError(err, "notFound")).To(BeTrue(), "Expected disk to not be found")
+
+			// Delete Snapshot
+			err = client.DeleteSnapshot(snapshotID)
+			Expect(err).To(BeNil(), "DeleteSnapshot failed")
+
+			// Validate Snapshot Deleted
+			_, err = computeService.Snapshots.Get(p, snapshotName).Do()
+			Expect(gce.IsGCEError(err, "notFound")).To(BeTrue(), "Expected snapshot to not be found")
+		}()
+	})
 })
 
 func equalWithinEpsilon(a, b, epsiolon int64) bool {
@@ -814,13 +909,13 @@ func createAndValidateUniqueZonalDisk(client *remote.CsiClient, project, zone st
 	return
 }
 
-func deleteVolumeOrError(client *remote.CsiClient, volID, project string) {
+func deleteVolumeOrError(client *remote.CsiClient, volID string) {
 	// Delete Disk
 	err := client.DeleteVolume(volID)
 	Expect(err).To(BeNil(), "DeleteVolume failed")
 
 	// Validate Disk Deleted
-	key, err := common.VolumeIDToKey(volID)
+	project, key, err := common.VolumeIDToKey(volID)
 	Expect(err).To(BeNil(), "Failed to conver volume ID To key")
 	_, err = computeService.Disks.Get(project, key.Zone, key.Name).Do()
 	Expect(gce.IsGCEError(err, "notFound")).To(BeTrue(), "Expected disk to not be found")

@@ -23,6 +23,14 @@ Kubernetes 1.17+.
     kubectl create -f ./examples/kubernetes/snapshot/default-volumesnapshotclass.yaml
     ```
 
+  To place the snapshot in a [custom storage location](https://cloud.google.com/compute/docs/disks/snapshots#custom_location),
+  edit `volumesnapshotclass-storage-locations.yaml` to change the `storage-locations` parameter to a location of your
+  choice, and then create the `VolumeSnapshotClass`.
+
+    ```console
+    kubectl create -f ./examples/kubernetes/snapshot/volumesnapshotclass-storage-locations.yaml
+    ```
+
 1. Create source PVC
 
     ```console
@@ -245,7 +253,7 @@ snapshot-controller and PD CSI driver:
   * gke.gcr.io/csi-attacher:v2.1.1-gke.0
   * gke.gcr.io/csi-resizer:v0.4.0-gke.0
   * gke.gcr.io/csi-snapshotter:v2.1.1-gke.0
-  * gke.gcr.io/gcp-compute-persistent-disk-csi-driver:v0.7.0-gke.0
+  * k8s.gcr.io/cloud-provider-gcp/gcp-compute-persistent-disk-csi-driver:v1.2.1
 
 #### Migrating by Restoring from a Manually Provisioned Snapshot
 

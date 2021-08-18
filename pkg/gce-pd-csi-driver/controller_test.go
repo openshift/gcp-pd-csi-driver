@@ -84,6 +84,7 @@ func TestCreateSnapshotArguments(t *testing.T) {
 			req: &csi.CreateSnapshotRequest{
 				Name:           name,
 				SourceVolumeId: testVolumeID,
+				Parameters:     map[string]string{common.ParameterKeyStorageLocations: " US-WEST2"},
 			},
 			seedDisks: []*gce.CloudDisk{
 				createZonalCloudDisk(name),
@@ -125,6 +126,30 @@ func TestCreateSnapshotArguments(t *testing.T) {
 			req: &csi.CreateSnapshotRequest{
 				Name:           name,
 				SourceVolumeId: "/test/wrongname",
+			},
+			expErrCode: codes.InvalidArgument,
+		},
+		{
+			name: "invalid snapshot parameter key",
+			req: &csi.CreateSnapshotRequest{
+				Name:           name,
+				SourceVolumeId: testVolumeID,
+				Parameters:     map[string]string{"bad-key": ""},
+			},
+			seedDisks: []*gce.CloudDisk{
+				createZonalCloudDisk(name),
+			},
+			expErrCode: codes.InvalidArgument,
+		},
+		{
+			name: "invalid snapshot locations",
+			req: &csi.CreateSnapshotRequest{
+				Name:           name,
+				SourceVolumeId: testVolumeID,
+				Parameters:     map[string]string{common.ParameterKeyStorageLocations: "bad-region"},
+			},
+			seedDisks: []*gce.CloudDisk{
+				createZonalCloudDisk(name),
 			},
 			expErrCode: codes.InvalidArgument,
 		},
@@ -674,6 +699,31 @@ func TestCreateVolumeArguments(t *testing.T) {
 				AccessibleTopology: stdTopology,
 			},
 		},
+		{
+			name: "success with labels parameter",
+			req: &csi.CreateVolumeRequest{
+				Name:               name,
+				CapacityRange:      stdCapRange,
+				VolumeCapabilities: stdVolCaps,
+				Parameters:         map[string]string{"labels": "key1=value1,key2=value2"},
+			},
+			expVol: &csi.Volume{
+				CapacityBytes:      common.GbToBytes(20),
+				VolumeId:           testVolumeID,
+				VolumeContext:      nil,
+				AccessibleTopology: stdTopology,
+			},
+		},
+		{
+			name: "fail with malformed labels parameter",
+			req: &csi.CreateVolumeRequest{
+				Name:               name,
+				CapacityRange:      stdCapRange,
+				VolumeCapabilities: stdVolCaps,
+				Parameters:         map[string]string{"labels": "key1=value1,#=$;;"},
+			},
+			expErrCode: codes.InvalidArgument,
+		},
 	}
 
 	// Run test cases
@@ -721,6 +771,7 @@ func TestCreateVolumeArguments(t *testing.T) {
 }
 
 func TestListVolumeArgs(t *testing.T) {
+	diskCount := 600
 	testCases := []struct {
 		name            string
 		maxEntries      int32
@@ -729,17 +780,12 @@ func TestListVolumeArgs(t *testing.T) {
 	}{
 		{
 			name:            "normal",
-			expectedEntries: 500,
+			expectedEntries: diskCount,
 		},
 		{
 			name:            "fine amount of entries",
 			maxEntries:      420,
 			expectedEntries: 420,
-		},
-		{
-			name:            "too many entries, but defaults to 500",
-			maxEntries:      501,
-			expectedEntries: 500,
 		},
 		{
 			name:        "negative entries",
@@ -751,10 +797,10 @@ func TestListVolumeArgs(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Setup new driver each time so no interference
-			d := []*gce.CloudDisk{}
-			for i := 0; i < 600; i++ {
+			var d []*gce.CloudDisk
+			for i := 0; i < diskCount; i++ {
 				// Create 600 dummy disks
-				d = append(d, &gce.CloudDisk{ZonalDisk: &compute.Disk{Name: fmt.Sprintf("%v", i)}})
+				d = append(d, gce.CloudDiskFromV1(&compute.Disk{Name: fmt.Sprintf("%v", i)}))
 			}
 			gceDriver := initGCEDriver(t, d)
 			lvr := &csi.ListVolumesRequest{
@@ -782,17 +828,20 @@ func TestCreateVolumeWithVolumeSource(t *testing.T) {
 	// Define test cases
 	testCases := []struct {
 		name            string
+		project         string
 		volKey          *meta.Key
 		snapshotOnCloud bool
 		expErrCode      codes.Code
 	}{
 		{
 			name:            "success with data source of snapshot type",
+			project:         "test-project",
 			volKey:          meta.ZonalKey("my-disk", zone),
 			snapshotOnCloud: true,
 		},
 		{
 			name:            "fail with data source of snapshot type that doesn't exist",
+			project:         "test-project",
 			volKey:          meta.ZonalKey("my-disk", zone),
 			snapshotOnCloud: false,
 			expErrCode:      codes.NotFound,
@@ -820,7 +869,11 @@ func TestCreateVolumeWithVolumeSource(t *testing.T) {
 		}
 
 		if tc.snapshotOnCloud {
-			gceDriver.cs.CloudProvider.CreateSnapshot(context.Background(), tc.volKey, name)
+			snapshotParams, err := common.ExtractAndDefaultSnapshotParameters(req.GetParameters())
+			if err != nil {
+				t.Errorf("Got error extracting snapshot parameters: %v", err)
+			}
+			gceDriver.cs.CloudProvider.CreateSnapshot(context.Background(), tc.project, tc.volKey, name, snapshotParams)
 		}
 		resp, err := gceDriver.cs.CreateVolume(context.Background(), req)
 		//check response
@@ -890,7 +943,7 @@ func TestCreateVolumeRandomRequisiteTopology(t *testing.T) {
 }
 
 func createZonalCloudDisk(name string) *gce.CloudDisk {
-	return gce.ZonalCloudDisk(&compute.Disk{
+	return gce.CloudDiskFromV1(&compute.Disk{
 		Name: name,
 	})
 }

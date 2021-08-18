@@ -27,6 +27,12 @@ import (
 	"k8s.io/klog"
 )
 
+const (
+	fsTypeXFS = "xfs"
+)
+
+var ProbeCSIFullMethod = "/csi.v1.Identity/Probe"
+
 func NewVolumeCapabilityAccessMode(mode csi.VolumeCapability_AccessMode_Mode) *csi.VolumeCapability_AccessMode {
 	return &csi.VolumeCapability_AccessMode{Mode: mode}
 }
@@ -52,12 +58,18 @@ func NewNodeServiceCapability(cap csi.NodeServiceCapability_RPC_Type) *csi.NodeS
 }
 
 func logGRPC(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-	klog.V(4).Infof("%s called with request: %+v", info.FullMethod, req)
+	if info.FullMethod == ProbeCSIFullMethod {
+		return handler(ctx, req)
+	}
+	// Note that secrets are not included in any RPC message. In the past protosanitizer and other log
+	// stripping was shown to cause a significant increase of CPU usage (see
+	// https://github.com/kubernetes-sigs/gcp-compute-persistent-disk-csi-driver/issues/356#issuecomment-550529004).
+	klog.V(4).Infof("%s called with request: %s", info.FullMethod, req)
 	resp, err := handler(ctx, req)
 	if err != nil {
 		klog.Errorf("%s returned with error: %v", info.FullMethod, err)
 	} else {
-		klog.V(4).Infof("%s returned with response: %+v", info.FullMethod, resp)
+		klog.V(4).Infof("%s returned with response: %s", info.FullMethod, resp)
 	}
 	return resp, err
 }
@@ -146,4 +158,19 @@ func getMultiWriterFromCapabilities(vcs []*csi.VolumeCapability) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+func collectMountOptions(fsType string, mntFlags []string) []string {
+	var options []string
+
+	for _, opt := range mntFlags {
+		options = append(options, opt)
+	}
+
+	// By default, xfs does not allow mounting of two volumes with the same filesystem uuid.
+	// Force ignore this uuid to be able to mount volume + its clone / restored snapshot on the same node.
+	if fsType == fsTypeXFS {
+		options = append(options, "nouuid")
+	}
+	return options
 }
