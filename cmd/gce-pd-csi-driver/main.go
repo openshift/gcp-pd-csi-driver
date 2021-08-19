@@ -24,10 +24,11 @@ import (
 
 	"k8s.io/klog"
 
-	cliflag "k8s.io/component-base/cli/flag"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
 	gce "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/compute"
 	metadataservice "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/metadata"
 	driver "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-pd-csi-driver"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/metrics"
 	mountmanager "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/mount-manager"
 )
 
@@ -36,7 +37,9 @@ var (
 	endpoint             = flag.String("endpoint", "unix:/tmp/csi.sock", "CSI endpoint")
 	runControllerService = flag.Bool("run-controller-service", true, "If set to false then the CSI driver does not activate its controller service (default: true)")
 	runNodeService       = flag.Bool("run-node-service", true, "If set to false then the CSI driver does not activate its node service (default: true)")
-	extraVolumeLabels    map[string]string
+	httpEndpoint         = flag.String("http-endpoint", "", "The TCP network address where the prometheus metrics endpoint will listen (example: `:8080`). The default is empty string, which means metrics endpoint is disabled.")
+	metricsPath          = flag.String("metrics-path", "/metrics", "The HTTP path where prometheus metrics will be exposed. Default is `/metrics`.")
+	extraVolumeLabelsStr = flag.String("extra-labels", "", "Extra labels to attach to each PD created. It is a comma separated list of key value pairs like '<key1>=<value1>,<key2>=<value2>'. See https://cloud.google.com/compute/docs/labeling-resources for details")
 	version              string
 )
 
@@ -55,7 +58,6 @@ func init() {
 }
 
 func main() {
-	flag.Var(cliflag.NewMapStringString(&extraVolumeLabels), "extra-labels", "Extra labels to attach to each PD created. It is a comma separated list of key value pairs like '<key1>=<value1>,<key2>=<value2>'")
 	flag.Parse()
 	rand.Seed(time.Now().UnixNano())
 	handle()
@@ -69,6 +71,20 @@ func handle() {
 		klog.Fatalf("version must be set at compile time")
 	}
 	klog.V(2).Infof("Driver vendor version %v", version)
+
+	if *runControllerService && *httpEndpoint != "" && metrics.IsGKEComponentVersionAvailable() {
+		mm := metrics.NewMetricsManager()
+		mm.InitializeHttpHandler(*httpEndpoint, *metricsPath)
+		mm.EmitGKEComponentVersion()
+	}
+
+	if len(*extraVolumeLabelsStr) > 0 && !*runControllerService {
+		klog.Fatalf("Extra volume labels provided but not running controller")
+	}
+	extraVolumeLabels, err := common.ConvertLabelsStringToMap(*extraVolumeLabelsStr)
+	if err != nil {
+		klog.Fatalf("Bad extra volume labels: %v", err)
+	}
 
 	gceDriver := driver.GetGCEDriver()
 

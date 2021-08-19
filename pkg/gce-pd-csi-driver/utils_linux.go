@@ -23,12 +23,12 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"k8s.io/utils/mount"
+	"k8s.io/mount-utils"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
 )
 
 func getDevicePath(ns *GCENodeServer, volumeID, partition string) (string, error) {
-	volumeKey, err := common.VolumeIDToKey(volumeID)
+	_, volumeKey, err := common.VolumeIDToKey(volumeID)
 	if err != nil {
 		return "", err
 	}
