@@ -70,8 +70,9 @@ func BytesToGbRoundDown(bytes int64) int64 {
 }
 
 func BytesToGbRoundUp(bytes int64) int64 {
-	re := bytes / (1024 * 1024 * 1024)
-	if (bytes % (1024 * 1024 * 1024)) != 0 {
+	// TEST: verify that rounding to 4GiB works correctly
+	re := bytes / (1024 * 1024 * 1024 * 4)
+	if (bytes % (1024 * 1024 * 1024 * 4)) != 0 {
 		re++
 	}
 	return re
