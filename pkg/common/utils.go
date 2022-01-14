@@ -75,7 +75,7 @@ func BytesToGbRoundUp(bytes int64) int64 {
 	if (bytes % (1024 * 1024 * 1024 * 4)) != 0 {
 		re++
 	}
-	return re
+	return 4 * re
 }
 
 func GbToBytes(Gb int64) int64 {
