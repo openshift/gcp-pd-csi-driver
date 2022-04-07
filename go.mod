@@ -12,7 +12,7 @@ require (
 	github.com/kubernetes-csi/csi-test/v4 v4.2.0
 	github.com/onsi/ginkgo v1.14.2
 	github.com/onsi/gomega v1.10.4
-	golang.org/x/oauth2 v0.0.0-20200902213428-5d25da1a8d43
+	golang.org/x/oauth2 v0.0.0-20210622215436-a8dc77f794b6
 	golang.org/x/sys v0.0.0-20210616094352-59db8d763f22
 	google.golang.org/api v0.34.0
 	google.golang.org/genproto v0.0.0-20210602131652-f16073e35f0c
