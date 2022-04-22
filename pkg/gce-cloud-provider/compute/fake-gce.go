@@ -17,7 +17,6 @@ package gcecloudprovider
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 
 	"github.com/GoogleCloudPlatform/k8s-cloud-provider/pkg/cloud/meta"
@@ -37,6 +36,7 @@ const (
 	Timestamp                 = "2018-09-05T15:17:08.270-07:00"
 	BasePath                  = "https://www.googleapis.com/compute/v1/projects/"
 	snapshotURITemplateGlobal = "%s/global/snapshots/%s" //{gce.projectID}/global/snapshots/{snapshot.Name}"
+	imageURITemplateGlobal    = "%s/global/images/%s"    //{gce.projectID}/global/images/{image.Name}"
 )
 
 type FakeCloudProvider struct {
@@ -47,6 +47,7 @@ type FakeCloudProvider struct {
 	pageTokens map[string]sets.String
 	instances  map[string]*computev1.Instance
 	snapshots  map[string]*computev1.Snapshot
+	images     map[string]*computev1.Image
 
 	// marker to set disk status during InsertDisk operation.
 	mockDiskStatus string
@@ -61,6 +62,7 @@ func CreateFakeCloudProvider(project, zone string, cloudDisks []*CloudDisk) (*Fa
 		disks:      map[string]*CloudDisk{},
 		instances:  map[string]*computev1.Instance{},
 		snapshots:  map[string]*computev1.Snapshot{},
+		images:     map[string]*computev1.Image{},
 		pageTokens: map[string]sets.String{},
 		// A newly created disk is marked READY by default.
 		mockDiskStatus: "READY",
@@ -122,7 +124,7 @@ func (cloud *FakeCloudProvider) ListDisks(ctx context.Context) ([]*computev1.Dis
 	return d, "", nil
 }
 
-func (cloud *FakeCloudProvider) ListSnapshots(ctx context.Context, filter string, maxEntries int64, pageToken string) ([]*computev1.Snapshot, string, error) {
+func (cloud *FakeCloudProvider) ListSnapshots(ctx context.Context, filter string) ([]*computev1.Snapshot, string, error) {
 	var sourceDisk string
 	snapshots := []*computev1.Snapshot{}
 	if len(filter) > 0 {
@@ -141,45 +143,7 @@ func (cloud *FakeCloudProvider) ListSnapshots(ctx context.Context, filter string
 		snapshots = append(snapshots, snapshot)
 	}
 
-	var (
-		ulenSnapshots = len(snapshots)
-		startingToken int
-	)
-
-	if len(pageToken) > 0 {
-		i, err := strconv.ParseUint(pageToken, 10, 32)
-		if err != nil {
-			return nil, "", invalidError()
-		}
-		startingToken = int(i)
-	}
-
-	if startingToken > ulenSnapshots {
-		return nil, "", invalidError()
-	}
-
-	// Discern the number of remaining entries.
-	rem := ulenSnapshots - startingToken
-
-	// If maxEntries is 0 or greater than the number of remaining entries then
-	// set maxEntries to the number of remaining entries.
-	max := int(maxEntries)
-	if max == 0 || max > rem {
-		max = rem
-	}
-
-	results := []*computev1.Snapshot{}
-	j := startingToken
-	for i := 0; i < max; i++ {
-		results = append(results, snapshots[j])
-		j++
-	}
-
-	var nextToken string
-	if j < ulenSnapshots {
-		nextToken = fmt.Sprintf("%d", j)
-	}
-	return results, nextToken, nil
+	return snapshots, "", nil
 }
 
 // Disk Methods
@@ -220,7 +184,7 @@ func (cloud *FakeCloudProvider) ValidateExistingDisk(ctx context.Context, resp *
 	return ValidateDiskParameters(resp, params)
 }
 
-func (cloud *FakeCloudProvider) InsertDisk(ctx context.Context, project string, volKey *meta.Key, params common.DiskParameters, capBytes int64, capacityRange *csi.CapacityRange, replicaZones []string, snapshotID string, multiWriter bool) error {
+func (cloud *FakeCloudProvider) InsertDisk(ctx context.Context, project string, volKey *meta.Key, params common.DiskParameters, capBytes int64, capacityRange *csi.CapacityRange, replicaZones []string, snapshotID string, volumeContentSourceVolumeID string, multiWriter bool) error {
 	if disk, ok := cloud.disks[volKey.Name]; ok {
 		err := cloud.ValidateExistingDisk(ctx, disk, params,
 			int64(capacityRange.GetRequiredBytes()),
@@ -232,14 +196,30 @@ func (cloud *FakeCloudProvider) InsertDisk(ctx context.Context, project string, 
 	}
 
 	computeDisk := &computev1.Disk{
-		Name:             volKey.Name,
-		SizeGb:           common.BytesToGbRoundUp(capBytes),
-		Description:      "Disk created by GCE-PD CSI Driver",
-		Type:             cloud.GetDiskTypeURI(project, volKey, params.DiskType),
-		SourceSnapshotId: snapshotID,
-		Status:           cloud.mockDiskStatus,
-		Labels:           params.Labels,
+		Name:         volKey.Name,
+		SizeGb:       common.BytesToGbRoundUp(capBytes),
+		Description:  "Disk created by GCE-PD CSI Driver",
+		Type:         cloud.GetDiskTypeURI(project, volKey, params.DiskType),
+		SourceDiskId: volumeContentSourceVolumeID,
+		Status:       cloud.mockDiskStatus,
+		Labels:       params.Labels,
 	}
+
+	if snapshotID != "" {
+		_, snapshotType, _, err := common.SnapshotIDToProjectKey(snapshotID)
+		if err != nil {
+			return err
+		}
+		switch snapshotType {
+		case common.DiskSnapshotType:
+			computeDisk.SourceSnapshotId = snapshotID
+		case common.DiskImageType:
+			computeDisk.SourceImageId = snapshotID
+		default:
+			return fmt.Errorf("invalid snapshot type in snapshot ID: %s", snapshotType)
+		}
+	}
+
 	if params.DiskEncryptionKMSKey != "" {
 		computeDisk.DiskEncryptionKey = &computev1.CustomerEncryptionKey{
 			KmsKeyName: params.DiskEncryptionKMSKey,
@@ -261,9 +241,6 @@ func (cloud *FakeCloudProvider) InsertDisk(ctx context.Context, project string, 
 }
 
 func (cloud *FakeCloudProvider) DeleteDisk(ctx context.Context, project string, volKey *meta.Key) error {
-	if _, ok := cloud.disks[volKey.Name]; !ok {
-		return notFoundError()
-	}
 	delete(cloud.disks, volKey.Name)
 	return nil
 }
@@ -401,6 +378,71 @@ func (cloud *FakeCloudProvider) DeleteSnapshot(ctx context.Context, project, sna
 	return nil
 }
 
+func (cloud *FakeCloudProvider) ListImages(ctx context.Context, filter string) ([]*computev1.Image, string, error) {
+	var sourceDisk string
+	images := []*computev1.Image{}
+	if len(filter) > 0 {
+		filterSplits := strings.Fields(filter)
+		if len(filterSplits) != 3 || filterSplits[0] != "sourceDisk" {
+			return nil, "", invalidError()
+		}
+		sourceDisk = filterSplits[2]
+	}
+	for _, image := range cloud.images {
+		if len(sourceDisk) > 0 {
+			if image.SourceDisk == sourceDisk {
+				continue
+			}
+		}
+		images = append(images, image)
+	}
+
+	return images, "", nil
+}
+
+func (cloud *FakeCloudProvider) GetImage(ctx context.Context, project, imageName string) (*computev1.Image, error) {
+	image, ok := cloud.images[imageName]
+	if !ok {
+		return nil, notFoundError()
+	}
+	image.Status = "READY"
+	return image, nil
+}
+
+func (cloud *FakeCloudProvider) CreateImage(ctx context.Context, project string, volKey *meta.Key, imageName string, snapshotParams common.SnapshotParameters) (*computev1.Image, error) {
+	if image, ok := cloud.images[imageName]; ok {
+		return image, nil
+	}
+
+	imageToCreate := &computev1.Image{
+		CreationTimestamp: Timestamp,
+		DiskSizeGb:        int64(DiskSizeGb),
+		Family:            snapshotParams.ImageFamily,
+		Name:              imageName,
+		SelfLink:          cloud.getGlobalImageURI(project, imageName),
+		SourceType:        "RAW",
+		Status:            "PENDING",
+		StorageLocations:  snapshotParams.StorageLocations,
+	}
+
+	switch volKey.Type() {
+	case meta.Zonal:
+		imageToCreate.SourceDisk = cloud.getZonalDiskSourceURI(project, volKey.Name, volKey.Zone)
+	case meta.Regional:
+		imageToCreate.SourceDisk = cloud.getRegionalDiskSourceURI(project, volKey.Name, volKey.Region)
+	default:
+		return nil, fmt.Errorf("could not create image, disk key was neither zonal nor regional, instead got: %v", volKey.String())
+	}
+
+	cloud.images[imageName] = imageToCreate
+	return imageToCreate, nil
+}
+
+func (cloud *FakeCloudProvider) DeleteImage(ctx context.Context, project, imageName string) error {
+	delete(cloud.images, imageName)
+	return nil
+}
+
 func (cloud *FakeCloudProvider) ValidateExistingSnapshot(resp *computev1.Snapshot, volKey *meta.Key) error {
 	if resp == nil {
 		return fmt.Errorf("disk does not exist")
@@ -449,6 +491,13 @@ func (cloud *FakeCloudProvider) getGlobalSnapshotURI(project, snapshotName strin
 		snapshotName)
 }
 
+func (cloud *FakeCloudProvider) getGlobalImageURI(project, imageName string) string {
+	return BasePath + fmt.Sprintf(
+		imageURITemplateGlobal,
+		project,
+		imageName)
+}
+
 func (cloud *FakeCloudProvider) UpdateDiskStatus(s string) {
 	cloud.mockDiskStatus = s
 }
@@ -467,6 +516,13 @@ func (cloud *FakeBlockingCloudProvider) CreateSnapshot(ctx context.Context, proj
 	cloud.ReadyToExecute <- executeCreateSnapshot
 	<-executeCreateSnapshot
 	return cloud.FakeCloudProvider.CreateSnapshot(ctx, project, volKey, snapshotName, snapshotParams)
+}
+
+func (cloud *FakeBlockingCloudProvider) CreateImage(ctx context.Context, project string, volKey *meta.Key, imageName string, snapshotParams common.SnapshotParameters) (*computev1.Image, error) {
+	executeCreateSnapshot := make(chan struct{})
+	cloud.ReadyToExecute <- executeCreateSnapshot
+	<-executeCreateSnapshot
+	return cloud.FakeCloudProvider.CreateImage(ctx, project, volKey, imageName, snapshotParams)
 }
 
 func notFoundError() *googleapi.Error {

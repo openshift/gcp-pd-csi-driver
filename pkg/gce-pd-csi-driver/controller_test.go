@@ -31,6 +31,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/wait"
 
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
@@ -63,6 +64,8 @@ var (
 	region, _      = common.GetRegionFromZones([]string{zone})
 	testRegionalID = fmt.Sprintf("projects/%s/regions/%s/disks/%s", project, region, name)
 	testSnapshotID = fmt.Sprintf("projects/%s/global/snapshots/%s", project, name)
+	testImageID    = fmt.Sprintf("projects/%s/global/images/%s", project, name)
+	testNodeID     = fmt.Sprintf("projects/%s/zones/%s/instances/%s", project, zone, node)
 )
 
 func TestCreateSnapshotArguments(t *testing.T) {
@@ -91,6 +94,24 @@ func TestCreateSnapshotArguments(t *testing.T) {
 			},
 			expSnapshot: &csi.Snapshot{
 				SnapshotId:     testSnapshotID,
+				SourceVolumeId: testVolumeID,
+				CreationTime:   tp,
+				SizeBytes:      common.GbToBytes(gce.DiskSizeGb),
+				ReadyToUse:     false,
+			},
+		},
+		{
+			name: "success disk image of zonal disk",
+			req: &csi.CreateSnapshotRequest{
+				Name:           name,
+				SourceVolumeId: testVolumeID,
+				Parameters:     map[string]string{common.ParameterKeyStorageLocations: " US-WEST2", common.ParameterKeySnapshotType: "images"},
+			},
+			seedDisks: []*gce.CloudDisk{
+				createZonalCloudDisk(name),
+			},
+			expSnapshot: &csi.Snapshot{
+				SnapshotId:     testImageID,
 				SourceVolumeId: testVolumeID,
 				CreationTime:   tp,
 				SizeBytes:      common.GbToBytes(gce.DiskSizeGb),
@@ -197,9 +218,15 @@ func TestDeleteSnapshot(t *testing.T) {
 		expErrCode codes.Code
 	}{
 		{
-			name: "valid",
+			name: "valid snapshot delete",
 			req: &csi.DeleteSnapshotRequest{
 				SnapshotId: testSnapshotID,
+			},
+		},
+		{
+			name: "valid image delete",
+			req: &csi.DeleteSnapshotRequest{
+				SnapshotId: testImageID,
 			},
 		},
 		{
@@ -244,31 +271,62 @@ func TestDeleteSnapshot(t *testing.T) {
 func TestListSnapshotsArguments(t *testing.T) {
 	// Define test cases
 	testCases := []struct {
-		name         string
-		req          *csi.ListSnapshotsRequest
-		numSnapshots int
-		expErrCode   codes.Code
+		name          string
+		req           *csi.ListSnapshotsRequest
+		numSnapshots  int
+		numImages     int
+		expectedCount int
+		expErrCode    codes.Code
 	}{
 		{
 			name: "valid",
 			req: &csi.ListSnapshotsRequest{
 				SnapshotId: testSnapshotID + "0",
 			},
-			numSnapshots: 1,
+			numSnapshots:  3,
+			numImages:     2,
+			expectedCount: 1,
 		},
 		{
 			name: "invalid id",
 			req: &csi.ListSnapshotsRequest{
 				SnapshotId: testSnapshotID + "/foo",
 			},
-			numSnapshots: 0,
+			expectedCount: 0,
 		},
 		{
 			name: "no id",
 			req: &csi.ListSnapshotsRequest{
 				SnapshotId: "",
 			},
-			numSnapshots: 5,
+			numSnapshots:  2,
+			numImages:     3,
+			expectedCount: 5,
+		},
+		{
+			name: "with invalid token",
+			req: &csi.ListSnapshotsRequest{
+				StartingToken: "invalid",
+			},
+			expectedCount: 0,
+			expErrCode:    codes.Aborted,
+		},
+		{
+			name: "negative entries",
+			req: &csi.ListSnapshotsRequest{
+				MaxEntries: -1,
+			},
+
+			expErrCode: codes.InvalidArgument,
+		},
+		{
+			name: "max enries",
+			req: &csi.ListSnapshotsRequest{
+				MaxEntries: 4,
+			},
+			numSnapshots:  2,
+			numImages:     3,
+			expectedCount: 4,
 		},
 	}
 
@@ -276,7 +334,7 @@ func TestListSnapshotsArguments(t *testing.T) {
 		t.Logf("test case: %s", tc.name)
 
 		disks := []*gce.CloudDisk{}
-		for i := 0; i < tc.numSnapshots; i++ {
+		for i := 0; i < tc.numSnapshots+tc.numImages; i++ {
 			sname := fmt.Sprintf("%s%d", name, i)
 			disks = append(disks, createZonalCloudDisk(sname))
 		}
@@ -290,6 +348,21 @@ func TestListSnapshotsArguments(t *testing.T) {
 			createReq := &csi.CreateSnapshotRequest{
 				Name:           nameID,
 				SourceVolumeId: volumeID,
+				Parameters:     map[string]string{common.ParameterKeySnapshotType: common.DiskSnapshotType},
+			}
+			_, err := gceDriver.cs.CreateSnapshot(context.Background(), createReq)
+			if err != nil {
+				t.Errorf("error %v", err)
+			}
+		}
+
+		for i := 0; i < tc.numImages; i++ {
+			volumeID := fmt.Sprintf("%s%d", testVolumeID, i)
+			nameID := fmt.Sprintf("%s%d", name, i)
+			createReq := &csi.CreateSnapshotRequest{
+				Name:           nameID,
+				SourceVolumeId: volumeID,
+				Parameters:     map[string]string{common.ParameterKeySnapshotType: common.DiskImageType},
 			}
 			_, err := gceDriver.cs.CreateSnapshot(context.Background(), createReq)
 			if err != nil {
@@ -325,8 +398,8 @@ func TestListSnapshotsArguments(t *testing.T) {
 			// If one is nil or empty but not both
 			t.Fatalf("Expected snapshots number %v, got no snapshot", tc.numSnapshots)
 		}
-		if len(snapshots) != tc.numSnapshots {
-			errStr := fmt.Sprintf("Expected snapshot: %#v\n to equal snapshot: %#v\n", snapshots[0].Snapshot, tc.numSnapshots)
+		if len(snapshots) != tc.expectedCount {
+			errStr := fmt.Sprintf("Expected snapshot number to equal: %v", tc.numSnapshots)
 			t.Errorf(errStr)
 		}
 	}
@@ -356,19 +429,14 @@ func TestCreateVolumeArguments(t *testing.T) {
 			},
 		},
 		{
-			name: "success with MULTI_NODE_READER_ONLY",
+			name: "fail with MULTI_NODE_READER_ONLY",
 			req: &csi.CreateVolumeRequest{
 				Name:               "test-name",
 				CapacityRange:      stdCapRange,
 				VolumeCapabilities: createVolumeCapabilities(csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY),
 				Parameters:         stdParams,
 			},
-			expVol: &csi.Volume{
-				CapacityBytes:      common.GbToBytes(20),
-				VolumeId:           testVolumeID,
-				VolumeContext:      nil,
-				AccessibleTopology: stdTopology,
-			},
+			expErrCode: codes.InvalidArgument,
 		},
 		{
 			name: "fail with mount/MULTI_NODE_MULTI_WRITER capabilities",
@@ -824,12 +892,13 @@ func TestListVolumeArgs(t *testing.T) {
 	}
 }
 
-func TestCreateVolumeWithVolumeSource(t *testing.T) {
+func TestCreateVolumeWithVolumeSourceFromSnapshot(t *testing.T) {
 	// Define test cases
 	testCases := []struct {
 		name            string
 		project         string
 		volKey          *meta.Key
+		snapshotType    string
 		snapshotOnCloud bool
 		expErrCode      codes.Code
 	}{
@@ -837,12 +906,29 @@ func TestCreateVolumeWithVolumeSource(t *testing.T) {
 			name:            "success with data source of snapshot type",
 			project:         "test-project",
 			volKey:          meta.ZonalKey("my-disk", zone),
+			snapshotType:    common.DiskSnapshotType,
 			snapshotOnCloud: true,
 		},
 		{
 			name:            "fail with data source of snapshot type that doesn't exist",
 			project:         "test-project",
 			volKey:          meta.ZonalKey("my-disk", zone),
+			snapshotType:    common.DiskSnapshotType,
+			snapshotOnCloud: false,
+			expErrCode:      codes.NotFound,
+		},
+		{
+			name:            "success with data source of snapshot type",
+			project:         "test-project",
+			volKey:          meta.ZonalKey("my-disk", zone),
+			snapshotType:    common.DiskImageType,
+			snapshotOnCloud: true,
+		},
+		{
+			name:            "fail with data source of snapshot type that doesn't exist",
+			project:         "test-project",
+			volKey:          meta.ZonalKey("my-disk", zone),
+			snapshotType:    common.DiskImageType,
 			snapshotOnCloud: false,
 			expErrCode:      codes.NotFound,
 		},
@@ -854,7 +940,28 @@ func TestCreateVolumeWithVolumeSource(t *testing.T) {
 		// Setup new driver each time so no interference
 		gceDriver := initGCEDriver(t, nil)
 
+		snapshotParams, err := common.ExtractAndDefaultSnapshotParameters(nil)
+		if err != nil {
+			t.Errorf("Got error extracting snapshot parameters: %v", err)
+		}
+
 		// Start Test
+		var snapshotID string
+		switch tc.snapshotType {
+		case common.DiskSnapshotType:
+			snapshotID = testSnapshotID
+			if tc.snapshotOnCloud {
+				gceDriver.cs.CloudProvider.CreateSnapshot(context.Background(), tc.project, tc.volKey, name, snapshotParams)
+			}
+		case common.DiskImageType:
+			snapshotID = testImageID
+			if tc.snapshotOnCloud {
+				gceDriver.cs.CloudProvider.CreateImage(context.Background(), tc.project, tc.volKey, name, snapshotParams)
+			}
+		default:
+			t.Errorf("Unknown snapshot type: %v", tc.snapshotType)
+		}
+
 		req := &csi.CreateVolumeRequest{
 			Name:               "test-name",
 			CapacityRange:      stdCapRange,
@@ -862,19 +969,12 @@ func TestCreateVolumeWithVolumeSource(t *testing.T) {
 			VolumeContentSource: &csi.VolumeContentSource{
 				Type: &csi.VolumeContentSource_Snapshot{
 					Snapshot: &csi.VolumeContentSource_SnapshotSource{
-						SnapshotId: testSnapshotID,
+						SnapshotId: snapshotID,
 					},
 				},
 			},
 		}
 
-		if tc.snapshotOnCloud {
-			snapshotParams, err := common.ExtractAndDefaultSnapshotParameters(req.GetParameters())
-			if err != nil {
-				t.Errorf("Got error extracting snapshot parameters: %v", err)
-			}
-			gceDriver.cs.CloudProvider.CreateSnapshot(context.Background(), tc.project, tc.volKey, name, snapshotParams)
-		}
 		resp, err := gceDriver.cs.CreateVolume(context.Background(), req)
 		//check response
 		if err != nil {
@@ -897,6 +997,162 @@ func TestCreateVolumeWithVolumeSource(t *testing.T) {
 			t.Fatalf("Expected volume content source to have snapshot ID, got none")
 		}
 
+	}
+}
+
+func TestCreateVolumeWithVolumeSourceFromVolume(t *testing.T) {
+	testSourceVolumeName := "test-volume-source-name"
+	testZonalVolumeSourceID := fmt.Sprintf("projects/%s/zones/%s/disks/%s", project, zone, testSourceVolumeName)
+	testRegionalVolumeSourceID := fmt.Sprintf("projects/%s/regions/%s/disks/%s", project, region, testSourceVolumeName)
+	testVolumeSourceIDDifferentZone := fmt.Sprintf("projects/%s/zones/%s/disks/%s", project, "different-zone", testSourceVolumeName)
+	topology := &csi.TopologyRequirement{
+		Requisite: []*csi.Topology{
+			{
+				Segments: map[string]string{common.TopologyKeyZone: region + "-b"},
+			},
+			{
+				Segments: map[string]string{common.TopologyKeyZone: region + "-c"},
+			},
+		},
+	}
+	regionalParams := map[string]string{
+		common.ParameterKeyType: "test-type", common.ParameterKeyReplicationType: "regional-pd",
+	}
+	// Define test cases
+	testCases := []struct {
+		name                string
+		volumeOnCloud       bool
+		expErrCode          codes.Code
+		sourceVolumeID      string
+		reqParameters       map[string]string
+		sourceReqParameters map[string]string
+		topology            *csi.TopologyRequirement
+	}{
+		{
+			name:                "success with data source of zonal volume type",
+			volumeOnCloud:       true,
+			sourceVolumeID:      testZonalVolumeSourceID,
+			reqParameters:       stdParams,
+			sourceReqParameters: stdParams,
+		},
+		{
+			name:                "success with data source of regional volume type",
+			volumeOnCloud:       true,
+			sourceVolumeID:      testRegionalVolumeSourceID,
+			reqParameters:       regionalParams,
+			sourceReqParameters: regionalParams,
+			topology:            topology,
+		},
+		{
+			name:                "fail with with data source of replication-type different from CreateVolumeRequest",
+			volumeOnCloud:       true,
+			expErrCode:          codes.InvalidArgument,
+			sourceVolumeID:      testZonalVolumeSourceID,
+			reqParameters:       stdParams,
+			sourceReqParameters: regionalParams,
+			topology:            topology,
+		},
+		{
+			name:                "fail with data source of zonal volume type that doesn't exist",
+			volumeOnCloud:       false,
+			expErrCode:          codes.NotFound,
+			sourceVolumeID:      testZonalVolumeSourceID,
+			reqParameters:       stdParams,
+			sourceReqParameters: stdParams,
+		},
+		{
+			name:                "fail with data source of zonal volume type with invalid volume id format",
+			volumeOnCloud:       false,
+			expErrCode:          codes.InvalidArgument,
+			sourceVolumeID:      testZonalVolumeSourceID + "invalid/format",
+			reqParameters:       stdParams,
+			sourceReqParameters: stdParams,
+		},
+		{
+			name:           "fail with data source of zonal volume type with invalid disk parameters",
+			volumeOnCloud:  true,
+			expErrCode:     codes.InvalidArgument,
+			sourceVolumeID: testVolumeSourceIDDifferentZone,
+			reqParameters:  stdParams,
+			sourceReqParameters: map[string]string{
+				common.ParameterKeyType: "different-type",
+			},
+		},
+		{
+			name:                "fail with data source of zonal volume type with invalid replication type",
+			volumeOnCloud:       true,
+			expErrCode:          codes.InvalidArgument,
+			sourceVolumeID:      testZonalVolumeSourceID,
+			reqParameters:       regionalParams,
+			sourceReqParameters: stdParams,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Logf("test case: %s", tc.name)
+		gceDriver := initGCEDriver(t, nil)
+
+		req := &csi.CreateVolumeRequest{
+			Name:               name,
+			CapacityRange:      stdCapRange,
+			VolumeCapabilities: stdVolCaps,
+			Parameters:         tc.reqParameters,
+			VolumeContentSource: &csi.VolumeContentSource{
+				Type: &csi.VolumeContentSource_Volume{
+					Volume: &csi.VolumeContentSource_VolumeSource{
+						VolumeId: tc.sourceVolumeID,
+					},
+				},
+			},
+		}
+
+		sourceVolumeRequest := &csi.CreateVolumeRequest{
+			Name:               testSourceVolumeName,
+			CapacityRange:      stdCapRange,
+			VolumeCapabilities: stdVolCaps,
+			Parameters:         tc.sourceReqParameters,
+		}
+
+		if tc.topology != nil {
+			// req.AccessibilityRequirements = tc.topology
+			sourceVolumeRequest.AccessibilityRequirements = tc.topology
+		}
+
+		if tc.volumeOnCloud {
+			// Create the source volume.
+			sourceVolume, _ := gceDriver.cs.CreateVolume(context.Background(), sourceVolumeRequest)
+			req.VolumeContentSource = &csi.VolumeContentSource{
+				Type: &csi.VolumeContentSource_Volume{
+					Volume: &csi.VolumeContentSource_VolumeSource{
+						VolumeId: sourceVolume.GetVolume().VolumeId,
+					},
+				},
+			}
+		}
+
+		resp, err := gceDriver.cs.CreateVolume(context.Background(), req)
+		t.Logf("response: %v err: %v", resp, err)
+		if err != nil {
+			serverError, ok := status.FromError(err)
+			if !ok {
+				t.Fatalf("Could not get error status code from err: %v", serverError)
+			}
+			if serverError.Code() != tc.expErrCode {
+				t.Fatalf("Expected error code: %v, got: %v. err : %v", tc.expErrCode, serverError.Code(), err)
+			}
+			continue
+		}
+		if tc.expErrCode != codes.OK {
+			t.Fatalf("Expected error: %v, got no error", tc.expErrCode)
+		}
+
+		// Make sure the response has the source volume.
+		sourceVolume := resp.GetVolume()
+		t.Logf("response has source volume: %v ", sourceVolume)
+		if sourceVolume.ContentSource == nil || sourceVolume.ContentSource.Type == nil ||
+			sourceVolume.ContentSource.GetVolume() == nil || sourceVolume.ContentSource.GetVolume().VolumeId == "" {
+			t.Fatalf("Expected volume content source to have volume ID, got none")
+		}
 	}
 }
 
@@ -1564,6 +1820,7 @@ func TestVolumeOperationConcurrency(t *testing.T) {
 		response := make(chan error)
 		go func() {
 			_, err := cs.CreateSnapshot(context.Background(), req)
+			t.Log(err)
 			response <- err
 		}()
 		return response
@@ -1714,5 +1971,187 @@ func TestCreateVolumeDiskReady(t *testing.T) {
 				t.Fatalf("Mismatch in expected vol %v, current volume: %v\n", tc.expVol, vol)
 			}
 		})
+	}
+}
+
+func TestControllerPublishUnpublishVolume(t *testing.T) {
+	testCases := []struct {
+		name              string
+		seedDisks         []*gce.CloudDisk
+		pubReq            *csi.ControllerPublishVolumeRequest
+		unpubReq          *csi.ControllerUnpublishVolumeRequest
+		errorSeenOnNode   bool
+		fakeCloudProvider bool
+	}{
+		{
+			name: "queue up publish requests if node has publish error",
+			seedDisks: []*gce.CloudDisk{
+				createZonalCloudDisk(name),
+			},
+			pubReq: &csi.ControllerPublishVolumeRequest{
+				VolumeId: testVolumeID,
+				NodeId:   testNodeID,
+				VolumeCapability: &csi.VolumeCapability{
+					AccessType: &csi.VolumeCapability_Mount{
+						Mount: &csi.VolumeCapability_MountVolume{},
+					},
+					AccessMode: &csi.VolumeCapability_AccessMode{
+						Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+					},
+				},
+			},
+			errorSeenOnNode:   true,
+			fakeCloudProvider: false,
+		},
+		{
+			name: "queue up and process publish requests if node has publish error",
+			seedDisks: []*gce.CloudDisk{
+				createZonalCloudDisk(name),
+			},
+			pubReq: &csi.ControllerPublishVolumeRequest{
+				VolumeId: testVolumeID,
+				NodeId:   testNodeID,
+				VolumeCapability: &csi.VolumeCapability{
+					AccessType: &csi.VolumeCapability_Mount{
+						Mount: &csi.VolumeCapability_MountVolume{},
+					},
+					AccessMode: &csi.VolumeCapability_AccessMode{
+						Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+					},
+				},
+			},
+			errorSeenOnNode:   true,
+			fakeCloudProvider: true,
+		},
+		{
+			name: "do not queue up publish requests if node doesn't have publish error",
+			seedDisks: []*gce.CloudDisk{
+				createZonalCloudDisk(name),
+			},
+			pubReq: &csi.ControllerPublishVolumeRequest{
+				VolumeId: testVolumeID,
+				NodeId:   testNodeID,
+				VolumeCapability: &csi.VolumeCapability{
+					AccessType: &csi.VolumeCapability_Mount{
+						Mount: &csi.VolumeCapability_MountVolume{},
+					},
+					AccessMode: &csi.VolumeCapability_AccessMode{
+						Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+					},
+				},
+			},
+			errorSeenOnNode:   false,
+			fakeCloudProvider: false,
+		},
+		{
+			name: "queue up unpublish requests if node has publish error",
+			seedDisks: []*gce.CloudDisk{
+				createZonalCloudDisk(name),
+			},
+			unpubReq: &csi.ControllerUnpublishVolumeRequest{
+				VolumeId: testVolumeID,
+				NodeId:   testNodeID,
+			},
+			errorSeenOnNode:   true,
+			fakeCloudProvider: false,
+		},
+		{
+			name: "queue up and process unpublish requests if node has publish error",
+			seedDisks: []*gce.CloudDisk{
+				createZonalCloudDisk(name),
+			},
+			unpubReq: &csi.ControllerUnpublishVolumeRequest{
+				VolumeId: testVolumeID,
+				NodeId:   testNodeID,
+			},
+			errorSeenOnNode:   true,
+			fakeCloudProvider: true,
+		},
+		{
+			name: "do not queue up unpublish requests if node doesn't have publish error",
+			seedDisks: []*gce.CloudDisk{
+				createZonalCloudDisk(name),
+			},
+			unpubReq: &csi.ControllerUnpublishVolumeRequest{
+				VolumeId: testVolumeID,
+				NodeId:   testNodeID,
+			},
+			errorSeenOnNode:   false,
+			fakeCloudProvider: false,
+		},
+	}
+	for _, tc := range testCases {
+		t.Logf("test case: %s", tc.name)
+
+		var gceDriver *GCEDriver
+
+		if tc.fakeCloudProvider {
+			fcp, err := gce.CreateFakeCloudProvider(project, zone, tc.seedDisks)
+			if err != nil {
+				t.Fatalf("Failed to create fake cloud provider: %v", err)
+			}
+
+			instance := &compute.Instance{
+				Name:  node,
+				Disks: []*compute.AttachedDisk{},
+			}
+			fcp.InsertInstance(instance, zone, node)
+
+			// Setup new driver each time so no interference
+			gceDriver = initGCEDriverWithCloudProvider(t, fcp)
+		} else {
+			gceDriver = initGCEDriver(t, tc.seedDisks)
+		}
+
+		// mark the node in the map
+		if tc.errorSeenOnNode {
+			gceDriver.cs.publishErrorsSeenOnNode[testNodeID] = true
+		}
+
+		requestCount := 50
+		for i := 0; i < requestCount; i++ {
+			if tc.pubReq != nil {
+				gceDriver.cs.ControllerPublishVolume(context.Background(), tc.pubReq)
+			}
+
+			if tc.unpubReq != nil {
+				gceDriver.cs.ControllerUnpublishVolume(context.Background(), tc.unpubReq)
+			}
+		}
+
+		queued := false
+
+		if tc.errorSeenOnNode {
+			if err := wait.Poll(10*time.Nanosecond, 1*time.Second, func() (bool, error) {
+				if gceDriver.cs.queue.Len() > 0 {
+					queued = true
+
+					if tc.fakeCloudProvider {
+						gceDriver.cs.Run()
+					}
+				}
+
+				// Items are queued up and eventually all processed
+				if tc.fakeCloudProvider {
+					return queued && gceDriver.cs.queue.Len() == 0, nil
+				}
+
+				return gceDriver.cs.queue.Len() == requestCount, nil
+			}); err != nil {
+				if tc.fakeCloudProvider {
+					t.Fatalf("%v requests not processed for node has seen error", gceDriver.cs.queue.Len())
+				} else {
+					t.Fatalf("Only %v requests queued up for node has seen error", gceDriver.cs.queue.Len())
+				}
+			}
+		}
+
+		if !tc.errorSeenOnNode {
+			if err := wait.Poll(10*time.Nanosecond, 10*time.Millisecond, func() (bool, error) {
+				return gceDriver.cs.queue.Len() != 0, nil
+			}); err == nil {
+				t.Fatalf("%v requests queued up for node hasn't seen error", gceDriver.cs.queue.Len())
+			}
+		}
 	}
 }

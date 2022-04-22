@@ -36,6 +36,7 @@ func isRegionalGKECluster(gceZone, gceRegion string) bool {
 
 func clusterDownGCE(k8sDir string) error {
 	cmd := exec.Command(filepath.Join(k8sDir, "hack", "e2e-internal", "e2e-down.sh"))
+	cmd.Env = os.Environ()
 	err := runCommand("Bringing Down E2E Cluster on GCE", cmd)
 	if err != nil {
 		return fmt.Errorf("failed to bring down kubernetes e2e cluster on gce: %v", err)
@@ -60,14 +61,15 @@ func clusterDownGKE(gceZone, gceRegion string) error {
 
 func buildKubernetes(k8sDir, command string) error {
 	cmd := exec.Command("make", "-C", k8sDir, command)
-	err := runCommand("Building Kubernetes", cmd)
+	cmd.Env = os.Environ()
+	err := runCommand(fmt.Sprintf("Running command in kubernetes/kubernetes path=%s", k8sDir), cmd)
 	if err != nil {
 		return fmt.Errorf("failed to build Kubernetes: %v", err)
 	}
 	return nil
 }
 
-func clusterUpGCE(k8sDir, gceZone string, numNodes int, imageType string) error {
+func clusterUpGCE(k8sDir, gceZone string, numNodes int, numWindowsNodes int, imageType string) error {
 	kshPath := filepath.Join(k8sDir, "cluster", "kubectl.sh")
 	_, err := os.Stat(kshPath)
 	if err == nil {
@@ -98,6 +100,14 @@ func clusterUpGCE(k8sDir, gceZone string, numNodes int, imageType string) error 
 		return err
 	}
 
+	// the chain is NUM_WINDOWS_NODES -> --num-windows-nodes -> NUM_WINDOWS_NODES
+	// runCommand runs e2e-up.sh inheriting env vars so the `--num-windows-nodes`
+	// flags might not be needed, added to be similar to the setup of NUM_NODES
+	err = os.Setenv("NUM_WINDOWS_NODES", strconv.Itoa(numWindowsNodes))
+	if err != nil {
+		return err
+	}
+
 	// The default master size with few nodes is too small; the tests must hit the API server
 	// more than usual. The main issue seems to be memory, to reduce GC times that stall the
 	// api server. For defaults, get-master-size in k/k/cluster/gce/config-common.sh.
@@ -113,6 +123,7 @@ func clusterUpGCE(k8sDir, gceZone string, numNodes int, imageType string) error 
 		return err
 	}
 	cmd := exec.Command(filepath.Join(k8sDir, "hack", "e2e-internal", "e2e-up.sh"))
+	cmd.Env = os.Environ()
 	err = runCommand("Starting E2E Cluster on GCE", cmd)
 	if err != nil {
 		return fmt.Errorf("failed to bring up kubernetes e2e cluster on gce: %v", err)
@@ -124,8 +135,9 @@ func clusterUpGCE(k8sDir, gceZone string, numNodes int, imageType string) error 
 func setImageTypeEnvs(imageType string) error {
 	switch strings.ToLower(imageType) {
 	case "cos":
+	case "cos_containerd":
 	case "gci": // GCI/COS is default type and does not need env vars set
-	case "ubuntu":
+	case "ubuntu", "ubuntu_containerd":
 		return errors.New("setting environment vars for bringing up *ubuntu* cluster on GCE is unimplemented")
 		/* TODO(dyzz) figure out how to bring up a Ubuntu cluster on GCE. The below doesn't work.
 		err := os.Setenv("KUBE_OS_DISTRIBUTION", "ubuntu")
@@ -147,7 +159,7 @@ func setImageTypeEnvs(imageType string) error {
 	return nil
 }
 
-func clusterUpGKE(gceZone, gceRegion string, numNodes int, imageType string, useManagedDriver bool) error {
+func clusterUpGKE(gceZone, gceRegion string, numNodes int, numWindowsNodes int, imageType string, useManagedDriver bool) error {
 	locationArg, locationVal, err := gkeLocationArgs(gceZone, gceRegion)
 	if err != nil {
 		return err
@@ -185,8 +197,6 @@ func clusterUpGKE(gceZone, gceRegion string, numNodes int, imageType string, use
 	}
 
 	if useManagedDriver {
-		// PD CSI Driver add on is enabled only in gcloud beta.
-		cmdParams = append([]string{"beta"}, cmdParams...)
 		cmdParams = append(cmdParams, "--addons", "GcePersistentDiskCsiDriver")
 	}
 
@@ -215,7 +225,7 @@ func clusterUpGKE(gceZone, gceRegion string, numNodes int, imageType string, use
 
 func downloadKubernetesSource(pkgDir, k8sIoDir, kubeVersion string) error {
 	k8sDir := filepath.Join(k8sIoDir, "kubernetes")
-	klog.Infof("Downloading Kubernetes source for %s", kubeVersion)
+	klog.Infof("Downloading Kubernetes source v=%s to path=%s", kubeVersion, k8sIoDir)
 
 	if err := os.MkdirAll(k8sIoDir, 0777); err != nil {
 		return err
@@ -224,38 +234,27 @@ func downloadKubernetesSource(pkgDir, k8sIoDir, kubeVersion string) error {
 		return err
 	}
 
+	// We clone rather than download from release archives, because the file naming has not been
+	// stable.  For example, in late 2021 it appears that archives of minor versions (eg v1.21.tgz)
+	// stopped and was replaced with just patch version.
 	if kubeVersion == "master" {
-		// Clone of master. We cannot download the master version from the archive, because the k8s
-		// version is not set, which affects which APIs are removed in the running cluster. We cannot
-		// use a shallow clone, because in order to find the revision git searches through the tags,
-		// and tags are not fetched in a shallow clone. Not using a shallow clone adds about 700M to the
-		// ~5G archive directory, after make quick-release, so this is not disastrous.
+		// Clone of master. We cannot use a shallow clone, because the k8s version is not set, and
+		// in order to find the revision git searches through the tags, and tags are not fetched in
+		// a shallow clone. Not using a shallow clone adds about 700M to the ~5G archive directory,
+		// after make quick-release, so this is not disastrous.
 		klog.Info("cloning k8s master")
 		out, err := exec.Command("git", "clone", "https://github.com/kubernetes/kubernetes", k8sDir).CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("failed to clone kubernetes master: %s, err: %v", out, err)
 		}
 	} else {
-		// Download from the release archives rather than cloning the repo.
+		// Shallow clone of a release branch.
 		vKubeVersion := "v" + kubeVersion
-		kubeTarDir := filepath.Join(k8sIoDir, fmt.Sprintf("kubernetes-%s.tar.gz", kubeVersion))
-		klog.Infof("Pulling archive for %s", vKubeVersion)
-		out, err := exec.Command("curl", "-L", fmt.Sprintf("https://github.com/kubernetes/kubernetes/archive/%s.tar.gz", vKubeVersion), "-o", kubeTarDir).CombinedOutput()
+		klog.Infof("shallow clone of k8s %s", vKubeVersion)
+		out, err := exec.Command("git", "clone", "--depth", "1", "https://github.com/kubernetes/kubernetes", k8sDir).CombinedOutput()
 		if err != nil {
-			return fmt.Errorf("failed to curl kubernetes version %s: %s, err: %v", kubeVersion, out, err)
+			return fmt.Errorf("failed to clone kubernetes %s: %s, err: %v", vKubeVersion, out, err)
 		}
-
-		out, err = exec.Command("tar", "-C", k8sIoDir, "-xvf", kubeTarDir).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("failed to untar %s: %s, err: %v", kubeTarDir, out, err)
-		}
-
-		err = os.Rename(filepath.Join(k8sIoDir, fmt.Sprintf("kubernetes-%s", kubeVersion)), k8sDir)
-		if err != nil {
-			return err
-		}
-
-		klog.Infof("Successfully downloaded Kubernetes v%s to %s", kubeVersion, k8sDir)
 	}
 	return nil
 }

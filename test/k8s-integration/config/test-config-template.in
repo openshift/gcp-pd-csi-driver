@@ -4,8 +4,13 @@ StorageClass:
 SnapshotClass:
   FromFile: {{ .SnapshotClassFile }}
 {{end}}
+{{if .Timeouts}}
+Timeouts:
+  {{ range $key, $value := .Timeouts }}{{ $key }}: {{ $value }}
+  {{ end }}
+{{end}}
 DriverInfo:
-  Name: csi-gcepd-{{.StorageClass}}
+  Name: csi-gcepd-{{.StorageClass}}--{{.SnapshotClass}}
   SupportedFsType:
   {{range .SupportedFsType}}  {{ . }}:
   {{end}}

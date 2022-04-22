@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 
@@ -44,8 +45,9 @@ var (
 	localK8sDir          = flag.String("local-k8s-dir", "", "local prebuilt kubernetes/kubernetes directory to use for cluster and test binaries")
 	deploymentStrat      = flag.String("deployment-strategy", "gce", "choose between deploying on gce or gke")
 	gkeClusterVer        = flag.String("gke-cluster-version", "", "version of Kubernetes master and node for gke")
-	numNodes             = flag.Int("num-nodes", -1, "the number of nodes in the test cluster")
-	imageType            = flag.String("image-type", "cos", "the image type to use for the cluster")
+	numNodes             = flag.Int("num-nodes", 0, "the number of nodes in the test cluster")
+	numWindowsNodes      = flag.Int("num-windows-nodes", 0, "the number of Windows nodes in the test cluster")
+	imageType            = flag.String("image-type", "cos_containerd", "the image type to use for the cluster")
 	gkeReleaseChannel    = flag.String("gke-release-channel", "", "GKE release channel to be used for cluster deploy. One of 'rapid', 'stable' or 'regular'")
 	gkeTestClusterPrefix = flag.String("gke-cluster-prefix", "pdcsi", "Prefix of GKE cluster names. A random suffix will be appended to form the full name.")
 	gkeTestClusterName   = flag.String("gke-cluster-name", "", "Name of existing cluster")
@@ -55,7 +57,7 @@ var (
 	// Test infrastructure flags
 	boskosResourceType = flag.String("boskos-resource-type", "gce-project", "name of the boskos resource type to reserve")
 	storageClassFiles  = flag.String("storageclass-files", "", "name of storageclass yaml file to use for test relative to test/k8s-integration/config. This may be a comma-separated list to test multiple storage classes")
-	snapshotClassFile  = flag.String("snapshotclass-file", "", "name of snapshotclass yaml file to use for test relative to test/k8s-integration/config")
+	snapshotClassFiles = flag.String("snapshotclass-files", "", "name of snapshotclass yaml file to use for test relative to test/k8s-integration/config. This may be a comma-separated list to test multiple storage classes")
 	inProw             = flag.Bool("run-in-prow", false, "is the test running in PROW")
 
 	// Driver flags
@@ -112,6 +114,11 @@ func main() {
 	flag.Set("logtostderr", "true")
 	flag.Parse()
 
+	if *useGKEManagedDriver {
+		*doDriverBuild = false
+		*teardownDriver = false
+	}
+
 	if !*inProw && *doDriverBuild {
 		ensureVariable(stagingImage, true, "staging-image is a required flag, please specify the name of image to stage to")
 	}
@@ -148,14 +155,10 @@ func main() {
 	if !*bringupCluster && *platform != "windows" {
 		ensureVariable(kubeFeatureGates, false, "kube-feature-gates set but not bringing up new cluster")
 	} else {
-		ensureVariable(imageType, true, "image type is a required flag. Available options include 'cos' and 'ubuntu'")
+		ensureVariable(imageType, true, "image type is a required flag. A good default is 'cos_containerd'")
 		if *isRegionalCluster {
 			klog.Error("is-regional-cluster can only be set when using an existing cluster")
 		}
-	}
-
-	if *platform == "windows" {
-		ensureFlag(bringupCluster, false, "bringupCluster is set to false if it is for testing in windows cluster")
 	}
 
 	if *deploymentStrat == "gke" {
@@ -180,8 +183,11 @@ func main() {
 		ensureVariable(testVersion, false, "Cannot set a test version when using a local k8s dir.")
 	}
 
-	if *numNodes == -1 && *bringupCluster {
+	if *numNodes == 0 && *bringupCluster {
 		klog.Fatalf("num-nodes must be set to number of nodes in cluster")
+	}
+	if *numWindowsNodes == 0 && *bringupCluster && *platform == "windows" {
+		klog.Fatalf("num-windows-nodes must be set if the platform is windows")
 	}
 
 	err := handle()
@@ -197,7 +203,6 @@ func handle() error {
 	testParams := &testParameters{
 		platform:            *platform,
 		testFocus:           *testFocus,
-		snapshotClassFile:   *snapshotClassFile,
 		stagingVersion:      string(uuid.NewUUID()),
 		deploymentStrategy:  *deploymentStrat,
 		useGKEManagedDriver: *useGKEManagedDriver,
@@ -219,24 +224,19 @@ func handle() error {
 		if err != nil {
 			return fmt.Errorf("failed to get gcloud project: %s, err: %v", oldProject, err)
 		}
-		// TODO: Currently for prow tests with linux cluster, here it manually sets up a project from Boskos.
-		// For Windows, we used kubernetes_e2e.py which already set up the project and kubernetes automatically.
-		// Will update Linux in the future to use the same way as Windows test.
-		if *platform != "windows" {
-			newproject, _ := testutils.SetupProwConfig(*boskosResourceType)
-			err = setEnvProject(newproject)
-			if err != nil {
-				return fmt.Errorf("failed to set project environment to %s: %v", newproject, err)
-			}
-
-			defer func() {
-				err = setEnvProject(string(oldProject))
-				if err != nil {
-					klog.Errorf("failed to set project environment to %s: %v", oldProject, err)
-				}
-			}()
-			project = newproject
+		newproject, _ := testutils.SetupProwConfig(*boskosResourceType)
+		err = setEnvProject(newproject)
+		if err != nil {
+			return fmt.Errorf("failed to set project environment to %s: %v", newproject, err)
 		}
+
+		defer func() {
+			err = setEnvProject(string(oldProject))
+			if err != nil {
+				klog.Errorf("failed to set project environment to %s: %v", oldProject, err)
+			}
+		}()
+		project = newproject
 		if *doDriverBuild {
 			*stagingImage = fmt.Sprintf("gcr.io/%s/gcp-persistent-disk-csi-driver", strings.TrimSpace(string(project)))
 		}
@@ -250,6 +250,7 @@ func handle() error {
 
 	// Build and push the driver, if required. Defer the driver image deletion.
 	if *doDriverBuild {
+		klog.Infof("Building GCE PD CSI Driver")
 		err := pushImage(testParams.pkgDir, *stagingImage, testParams.stagingVersion, testParams.platform)
 		if err != nil {
 			return fmt.Errorf("failed pushing image: %v", err)
@@ -320,9 +321,9 @@ func handle() error {
 		var err error = nil
 		switch *deploymentStrat {
 		case "gce":
-			err = clusterUpGCE(testParams.k8sSourceDir, *gceZone, *numNodes, testParams.imageType)
+			err = clusterUpGCE(testParams.k8sSourceDir, *gceZone, *numNodes, *numWindowsNodes, testParams.imageType)
 		case "gke":
-			err = clusterUpGKE(*gceZone, *gceRegion, *numNodes, testParams.imageType, testParams.useGKEManagedDriver)
+			err = clusterUpGKE(*gceZone, *gceRegion, *numNodes, *numWindowsNodes, testParams.imageType, testParams.useGKEManagedDriver)
 		default:
 			err = fmt.Errorf("deployment-strategy must be set to 'gce' or 'gke', but is: %s", testParams.deploymentStrategy)
 		}
@@ -354,6 +355,8 @@ func handle() error {
 	// For windows cluster, when cluster is up, all Windows nodes are tainted with NoSchedule to avoid linux pods
 	// being scheduled to Windows nodes. When running windows tests, we need to remove the taint.
 	if testParams.platform == "windows" {
+		klog.Infof("Removing taints from all windows nodes.")
+
 		nodesCmd := exec.Command("kubectl", "get", "nodes", "-l", "kubernetes.io/os=windows", "-o", "name")
 		out, err := nodesCmd.CombinedOutput()
 		if err != nil {
@@ -422,6 +425,7 @@ func handle() error {
 	// unschedulable.
 	testParams.allowedNotReadyNodes = 0
 	if *platform == "windows" {
+		klog.Infof("Tainting linux nodes")
 		nodesCmd := exec.Command("kubectl", "get", "nodes", "-l", "kubernetes.io/os=linux", "-o", "name")
 		out, err := nodesCmd.CombinedOutput()
 		if err != nil {
@@ -476,6 +480,7 @@ func handle() error {
 	// Run the tests using the k8sSourceDir kubernetes
 	if len(*storageClassFiles) != 0 {
 		applicableStorageClassFiles := []string{}
+		applicableSnapshotClassFiles := []string{}
 		for _, rawScFile := range strings.Split(*storageClassFiles, ",") {
 			scFile := strings.TrimSpace(rawScFile)
 			if len(scFile) == 0 {
@@ -490,13 +495,29 @@ func handle() error {
 		if len(applicableStorageClassFiles) == 0 {
 			return fmt.Errorf("No applicable storage classes found")
 		}
+		for _, rawSnapshotClassFile := range strings.Split(*snapshotClassFiles, ",") {
+			snapshotClassFile := strings.TrimSpace(rawSnapshotClassFile)
+			if len(snapshotClassFile) != 0 {
+				applicableSnapshotClassFiles = append(applicableSnapshotClassFiles, snapshotClassFile)
+			}
+		}
+		if len(applicableSnapshotClassFiles) == 0 {
+			// when no snapshot class specified, we run the tests without snapshot capability
+			applicableSnapshotClassFiles = append(applicableSnapshotClassFiles, "")
+		}
 		var ginkgoErrors []string
 		var testOutputDirs []string
 		for _, scFile := range applicableStorageClassFiles {
 			outputDir := strings.TrimSuffix(scFile, ".yaml")
-			testOutputDirs = append(testOutputDirs, outputDir)
-			if err = runCSITests(testParams, scFile, outputDir); err != nil {
-				ginkgoErrors = append(ginkgoErrors, err.Error())
+			for _, snapshotClassFile := range applicableSnapshotClassFiles {
+				if len(snapshotClassFile) != 0 {
+					outputDir = fmt.Sprintf("%s--%s", outputDir, strings.TrimSuffix(snapshotClassFile, ".yaml"))
+				}
+				testOutputDirs = append(testOutputDirs, outputDir)
+				testParams.snapshotClassFile = snapshotClassFile
+				if err = runCSITests(testParams, scFile, outputDir); err != nil {
+					ginkgoErrors = append(ginkgoErrors, err.Error())
+				}
 			}
 		}
 		if err = mergeArtifacts(testOutputDirs); err != nil {
@@ -543,15 +564,22 @@ func generateGCETestSkip(testParams *testParameters) string {
 	if testParams.platform == "windows" {
 		skipString = skipString + "|\\[LinuxOnly\\]"
 	}
+
 	return skipString
 }
 
 func generateGKETestSkip(testParams *testParameters) string {
 	skipString := "\\[Disruptive\\]|\\[Serial\\]"
+
 	curVer := mustParseVersion(testParams.clusterVersion)
 	var nodeVer *version
 	if testParams.nodeVersion != "" {
 		nodeVer = mustParseVersion(testParams.nodeVersion)
+	}
+
+	// Cloning test fixes were introduced after 1.23.
+	if curVer.lessThan(mustParseVersion("1.24.0")) {
+		skipString = skipString + "|\\[Feature:VolumeSnapshotDataSource\\]|pvc.data.source"
 	}
 
 	// "volumeMode should not mount / map unused volumes in a pod" tests a
@@ -564,6 +592,12 @@ func generateGKETestSkip(testParams *testParameters) string {
 	// Check master and node version to skip Pod FsgroupChangePolicy test suite.
 	if curVer.lessThan(mustParseVersion("1.20.0")) || (nodeVer != nil && nodeVer.lessThan(mustParseVersion("1.20.0"))) {
 		skipString = skipString + "|fsgroupchangepolicy"
+	}
+
+	// Generic Ephemeral volume is only enabled in version 1.21.
+	// If there's node skew Generic Ephemeral volume tests might not be skipped correctly
+	if curVer.lessThan(mustParseVersion("1.21.0")) || (nodeVer != nil && nodeVer.lessThan(mustParseVersion("1.21.0"))) {
+		skipString = skipString + "|Generic\\sEphemeral-volume"
 	}
 
 	// ExpandCSIVolumes feature is beta in k8s 1.16
@@ -579,7 +613,6 @@ func generateGKETestSkip(testParams *testParameters) string {
 		(!testParams.useGKEManagedDriver && (*curVer).lessThan(mustParseVersion("1.17.0"))) {
 		skipString = skipString + "|VolumeSnapshotDataSource"
 	}
-
 	return skipString
 }
 
@@ -645,30 +678,68 @@ func runTestsWithConfig(testParams *testParameters, testConfigArg, reportPrefix 
 
 	testArgs := fmt.Sprintf("%s %s", ginkgoArgs, testConfigArg)
 
-	kubeTestArgs := []string{
-		"--test",
-		"--ginkgo-parallel",
-		"--check-version-skew=false",
-		fmt.Sprintf("--test_args=%s", testArgs),
+	// kubetest2 flags
+	var runID string
+	if uid, exists := os.LookupEnv("PROW_JOB_ID"); exists && uid != "" {
+		// reuse uid for CI use cases
+		runID = uid
+	} else {
+		runID = string(uuid.NewUUID())
 	}
 
+	// Usage: kubetest2 <deployer> [Flags] [DeployerFlags] -- [TesterArgs]
+	// [Flags]
 	kubeTest2Args := []string{
 		*deploymentStrat,
+		fmt.Sprintf("--run-id=%s", runID),
 		"--test=ginkgo",
 	}
+
+	// [DeployerFlags]
 	kubeTest2Args = append(kubeTest2Args, testParams.cloudProviderArgs...)
 	if kubetestDumpDir != "" {
 		kubeTest2Args = append(kubeTest2Args, fmt.Sprintf("--artifacts=%s", kubetestDumpDir))
 	}
+
 	kubeTest2Args = append(kubeTest2Args, "--")
-	if len(*testVersion) != 0 && *testVersion != "master" {
-		kubeTest2Args = append(kubeTest2Args, fmt.Sprintf("--test-package-version=v%s", *testVersion))
+
+	// [TesterArgs]
+	if len(*testVersion) != 0 {
+		if *testVersion == "master" {
+			// the kubernetes binaries should've already been built above because of `--kube-version`
+			// or by the user if --local-k8s-dir was set, these binaries should be copied to the
+			// path sent to kubetest2 through its --artifacts path
+
+			// pkg/_artifacts is the default value that kubetests uses for --artifacts
+			kubernetesTestBinariesPath := filepath.Join(testParams.pkgDir, "_artifacts")
+			if kubetestDumpDir != "" {
+				// a custom artifacts dir was set
+				kubernetesTestBinariesPath = kubetestDumpDir
+			}
+			kubernetesTestBinariesPath = filepath.Join(kubernetesTestBinariesPath, runID)
+
+			klog.Infof("Copying kubernetes binaries to path=%s to run the tests", kubernetesTestBinariesPath)
+			err := copyKubernetesTestBinaries(testParams.k8sSourceDir, kubernetesTestBinariesPath)
+			if err != nil {
+				return fmt.Errorf("Failed to copy the kubernetes test binaries, err=%v", err)
+			}
+			kubeTest2Args = append(kubeTest2Args, "--use-built-binaries")
+		} else {
+			kubeTest2Args = append(kubeTest2Args, fmt.Sprintf("--test-package-marker=latest-%s.txt", *testVersion))
+		}
 	}
 	kubeTest2Args = append(kubeTest2Args, fmt.Sprintf("--focus-regex=%s", testParams.testFocus))
 	kubeTest2Args = append(kubeTest2Args, fmt.Sprintf("--skip-regex=%s", testParams.testSkip))
 	kubeTest2Args = append(kubeTest2Args, fmt.Sprintf("--parallel=%d", testParams.parallel))
 	kubeTest2Args = append(kubeTest2Args, fmt.Sprintf("--test-args=%s %s", testConfigArg, windowsArgs))
 
+	// kubetest flags
+	kubeTestArgs := []string{
+		"--test",
+		"--ginkgo-parallel",
+		"--check-version-skew=false",
+		fmt.Sprintf("--test_args=%s", testArgs),
+	}
 	if kubetestDumpDir != "" {
 		kubeTestArgs = append(kubeTestArgs, fmt.Sprintf("--dump=%s", kubetestDumpDir))
 	}
@@ -683,5 +754,32 @@ func runTestsWithConfig(testParams *testParameters, testConfigArg, reportPrefix 
 		return fmt.Errorf("failed to run tests on e2e cluster: %v", err)
 	}
 
+	return nil
+}
+
+var (
+	kubernetesTestBinaries = []string{
+		"kubectl",
+		"e2e.test",
+		"ginkgo",
+	}
+)
+
+// copyKubernetesBinariesForTest copies the common test binaries to the output directory
+func copyKubernetesTestBinaries(kuberoot string, outroot string) error {
+	const dockerizedOutput = "_output/dockerized"
+	root := filepath.Join(kuberoot, dockerizedOutput, "bin", runtime.GOOS, runtime.GOARCH)
+	for _, binary := range kubernetesTestBinaries {
+		source := filepath.Join(root, binary)
+		dest := filepath.Join(outroot, binary)
+		if _, err := os.Stat(source); err == nil {
+			klog.Infof("copying %s to %s", source, dest)
+			if err := CopyFile(source, dest); err != nil {
+				return fmt.Errorf("failed to copy %s to %s: %v", source, dest, err)
+			}
+		} else {
+			return fmt.Errorf("could not find %s: %v", source, err)
+		}
+	}
 	return nil
 }

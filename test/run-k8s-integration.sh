@@ -6,6 +6,7 @@
 #   use the driver version from the overlay
 # GCE_PD_BOSKOS_RESOURCE_TYPE: name of the boskos resource type to reserve
 
+set -o xtrace
 set -o nounset
 set -o errexit
 
@@ -19,7 +20,7 @@ readonly kube_version=${GCE_PD_KUBE_VERSION:-master}
 readonly test_version=${TEST_VERSION:-master}
 readonly gce_zone=${GCE_CLUSTER_ZONE:-us-central1-b}
 readonly gce_region=${GCE_CLUSTER_REGION:-}
-readonly image_type=${IMAGE_TYPE:-cos}
+readonly image_type=${IMAGE_TYPE:-cos_containerd}
 readonly use_gke_managed_driver=${USE_GKE_MANAGED_DRIVER:-false}
 readonly gke_release_channel=${GKE_RELEASE_CHANNEL:-""}
 readonly teardown_driver=${GCE_PD_TEARDOWN_DRIVER:-true}
@@ -43,7 +44,7 @@ fi
 base_cmd="${PKGDIR}/bin/k8s-integration-test \
             --run-in-prow=true --service-account-file=${E2E_GOOGLE_APPLICATION_CREDENTIALS} \
             --do-driver-build=${do_driver_build} --teardown-driver=${teardown_driver} --boskos-resource-type=${boskos_resource_type} \
-            --storageclass-files=sc-standard.yaml --snapshotclass-file=pd-volumesnapshotclass.yaml \
+            --storageclass-files=sc-standard.yaml --snapshotclass-files=pd-volumesnapshotclass.yaml \
             --deployment-strategy=${deployment_strategy} --test-version=${test_version} \
             --num-nodes=3 --image-type=${image_type} --use-kubetest2=${use_kubetest2}"
 

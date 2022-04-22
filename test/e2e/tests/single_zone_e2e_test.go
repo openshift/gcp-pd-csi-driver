@@ -87,14 +87,12 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		Expect(err).To(BeNil(), "Failed to go through volume lifecycle")
 	})
 
-	It("Should automatically fix symlink errors between /dev/sdx and /dev/by-id if disk is not found", func() {
+	It("Should automatically fix the symlink between /dev/* and /dev/by-id if the disk does not match", func() {
 		testContext := getRandomTestContext()
 
 		p, z, _ := testContext.Instance.GetIdentity()
 		client := testContext.Client
 		instance := testContext.Instance
-
-		// Set-up instance to have scsi_id where we expect it
 
 		// Create Disk
 		volName, volID := createAndValidateUniqueZonalDisk(client, p, z)
@@ -123,6 +121,78 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		}()
 
 		// MESS UP THE symlink
+		devicePaths := mountmanager.NewDeviceUtils().GetDiskByIdPaths(volName, "")
+		for _, devicePath := range devicePaths {
+			err = testutils.RmAll(instance, devicePath)
+			Expect(err).To(BeNil(), "failed to remove /dev/by-id folder")
+			err = testutils.Symlink(instance, "/dev/null", devicePath)
+			Expect(err).To(BeNil(), "failed to add invalid symlink /dev/by-id folder")
+		}
+
+		// Stage Disk
+		stageDir := filepath.Join("/tmp/", volName, "stage")
+		err = client.NodeStageExt4Volume(volID, stageDir)
+		Expect(err).To(BeNil(), "failed to repair /dev/by-id symlink and stage volume")
+
+		// Validate that the link is correct
+		var validated bool
+		for _, devicePath := range devicePaths {
+			validated, err = testutils.ValidateLogicalLinkIsDisk(instance, devicePath, volName)
+			Expect(err).To(BeNil(), "failed to validate link %s is disk %s: %v", stageDir, volName, err)
+			if validated {
+				break
+			}
+		}
+		Expect(validated).To(BeTrue(), "could not find device in %v that links to volume %s", devicePaths, volName)
+
+		defer func() {
+			// Unstage Disk
+			err = client.NodeUnstageVolume(volID, stageDir)
+			if err != nil {
+				klog.Errorf("Failed to unstage volume: %v", err)
+			}
+			fp := filepath.Join("/tmp/", volName)
+			err = testutils.RmAll(instance, fp)
+			if err != nil {
+				klog.Errorf("Failed to rm file path %s: %v", fp, err)
+			}
+		}()
+	})
+
+	It("Should automatically add a symlink between /dev/* and /dev/by-id if disk is not found", func() {
+		testContext := getRandomTestContext()
+
+		p, z, _ := testContext.Instance.GetIdentity()
+		client := testContext.Client
+		instance := testContext.Instance
+
+		// Create Disk
+		volName, volID := createAndValidateUniqueZonalDisk(client, p, z)
+
+		defer func() {
+			// Delete Disk
+			err := client.DeleteVolume(volID)
+			Expect(err).To(BeNil(), "DeleteVolume failed")
+
+			// Validate Disk Deleted
+			_, err = computeService.Disks.Get(p, z, volName).Do()
+			Expect(gce.IsGCEError(err, "notFound")).To(BeTrue(), "Expected disk to not be found")
+		}()
+
+		// Attach Disk
+		err := client.ControllerPublishVolume(volID, instance.GetNodeID())
+		Expect(err).To(BeNil(), "ControllerPublishVolume failed with error for disk %v on node %v: %v", volID, instance.GetNodeID())
+
+		defer func() {
+			// Detach Disk
+			err = client.ControllerUnpublishVolume(volID, instance.GetNodeID())
+			if err != nil {
+				klog.Errorf("Failed to detach disk: %v", err)
+			}
+
+		}()
+
+		// DELETE THE symlink
 		devicePaths := mountmanager.NewDeviceUtils().GetDiskByIdPaths(volName, "")
 		for _, devicePath := range devicePaths {
 			err = testutils.RmAll(instance, devicePath)
@@ -876,6 +946,65 @@ var _ = Describe("GCE PD CSI Driver", func() {
 			Expect(gce.IsGCEError(err, "notFound")).To(BeTrue(), "Expected snapshot to not be found")
 		}()
 	})
+
+	// Use the region of the test location.
+	It("Should successfully create snapshot backed by disk image", func() {
+		testContext := getRandomTestContext()
+
+		p, z, _ := testContext.Instance.GetIdentity()
+		client := testContext.Client
+
+		// Create Disk
+		volName, volID := createAndValidateUniqueZonalDisk(client, p, z)
+
+		// Create Snapshot
+		snapshotName := testNamePrefix + string(uuid.NewUUID())
+		testImageFamily := "test-family"
+
+		snapshotParams := map[string]string{common.ParameterKeySnapshotType: common.DiskImageType, common.ParameterKeyImageFamily: testImageFamily}
+		snapshotID, err := client.CreateSnapshot(snapshotName, volID, snapshotParams)
+		Expect(err).To(BeNil(), "CreateSnapshot failed with error: %v", err)
+
+		// Validate Snapshot Created
+		snapshot, err := computeService.Images.Get(p, snapshotName).Do()
+		Expect(err).To(BeNil(), "Could not get snapshot from cloud directly")
+		Expect(snapshot.Name).To(Equal(snapshotName))
+
+		err = wait.Poll(10*time.Second, 5*time.Minute, func() (bool, error) {
+			snapshot, err := computeService.Images.Get(p, snapshotName).Do()
+			Expect(err).To(BeNil(), "Could not get snapshot from cloud directly")
+			if snapshot.Status == "READY" {
+				return true, nil
+			}
+			return false, nil
+		})
+		Expect(err).To(BeNil(), "Could not wait for snapshot be ready")
+
+		// Check Snapshot Type
+		snapshot, err = computeService.Images.Get(p, snapshotName).Do()
+		Expect(err).To(BeNil(), "Could not get snapshot from cloud directly")
+		_, snapshotType, _, err := common.SnapshotIDToProjectKey(cleanSelfLink(snapshot.SelfLink))
+		Expect(err).To(BeNil(), "Failed to parse snapshot ID")
+		Expect(snapshotType).To(Equal(common.DiskImageType), "Expected images type in snapshot ID")
+
+		defer func() {
+			// Delete Disk
+			err := client.DeleteVolume(volID)
+			Expect(err).To(BeNil(), "DeleteVolume failed")
+
+			// Validate Disk Deleted
+			_, err = computeService.Disks.Get(p, z, volName).Do()
+			Expect(gce.IsGCEError(err, "notFound")).To(BeTrue(), "Expected disk to not be found")
+
+			// Delete Snapshot
+			err = client.DeleteSnapshot(snapshotID)
+			Expect(err).To(BeNil(), "DeleteSnapshot failed")
+
+			// Validate Snapshot Deleted
+			_, err = computeService.Images.Get(p, snapshotName).Do()
+			Expect(gce.IsGCEError(err, "notFound")).To(BeTrue(), "Expected snapshot to not be found")
+		}()
+	})
 })
 
 func equalWithinEpsilon(a, b, epsiolon int64) bool {
@@ -954,4 +1083,10 @@ func createAndValidateUniqueZonalMultiWriterDisk(client *remote.CsiClient, proje
 	Expect(cloudDisk.MultiWriter).To(Equal(true))
 
 	return volName, volID
+}
+
+func cleanSelfLink(selfLink string) string {
+	temp := strings.TrimPrefix(selfLink, gce.GCEComputeAPIEndpoint)
+	temp = strings.TrimPrefix(temp, gce.GCEComputeBetaAPIEndpoint)
+	return strings.TrimPrefix(temp, gce.GCEComputeAlphaAPIEndpoint)
 }

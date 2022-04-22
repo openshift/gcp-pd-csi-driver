@@ -3,6 +3,6 @@ kind: Kustomization
 namespace:
   gce-pd-csi-driver
 resources:
-- ../../base
+- ../../base/
 transformers:
 - ../../images/stable-master
