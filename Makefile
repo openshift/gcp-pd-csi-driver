@@ -41,8 +41,12 @@ gce-pd-driver: require-GCE_PD_CSI_STAGING_VERSION
 	go build -mod=vendor -gcflags=$(GCFLAGS) -ldflags "-X main.version=$(STAGINGVERSION)" -o bin/${DRIVERBINARY} ./cmd/gce-pd-csi-driver/
 
 gce-pd-driver-windows: require-GCE_PD_CSI_STAGING_VERSION
+ifeq (${GOARCH}, amd64)
 	mkdir -p bin
 	GOOS=windows go build -mod=vendor -ldflags -X=main.version=$(STAGINGVERSION) -o bin/${DRIVERWINDOWSBINARY} ./cmd/gce-pd-csi-driver/
+else
+  $(warning gcp-pd-driver-windows only supports amd64.)
+endif
 
 build-container: require-GCE_PD_CSI_STAGING_IMAGE require-GCE_PD_CSI_STAGING_VERSION init-buildx
 	$(DOCKER) buildx build --platform=linux --progress=plain \
@@ -82,7 +86,7 @@ build-and-push-container-linux-amd64: require-GCE_PD_CSI_STAGING_IMAGE init-buil
 		--build-arg STAGINGVERSION=$(STAGINGVERSION) --push .
 
 build-and-push-container-linux-arm64: require-GCE_PD_CSI_STAGING_IMAGE init-buildx
-	$(DOCKER) buildx build --file=Dockerfile.arm64 --platform=linux/arm64 \
+	$(DOCKER) buildx build --file=Dockerfile --platform=linux/arm64 \
 		-t $(STAGINGIMAGE):$(STAGINGVERSION)_linux_arm64 \
 		--build-arg BUILDPLATFORM=linux \
 		--build-arg STAGINGVERSION=$(STAGINGVERSION) --push .

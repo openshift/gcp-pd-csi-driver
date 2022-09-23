@@ -38,7 +38,6 @@ import (
 )
 
 const (
-	defaultMachine      = "n1-standard-1"
 	defaultFirewallRule = "default-allow-ssh"
 
 	// timestampFormat is the timestamp format used in the e2e directory name.
@@ -46,9 +45,11 @@ const (
 )
 
 type InstanceInfo struct {
-	project string
-	zone    string
-	name    string
+	project      string
+	architecture string
+	zone         string
+	name         string
+	machineType  string
 
 	// External IP is filled in after instance creation
 	externalIP string
@@ -68,18 +69,20 @@ func (i *InstanceInfo) GetNodeID() string {
 	return common.CreateNodeID(i.project, i.zone, i.name)
 }
 
-func CreateInstanceInfo(project, instanceZone, name string, cs *compute.Service) (*InstanceInfo, error) {
+func CreateInstanceInfo(project, instanceArchitecture, instanceZone, name, machineType string, cs *compute.Service) (*InstanceInfo, error) {
 	return &InstanceInfo{
-		project: project,
-		zone:    instanceZone,
-		name:    name,
+		project:      project,
+		architecture: instanceArchitecture,
+		zone:         instanceZone,
+		name:         name,
+		machineType:  machineType,
 
 		computeService: cs,
 	}, nil
 }
 
 // Provision a gce instance using image
-func (i *InstanceInfo) CreateOrGetInstance(serviceAccount string) error {
+func (i *InstanceInfo) CreateOrGetInstance(imageURL, serviceAccount string) error {
 	var err error
 	var instance *compute.Instance
 	klog.V(4).Infof("Creating instance: %v", i.name)
@@ -91,10 +94,9 @@ func (i *InstanceInfo) CreateOrGetInstance(serviceAccount string) error {
 		return fmt.Errorf("Failed to create firewall rule: %v", err)
 	}
 
-	imageURL := "projects/debian-cloud/global/images/family/debian-11"
-	inst := &compute.Instance{
+	newInst := &compute.Instance{
 		Name:        i.name,
-		MachineType: machineType(i.zone, ""),
+		MachineType: fmt.Sprintf("zones/%s/machineTypes/%s", i.zone, i.machineType),
 		NetworkInterfaces: []*compute.NetworkInterface{
 			{
 				AccessConfigs: []*compute.AccessConfig{
@@ -121,7 +123,7 @@ func (i *InstanceInfo) CreateOrGetInstance(serviceAccount string) error {
 		Email:  serviceAccount,
 		Scopes: []string{"https://www.googleapis.com/auth/cloud-platform"},
 	}
-	inst.ServiceAccounts = []*compute.ServiceAccount{saObj}
+	newInst.ServiceAccounts = []*compute.ServiceAccount{saObj}
 
 	if pubkey, ok := os.LookupEnv("JENKINS_GCE_SSH_PUBLIC_KEY_FILE"); ok {
 		klog.V(4).Infof("JENKINS_GCE_SSH_PUBLIC_KEY_FILE set to %v, adding public key to Instance", pubkey)
@@ -129,12 +131,35 @@ func (i *InstanceInfo) CreateOrGetInstance(serviceAccount string) error {
 		if err != nil {
 			return err
 		}
-		inst.Metadata = meta
+		newInst.Metadata = meta
 	}
 
-	if _, err := i.computeService.Instances.Get(i.project, i.zone, inst.Name).Do(); err != nil {
-		op, err := i.computeService.Instances.Insert(i.project, i.zone, inst).Do()
-		klog.V(4).Infof("Inserted instance %v in project: %v, zone: %v", inst.Name, i.project, i.zone)
+	// If instance exists but machine-type doesn't match, delete instance
+	curInst, _ := i.computeService.Instances.Get(i.project, i.zone, newInst.Name).Do()
+	if curInst != nil {
+		if !strings.Contains(curInst.MachineType, newInst.MachineType) {
+			klog.V(4).Infof("Instance machine type doesn't match the required one. Delete instance.")
+			if _, err := i.computeService.Instances.Delete(i.project, i.zone, i.name).Do(); err != nil {
+				return err
+			}
+
+			then := time.Now()
+			err := wait.Poll(15*time.Second, 5*time.Minute, func() (bool, error) {
+				klog.V(2).Infof("Waiting for instance to be deleted. %v elapsed", time.Since(then))
+				if curInst, _ = i.computeService.Instances.Get(i.project, i.zone, i.name).Do(); curInst != nil {
+					return false, nil
+				}
+				return true, nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	if curInst == nil {
+		op, err := i.computeService.Instances.Insert(i.project, i.zone, newInst).Do()
+		klog.V(4).Infof("Inserted instance %v in project: %v, zone: %v", newInst.Name, i.project, i.zone)
 		if err != nil {
 			ret := fmt.Sprintf("could not create instance %s: API error: %v", i.name, err)
 			if op != nil {
@@ -145,7 +170,7 @@ func (i *InstanceInfo) CreateOrGetInstance(serviceAccount string) error {
 			return fmt.Errorf("could not create instance %s: %+v", i.name, op.Error)
 		}
 	} else {
-		klog.V(4).Infof("Compute service GOT instance %v, skipping instance creation", inst.Name)
+		klog.V(4).Infof("Compute service GOT instance %v, skipping instance creation", newInst.Name)
 	}
 
 	then := time.Now()
@@ -213,13 +238,6 @@ func getexternalIP(instance *compute.Instance) string {
 
 func getTimestamp() string {
 	return fmt.Sprintf(time.Now().Format(timestampFormat))
-}
-
-func machineType(zone, machine string) string {
-	if machine == "" {
-		machine = defaultMachine
-	}
-	return fmt.Sprintf("zones/%s/machineTypes/%s", zone, machine)
 }
 
 // Create default SSH filewall rule if it does not exist
