@@ -25,7 +25,7 @@ import (
 	"google.golang.org/api/googleapi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
 
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -34,9 +34,9 @@ import (
 const (
 	DiskSizeGb                = 10
 	Timestamp                 = "2018-09-05T15:17:08.270-07:00"
-	BasePath                  = "https://www.googleapis.com/compute/v1/projects/"
-	snapshotURITemplateGlobal = "%s/global/snapshots/%s" //{gce.projectID}/global/snapshots/{snapshot.Name}"
-	imageURITemplateGlobal    = "%s/global/images/%s"    //{gce.projectID}/global/images/{image.Name}"
+	BasePath                  = "https://www.googleapis.com/compute/v1/"
+	snapshotURITemplateGlobal = "projects/%s/global/snapshots/%s" //{gce.projectID}/global/snapshots/{snapshot.Name}"
+	imageURITemplateGlobal    = "projects/%s/global/images/%s"    //{gce.projectID}/global/images/{image.Name}"
 )
 
 type FakeCloudProvider struct {
@@ -103,7 +103,7 @@ func (cloud *FakeCloudProvider) RepairUnderspecifiedVolumeKey(ctx context.Contex
 		}
 		r, err := common.GetRegionFromZones([]string{cloud.zone})
 		if err != nil {
-			return "", nil, fmt.Errorf("failed to get region from zones: %v", err)
+			return "", nil, fmt.Errorf("failed to get region from zones: %w", err)
 		}
 		volumeKey.Region = r
 		return project, volumeKey, nil
@@ -344,6 +344,7 @@ func (cloud *FakeCloudProvider) CreateSnapshot(ctx context.Context, project stri
 		Status:            "UPLOADING",
 		SelfLink:          cloud.getGlobalSnapshotURI(project, snapshotName),
 		StorageLocations:  snapshotParams.StorageLocations,
+		Labels:            snapshotParams.Labels,
 	}
 	switch volKey.Type() {
 	case meta.Zonal:

@@ -14,7 +14,7 @@
 
 ARG BUILDPLATFORM
 
-FROM --platform=$BUILDPLATFORM golang:1.18.4 as builder
+FROM --platform=$BUILDPLATFORM golang:1.19.4 as builder
 
 ARG STAGINGVERSION
 ARG TARGETPLATFORM
@@ -40,7 +40,7 @@ ENV LIB_DIR_PREFIX x86_64
 FROM distroless-base AS distroless-arm64
 ENV LIB_DIR_PREFIX aarch64
 
-FROM distroless-$TARGETARCH
+FROM distroless-$TARGETARCH as output-image
 
 # Copy necessary dependencies into distroless base.
 COPY --from=builder /go/src/sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/bin/gce-pd-csi-driver /gce-pd-csi-driver
@@ -71,6 +71,7 @@ COPY --from=debian /bin/date /bin/date
 COPY --from=debian /bin/grep /bin/grep
 COPY --from=debian /bin/sed /bin/sed
 COPY --from=debian /bin/ln /bin/ln
+COPY --from=debian /bin/udevadm /bin/udevadm
 
 # Copy shared libraries into distroless base.
 COPY --from=debian /lib/${LIB_DIR_PREFIX}-linux-gnu/libblkid.so.1 \
@@ -79,6 +80,7 @@ COPY --from=debian /lib/${LIB_DIR_PREFIX}-linux-gnu/libblkid.so.1 \
                    /lib/${LIB_DIR_PREFIX}-linux-gnu/libe2p.so.2 \
                    /lib/${LIB_DIR_PREFIX}-linux-gnu/libext2fs.so.2 \
                    /lib/${LIB_DIR_PREFIX}-linux-gnu/libgcc_s.so.1 \
+                   /lib/${LIB_DIR_PREFIX}-linux-gnu/liblzma.so.5 \
                    /lib/${LIB_DIR_PREFIX}-linux-gnu/libmount.so.1 \
                    /lib/${LIB_DIR_PREFIX}-linux-gnu/libpcre.so.3 \
                    /lib/${LIB_DIR_PREFIX}-linux-gnu/libreadline.so.5 \
@@ -93,9 +95,22 @@ COPY --from=debian /usr/lib/${LIB_DIR_PREFIX}-linux-gnu/libacl.so.1 \
                    /usr/lib/${LIB_DIR_PREFIX}-linux-gnu/libicudata.so.63 \
                    /usr/lib/${LIB_DIR_PREFIX}-linux-gnu/libicui18n.so.63 \
                    /usr/lib/${LIB_DIR_PREFIX}-linux-gnu/libicuuc.so.63 \
+                   /usr/lib/${LIB_DIR_PREFIX}-linux-gnu/libkmod.so.2 \
                    /usr/lib/${LIB_DIR_PREFIX}-linux-gnu/libstdc++.so.6 /usr/lib/${LIB_DIR_PREFIX}-linux-gnu/
 
 # Copy NVME support required script and rules into distroless base.
 COPY deploy/kubernetes/udev/google_nvme_id /lib/udev_containerized/google_nvme_id
+
+# Build stage used for validation of the output-image
+# See validate-container-linux-* targets in Makefile
+FROM output-image as validation-image
+
+COPY --from=debian /usr/bin/ldd /usr/bin/find /usr/bin/xargs /usr/bin/
+COPY --from=builder /go/src/sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/hack/print-missing-deps.sh /print-missing-deps.sh
+SHELL ["/bin/bash", "-c"]
+RUN /print-missing-deps.sh
+
+# Final build stage, create the real Docker image with ENTRYPOINT
+FROM output-image
 
 ENTRYPOINT ["/gce-pd-csi-driver"]

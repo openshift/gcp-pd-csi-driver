@@ -16,17 +16,20 @@ package gceGCEDriver
 
 import (
 	"fmt"
+	"time"
 
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	"k8s.io/mount-utils"
 	common "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
 	gce "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/compute"
 	metadataservice "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/metadata"
 	mountmanager "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/mount-manager"
 )
+
+var maxLogChar int
 
 type GCEDriver struct {
 	name              string
@@ -148,17 +151,19 @@ func NewNodeServer(gceDriver *GCEDriver, mounter *mount.SafeFormatAndMount, devi
 	}
 }
 
-func NewControllerServer(gceDriver *GCEDriver, cloudProvider gce.GCECompute) *GCEControllerServer {
+func NewControllerServer(gceDriver *GCEDriver, cloudProvider gce.GCECompute, errorBackoffInitialDuration, errorBackoffMaxDuration time.Duration) *GCEControllerServer {
 	return &GCEControllerServer{
 		Driver:        gceDriver,
 		CloudProvider: cloudProvider,
 		seen:          map[string]int{},
 		volumeLocks:   common.NewVolumeLocks(),
-		errorBackoff:  newCsiErrorBackoff(),
+		errorBackoff:  newCsiErrorBackoff(errorBackoffInitialDuration, errorBackoffMaxDuration),
 	}
 }
 
-func (gceDriver *GCEDriver) Run(endpoint string) {
+func (gceDriver *GCEDriver) Run(endpoint string, grpcLogCharCap int) {
+	maxLogChar = grpcLogCharCap
+
 	klog.V(4).Infof("Driver: %v", gceDriver.name)
 	//Start the nonblocking GRPC
 	s := NewNonBlockingGRPCServer()

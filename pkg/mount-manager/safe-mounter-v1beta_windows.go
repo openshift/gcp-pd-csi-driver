@@ -34,7 +34,7 @@ import (
 	volumeapi "github.com/kubernetes-csi/csi-proxy/client/api/volume/v1beta1"
 	volumeclient "github.com/kubernetes-csi/csi-proxy/client/groups/volume/v1beta1"
 
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	mount "k8s.io/mount-utils"
 )
 
@@ -323,5 +323,11 @@ func (mounter *CSIProxyMounterV1Beta) GetDiskTotalBytes(devicePath string) (int6
 // MountSensitiveWithoutSystemd is the same as MountSensitive() but this method disable using systemd mount.
 // It's unimplemented in PD CSI Driver
 func (mounter *CSIProxyMounterV1Beta) MountSensitiveWithoutSystemd(source string, target string, fstype string, options []string, sensitiveOptions []string) error {
+	return errors.New("MountSensitiveWithoutSystemd is not implemented")
+}
+
+// MountSensitiveWithoutSystemdWithMountFlags is the same as MountSensitiveWithoutSystemd with additional mount flags.
+// It's unimplemented in PD CSI Driver
+func (mounter *CSIProxyMounterV1Beta) MountSensitiveWithoutSystemdWithMountFlags(source string, target string, fstype string, options []string, sensitiveOptions []string, mountFlags []string) error {
 	return errors.New("MountSensitiveWithoutSystemd is not implemented")
 }

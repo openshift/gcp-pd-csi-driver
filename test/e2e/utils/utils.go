@@ -27,9 +27,9 @@ import (
 
 	"golang.org/x/oauth2/google"
 	cloudresourcemanager "google.golang.org/api/cloudresourcemanager/v1"
-	"k8s.io/klog"
-	boskosclient "k8s.io/test-infra/boskos/client"
-	"k8s.io/test-infra/boskos/common"
+	"k8s.io/klog/v2"
+	boskosclient "sigs.k8s.io/boskos/client"
+	"sigs.k8s.io/boskos/common"
 	utilcommon "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
 	remote "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/test/remote"
 )
@@ -88,7 +88,7 @@ func getBoskosProject(resourceType string) *common.Resource {
 		case <-ticker.C:
 			p, err := boskos.Acquire(resourceType, "free", "busy")
 			if err != nil {
-				klog.Warningf("boskos failed to acquire project: %v", err)
+				klog.Warningf("boskos failed to acquire project: %w", err)
 			} else if p == nil {
 				klog.Warningf("boskos does not have a free %s at the moment", resourceType)
 			} else {
@@ -105,7 +105,7 @@ func SetupProwConfig(resourceType string) (project, serviceAccount string) {
 	klog.V(4).Infof("Fetching a Boskos loaned project")
 
 	p := getBoskosProject(resourceType)
-	project = p.GetName()
+	project = p.Name
 
 	go func(c *boskosclient.Client, proj string) {
 		for range time.Tick(time.Minute * 5) {
@@ -120,17 +120,17 @@ func SetupProwConfig(resourceType string) (project, serviceAccount string) {
 
 	c, err := google.DefaultClient(context.Background(), cloudresourcemanager.CloudPlatformScope)
 	if err != nil {
-		klog.Fatalf("Failed to get Google Default Client: %v", err)
+		klog.Fatalf("Failed to get Google Default Client: %w", err)
 	}
 
 	cloudresourcemanagerService, err := cloudresourcemanager.New(c)
 	if err != nil {
-		klog.Fatalf("Failed to create new cloudresourcemanager: %v", err)
+		klog.Fatalf("Failed to create new cloudresourcemanager: %w", err)
 	}
 
 	resp, err := cloudresourcemanagerService.Projects.Get(project).Do()
 	if err != nil {
-		klog.Fatalf("Failed to get project %v from Cloud Resource Manager: %v", project, err)
+		klog.Fatalf("Failed to get project %v from Cloud Resource Manager: %w", project, err)
 	}
 
 	// Default Compute Engine service account

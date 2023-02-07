@@ -83,7 +83,7 @@ func getDevicePath(ns *GCENodeServer, volumeID, partition string) (string, error
 	}
 	deviceName, err := common.GetDeviceName(volumeKey)
 	if err != nil {
-		return "", fmt.Errorf("error getting device name: %v", err)
+		return "", fmt.Errorf("error getting device name: %w", err)
 	}
 
 	proxy, ok := ns.Mounter.Interface.(mounter.CSIProxyMounter)
@@ -91,6 +91,11 @@ func getDevicePath(ns *GCENodeServer, volumeID, partition string) (string, error
 		return "", fmt.Errorf("could not cast to csi proxy class")
 	}
 	return proxy.GetDiskNumber(deviceName, partition, volumeKey.Name)
+}
+
+func disableDevice(devicePath string) error {
+	// This is a no-op on windows.
+	return nil
 }
 
 func getBlockSizeBytes(devicePath string, m *mount.SafeFormatAndMount) (int64, error) {

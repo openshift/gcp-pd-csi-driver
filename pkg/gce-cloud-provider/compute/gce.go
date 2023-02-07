@@ -32,15 +32,15 @@ import (
 	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 const (
 	TokenURL                        = "https://accounts.google.com/o/oauth2/token"
-	diskSourceURITemplateSingleZone = "%s/zones/%s/disks/%s"       // {gce.projectID}/zones/{disk.Zone}/disks/{disk.Name}"
-	diskSourceURITemplateRegional   = "%s/regions/%s/disks/%s"     //{gce.projectID}/regions/{disk.Region}/disks/repd"
-	diskTypeURITemplateSingleZone   = "%s/zones/%s/diskTypes/%s"   // {gce.projectID}/zones/{disk.Zone}/diskTypes/{disk.Type}"
-	diskTypeURITemplateRegional     = "%s/regions/%s/diskTypes/%s" // {gce.projectID}/regions/{disk.Region}/diskTypes/{disk.Type}"
+	diskSourceURITemplateSingleZone = "projects/%s/zones/%s/disks/%s"       // {gce.projectID}/zones/{disk.Zone}/disks/{disk.Name}"
+	diskSourceURITemplateRegional   = "projects/%s/regions/%s/disks/%s"     //{gce.projectID}/regions/{disk.Region}/disks/repd"
+	diskTypeURITemplateSingleZone   = "projects/%s/zones/%s/diskTypes/%s"   // {gce.projectID}/zones/{disk.Zone}/diskTypes/{disk.Type}"
+	diskTypeURITemplateRegional     = "projects/%s/regions/%s/diskTypes/%s" // {gce.projectID}/regions/{disk.Region}/diskTypes/{disk.Type}"
 
 	regionURITemplate = "projects/%s/regions/%s"
 
@@ -48,7 +48,7 @@ const (
 	GCEComputeBetaAPIEndpoint  = "https://www.googleapis.com/compute/beta/"
 	GCEComputeAlphaAPIEndpoint = "https://www.googleapis.com/compute/alpha/"
 
-	replicaZoneURITemplateSingleZone = "%s/zones/%s" // {gce.projectID}/zones/{disk.Zone}
+	replicaZoneURITemplateSingleZone = "projects/%s/zones/%s" // {gce.projectID}/zones/{disk.Zone}
 )
 
 type CloudProvider struct {
@@ -100,7 +100,7 @@ func CreateCloudProvider(ctx context.Context, vendorVersion string, configPath s
 
 	project, zone, err := getProjectAndZone(configFile)
 	if err != nil {
-		return nil, fmt.Errorf("Failed getting Project and Zone: %v", err)
+		return nil, fmt.Errorf("Failed getting Project and Zone: %w", err)
 	}
 
 	return &CloudProvider{
@@ -148,13 +148,13 @@ func readConfig(configPath string) (*ConfigFile, error) {
 
 	reader, err := os.Open(configPath)
 	if err != nil {
-		return nil, fmt.Errorf("couldn't open cloud provider configuration at %s: %v", configPath, err)
+		return nil, fmt.Errorf("couldn't open cloud provider configuration at %s: %w", configPath, err)
 	}
 	defer reader.Close()
 
 	cfg := &ConfigFile{}
 	if err := gcfg.FatalOnly(gcfg.ReadInto(cfg, reader)); err != nil {
-		return nil, fmt.Errorf("couldn't read cloud provider configuration at %s: %v", configPath, err)
+		return nil, fmt.Errorf("couldn't read cloud provider configuration at %s: %w", configPath, err)
 	}
 	return cfg, nil
 }
@@ -193,7 +193,7 @@ func createCloudServiceWithDefaultServiceAccount(ctx context.Context, vendorVers
 func newOauthClient(ctx context.Context, tokenSource oauth2.TokenSource) (*http.Client, error) {
 	if err := wait.PollImmediate(5*time.Second, 30*time.Second, func() (bool, error) {
 		if _, err := tokenSource.Token(); err != nil {
-			klog.Errorf("error fetching initial token: %v", err)
+			klog.Errorf("error fetching initial token: %v", err.Error())
 			return false, nil
 		}
 		return true, nil
