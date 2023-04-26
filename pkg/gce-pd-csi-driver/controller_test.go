@@ -30,12 +30,14 @@ import (
 	compute "google.golang.org/api/compute/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/flowcontrol"
 
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
 	gce "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/compute"
+	gcecloudprovider "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/compute"
 )
 
 const (
@@ -1796,7 +1798,7 @@ func TestPickRandAndConsecutive(t *testing.T) {
 }
 
 func TestVolumeOperationConcurrency(t *testing.T) {
-	readyToExecute := make(chan chan struct{}, 1)
+	readyToExecute := make(chan chan gce.Signal, 1)
 	gceDriver := initBlockingGCEDriver(t, []*gce.CloudDisk{
 		createZonalCloudDisk(name + "1"),
 		createZonalCloudDisk(name + "2"),
@@ -1854,13 +1856,13 @@ func TestVolumeOperationConcurrency(t *testing.T) {
 	// Start vol2CreateSnapshot and allow it to execute to completion. Then check for success.
 	vol2CreateSnapshotResp := runRequest(vol2CreateSnapshotReq)
 	execVol2CreateSnapshot := <-readyToExecute
-	execVol2CreateSnapshot <- struct{}{}
+	execVol2CreateSnapshot <- gce.Signal{}
 	if err := <-vol2CreateSnapshotResp; err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}
 
 	// To clean up, allow the vol1CreateSnapshotA to complete
-	execVol1CreateSnapshotA <- struct{}{}
+	execVol1CreateSnapshotA <- gce.Signal{}
 	if err := <-vol1CreateSnapshotAResp; err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}
@@ -1974,184 +1976,290 @@ func TestCreateVolumeDiskReady(t *testing.T) {
 	}
 }
 
-func TestControllerPublishUnpublishVolume(t *testing.T) {
-	testCases := []struct {
-		name              string
-		seedDisks         []*gce.CloudDisk
-		pubReq            *csi.ControllerPublishVolumeRequest
-		unpubReq          *csi.ControllerUnpublishVolumeRequest
-		errorSeenOnNode   bool
-		fakeCloudProvider bool
-	}{
-		{
-			name: "queue up publish requests if node has publish error",
-			seedDisks: []*gce.CloudDisk{
-				createZonalCloudDisk(name),
-			},
-			pubReq: &csi.ControllerPublishVolumeRequest{
-				VolumeId: testVolumeID,
-				NodeId:   testNodeID,
-				VolumeCapability: &csi.VolumeCapability{
-					AccessType: &csi.VolumeCapability_Mount{
-						Mount: &csi.VolumeCapability_MountVolume{},
-					},
-					AccessMode: &csi.VolumeCapability_AccessMode{
-						Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
-					},
-				},
-			},
-			errorSeenOnNode:   true,
-			fakeCloudProvider: false,
-		},
-		{
-			name: "queue up and process publish requests if node has publish error",
-			seedDisks: []*gce.CloudDisk{
-				createZonalCloudDisk(name),
-			},
-			pubReq: &csi.ControllerPublishVolumeRequest{
-				VolumeId: testVolumeID,
-				NodeId:   testNodeID,
-				VolumeCapability: &csi.VolumeCapability{
-					AccessType: &csi.VolumeCapability_Mount{
-						Mount: &csi.VolumeCapability_MountVolume{},
-					},
-					AccessMode: &csi.VolumeCapability_AccessMode{
-						Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
-					},
-				},
-			},
-			errorSeenOnNode:   true,
-			fakeCloudProvider: true,
-		},
-		{
-			name: "do not queue up publish requests if node doesn't have publish error",
-			seedDisks: []*gce.CloudDisk{
-				createZonalCloudDisk(name),
-			},
-			pubReq: &csi.ControllerPublishVolumeRequest{
-				VolumeId: testVolumeID,
-				NodeId:   testNodeID,
-				VolumeCapability: &csi.VolumeCapability{
-					AccessType: &csi.VolumeCapability_Mount{
-						Mount: &csi.VolumeCapability_MountVolume{},
-					},
-					AccessMode: &csi.VolumeCapability_AccessMode{
-						Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
-					},
-				},
-			},
-			errorSeenOnNode:   false,
-			fakeCloudProvider: false,
-		},
-		{
-			name: "queue up unpublish requests if node has publish error",
-			seedDisks: []*gce.CloudDisk{
-				createZonalCloudDisk(name),
-			},
-			unpubReq: &csi.ControllerUnpublishVolumeRequest{
-				VolumeId: testVolumeID,
-				NodeId:   testNodeID,
-			},
-			errorSeenOnNode:   true,
-			fakeCloudProvider: false,
-		},
-		{
-			name: "queue up and process unpublish requests if node has publish error",
-			seedDisks: []*gce.CloudDisk{
-				createZonalCloudDisk(name),
-			},
-			unpubReq: &csi.ControllerUnpublishVolumeRequest{
-				VolumeId: testVolumeID,
-				NodeId:   testNodeID,
-			},
-			errorSeenOnNode:   true,
-			fakeCloudProvider: true,
-		},
-		{
-			name: "do not queue up unpublish requests if node doesn't have publish error",
-			seedDisks: []*gce.CloudDisk{
-				createZonalCloudDisk(name),
-			},
-			unpubReq: &csi.ControllerUnpublishVolumeRequest{
-				VolumeId: testVolumeID,
-				NodeId:   testNodeID,
-			},
-			errorSeenOnNode:   false,
-			fakeCloudProvider: false,
+type backoffTesterConfig struct {
+	mockMissingInstance bool // used by the backoff tester to mock a missing instance scenario
+}
+
+func newFakeCsiErrorBackoff(tc *clock.FakeClock) *csiErrorBackoff {
+	return &csiErrorBackoff{flowcontrol.NewFakeBackOff(errorBackoffInitialDuration, errorBackoffMaxDuration, tc)}
+}
+
+func TestControllerUnpublishBackoff(t *testing.T) {
+	backoffTesterForUnpublish(t, &backoffTesterConfig{})
+}
+
+func TestControllerUnpublishBackoffMissingInstance(t *testing.T) {
+	backoffTesterForUnpublish(t, &backoffTesterConfig{
+		mockMissingInstance: true,
+	})
+}
+
+func backoffTesterForUnpublish(t *testing.T, config *backoffTesterConfig) {
+	readyToExecute := make(chan chan gce.Signal)
+	cloudDisks := []*gce.CloudDisk{
+		createZonalCloudDisk(name),
+	}
+	fcp, err := gce.CreateFakeCloudProvider(project, zone, cloudDisks)
+	if err != nil {
+		t.Fatalf("Failed to create fake cloud provider: %v", err)
+	}
+	fcpBlocking := &gce.FakeBlockingCloudProvider{
+		FakeCloudProvider: fcp,
+		ReadyToExecute:    readyToExecute,
+	}
+	instance := &compute.Instance{
+		Name: node,
+		Disks: []*compute.AttachedDisk{
+			{DeviceName: name}, // mock attached disks
 		},
 	}
-	for _, tc := range testCases {
-		t.Logf("test case: %s", tc.name)
+	if !config.mockMissingInstance {
+		fcp.InsertInstance(instance, zone, node)
+	}
 
-		var gceDriver *GCEDriver
+	driver := GetGCEDriver()
+	tc := clock.NewFakeClock(time.Now())
+	driver.cs = &GCEControllerServer{
+		Driver:        driver,
+		CloudProvider: fcpBlocking,
+		seen:          map[string]int{},
+		volumeLocks:   common.NewVolumeLocks(),
+		errorBackoff:  newFakeCsiErrorBackoff(tc),
+	}
 
-		if tc.fakeCloudProvider {
-			fcp, err := gce.CreateFakeCloudProvider(project, zone, tc.seedDisks)
-			if err != nil {
-				t.Fatalf("Failed to create fake cloud provider: %v", err)
-			}
+	backoffId := driver.cs.errorBackoff.backoffId(testNodeID, testVolumeID)
+	step := 1 * time.Millisecond
 
-			instance := &compute.Instance{
-				Name:  node,
-				Disks: []*compute.AttachedDisk{},
-			}
-			fcp.InsertInstance(instance, zone, node)
+	runUnpublishRequest := func(req *csi.ControllerUnpublishVolumeRequest, reportError bool) error {
+		response := make(chan error)
+		go func() {
+			_, err := driver.cs.ControllerUnpublishVolume(context.Background(), req)
+			response <- err
+		}()
+		go func() {
+			executeChan := <-readyToExecute
+			executeChan <- gcecloudprovider.Signal{ReportError: reportError}
+		}()
+		return <-response
+	}
 
-			// Setup new driver each time so no interference
-			gceDriver = initGCEDriverWithCloudProvider(t, fcp)
-		} else {
-			gceDriver = initGCEDriver(t, tc.seedDisks)
+	// Mock an active backoff condition on the node.
+	driver.cs.errorBackoff.next(backoffId)
+
+	tc.Step(step)
+	// A requst for a a different volume should succeed. This volume is not
+	// mounted on the node, so no GCE call will be made (ie, runUnpublishRequest
+	// doesn't need to be called, the request can be called directly).
+	differentUnpubReq := &csi.ControllerUnpublishVolumeRequest{
+		VolumeId: testVolumeID + "-different",
+		NodeId:   testNodeID,
+	}
+	if _, err := driver.cs.ControllerUnpublishVolume(context.Background(), differentUnpubReq); err != nil {
+		t.Errorf("expected no error on different unpublish, got %v", err)
+	}
+
+	unpubreq := &csi.ControllerUnpublishVolumeRequest{
+		VolumeId: testVolumeID,
+		NodeId:   testNodeID,
+	}
+	// For the first 199 ms, the backoff condition is true. All controller publish request will be denied with 'Unavailable' error code.
+	for i := 0; i < 199; i++ {
+		var err error
+		_, err = driver.cs.ControllerUnpublishVolume(context.Background(), unpubreq)
+		if !isUnavailableError(err) {
+			t.Errorf("unexpected error %v", err)
 		}
+		tc.Step(step)
+	}
 
-		// mark the node in the map
-		if tc.errorSeenOnNode {
-			gceDriver.cs.publishErrorsSeenOnNode[testNodeID] = true
+	// At the 200th millisecond, the backoff condition is no longer true. The driver should return a success code, and the backoff condition should be cleared.
+	if config.mockMissingInstance {
+		_, err = driver.cs.ControllerUnpublishVolume(context.Background(), unpubreq)
+		if err != nil {
+			t.Errorf("unexpected error %v", err)
 		}
-
-		requestCount := 50
-		for i := 0; i < requestCount; i++ {
-			if tc.pubReq != nil {
-				gceDriver.cs.ControllerPublishVolume(context.Background(), tc.pubReq)
-			}
-
-			if tc.unpubReq != nil {
-				gceDriver.cs.ControllerUnpublishVolume(context.Background(), tc.unpubReq)
-			}
+		// Driver is expected to remove the node key from the backoff map.
+		t1 := driver.cs.errorBackoff.backoff.Get(string(backoffId))
+		if t1 != 0 {
+			t.Error("unexpected delay")
 		}
+		return
+	}
 
-		queued := false
+	// mock an error
+	if err := runUnpublishRequest(unpubreq, true); err == nil {
+		t.Errorf("expected error")
+	}
 
-		if tc.errorSeenOnNode {
-			if err := wait.Poll(10*time.Nanosecond, 1*time.Second, func() (bool, error) {
-				if gceDriver.cs.queue.Len() > 0 {
-					queued = true
-
-					if tc.fakeCloudProvider {
-						gceDriver.cs.Run()
-					}
-				}
-
-				// Items are queued up and eventually all processed
-				if tc.fakeCloudProvider {
-					return queued && gceDriver.cs.queue.Len() == 0, nil
-				}
-
-				return gceDriver.cs.queue.Len() == requestCount, nil
-			}); err != nil {
-				if tc.fakeCloudProvider {
-					t.Fatalf("%v requests not processed for node has seen error", gceDriver.cs.queue.Len())
-				} else {
-					t.Fatalf("Only %v requests queued up for node has seen error", gceDriver.cs.queue.Len())
-				}
-			}
-		}
-
-		if !tc.errorSeenOnNode {
-			if err := wait.Poll(10*time.Nanosecond, 10*time.Millisecond, func() (bool, error) {
-				return gceDriver.cs.queue.Len() != 0, nil
-			}); err == nil {
-				t.Fatalf("%v requests queued up for node hasn't seen error", gceDriver.cs.queue.Len())
-			}
+	// The above failure should cause driver to call Backoff.Next() again and a backoff duration of 400 ms duration is set starting at the 200th millisecond.
+	// For the 200-599 ms, the backoff condition is true, and new controller publish requests will be deined.
+	for i := 0; i < 399; i++ {
+		tc.Step(step)
+		var err error
+		_, err = driver.cs.ControllerUnpublishVolume(context.Background(), unpubreq)
+		if !isUnavailableError(err) {
+			t.Errorf("unexpected error %v", err)
 		}
 	}
+
+	// Mock clock tick for the 600th millisecond. So backoff condition is no longer true.
+	tc.Step(step)
+	// Now mock a successful ControllerUnpublish request, where DetachDisk call succeeds.
+	if err := runUnpublishRequest(unpubreq, false); err != nil {
+		t.Errorf("unexpected error")
+	}
+
+	// Driver is expected to remove the node key from the backoff map.
+	t1 := driver.cs.errorBackoff.backoff.Get(string(backoffId))
+	if t1 != 0 {
+		t.Error("unexpected delay")
+	}
+}
+
+func TestControllerPublishBackoff(t *testing.T) {
+	backoffTesterForPublish(t, &backoffTesterConfig{})
+}
+
+func TestControllerPublishBackoffMissingInstance(t *testing.T) {
+	backoffTesterForPublish(t, &backoffTesterConfig{
+		mockMissingInstance: true,
+	})
+}
+
+func backoffTesterForPublish(t *testing.T, config *backoffTesterConfig) {
+	readyToExecute := make(chan chan gce.Signal)
+	cloudDisks := []*gce.CloudDisk{
+		createZonalCloudDisk(name),
+	}
+	fcp, err := gce.CreateFakeCloudProvider(project, zone, cloudDisks)
+	if err != nil {
+		t.Fatalf("Failed to create fake cloud provider: %v", err)
+	}
+	fcpBlocking := &gce.FakeBlockingCloudProvider{
+		FakeCloudProvider: fcp,
+		ReadyToExecute:    readyToExecute,
+	}
+	instance := &compute.Instance{
+		Name:  node,
+		Disks: []*compute.AttachedDisk{},
+	}
+	if !config.mockMissingInstance {
+		fcp.InsertInstance(instance, zone, node)
+	}
+
+	driver := GetGCEDriver()
+	tc := clock.NewFakeClock(time.Now())
+	driver.cs = &GCEControllerServer{
+		Driver:        driver,
+		CloudProvider: fcpBlocking,
+		seen:          map[string]int{},
+		volumeLocks:   common.NewVolumeLocks(),
+		errorBackoff:  newFakeCsiErrorBackoff(tc),
+	}
+
+	backoffId := driver.cs.errorBackoff.backoffId(testNodeID, testVolumeID)
+	step := 1 * time.Millisecond
+	// Mock an active backoff condition on the node.
+	driver.cs.errorBackoff.next(backoffId)
+
+	// A detach request for a different disk should succeed. As this disk is not
+	// on the instance, the detach will succeed without calling the gce detach
+	// disk api so we don't have to go through the blocking cloud provider and
+	// and make the request directly.
+	if _, err := driver.cs.ControllerUnpublishVolume(context.Background(), &csi.ControllerUnpublishVolumeRequest{VolumeId: testVolumeID + "different", NodeId: testNodeID}); err != nil {
+		t.Errorf("expected no error on different unpublish, got %v", err)
+	}
+
+	pubreq := &csi.ControllerPublishVolumeRequest{
+		VolumeId: testVolumeID,
+		NodeId:   testNodeID,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{
+				Mount: &csi.VolumeCapability_MountVolume{},
+			},
+			AccessMode: &csi.VolumeCapability_AccessMode{
+				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+			},
+		},
+	}
+	// For the first 199 ms, the backoff condition is true. All controller publish request will be denied with 'Unavailable' error code.
+	for i := 0; i < 199; i++ {
+		tc.Step(step)
+		var err error
+		_, err = driver.cs.ControllerPublishVolume(context.Background(), pubreq)
+		if !isUnavailableError(err) {
+			t.Errorf("unexpected error %v", err)
+		}
+	}
+
+	// Mock clock tick for the 200th millisecond. So backoff condition is no longer true.
+	tc.Step(step)
+	runPublishRequest := func(req *csi.ControllerPublishVolumeRequest, reportError bool) error {
+		response := make(chan error)
+		go func() {
+			_, err := driver.cs.ControllerPublishVolume(context.Background(), req)
+			response <- err
+		}()
+		go func() {
+			executeChan := <-readyToExecute
+			executeChan <- gcecloudprovider.Signal{ReportError: reportError}
+		}()
+		return <-response
+	}
+
+	// For a missing instance the driver should return error code, and the backoff condition should be set.
+	if config.mockMissingInstance {
+		_, err = driver.cs.ControllerPublishVolume(context.Background(), pubreq)
+		if err == nil {
+			t.Errorf("unexpected error %v", err)
+		}
+
+		t1 := driver.cs.errorBackoff.backoff.Get(string(backoffId))
+		if t1 == 0 {
+			t.Error("expected delay, got none")
+		}
+		return
+	}
+
+	// mock an error
+	if err := runPublishRequest(pubreq, true); err == nil {
+		t.Errorf("expected error")
+	}
+
+	// The above failure should cause driver to call Backoff.Next() again and a backoff duration of 400 ms duration is set starting at the 200th millisecond.
+	// For the 200-599 ms, the backoff condition is true, and new controller publish requests will be deined.
+	for i := 0; i < 399; i++ {
+		tc.Step(step)
+		var err error
+		_, err = driver.cs.ControllerPublishVolume(context.Background(), pubreq)
+		if !isUnavailableError(err) {
+			t.Errorf("unexpected error %v", err)
+		}
+	}
+
+	// Mock clock tick for the 600th millisecond. So backoff condition is no longer true.
+	tc.Step(step)
+	// Now mock a successful ControllerUnpublish request, where DetachDisk call succeeds.
+	if err := runPublishRequest(pubreq, false); err != nil {
+		t.Errorf("unexpected error")
+	}
+
+	// Driver is expected to remove the node key from the backoff map.
+	t1 := driver.cs.errorBackoff.backoff.Get(string(backoffId))
+	if t1 != 0 {
+		t.Error("unexpected delay")
+	}
+}
+
+func isUnavailableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	st, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+
+	return st.Code().String() == "Unavailable"
 }
