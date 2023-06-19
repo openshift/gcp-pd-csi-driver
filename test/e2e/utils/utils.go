@@ -43,7 +43,7 @@ var (
 	boskos, _ = boskosclient.NewClient(os.Getenv("JOB_NAME"), "http://boskos", "", "")
 )
 
-func GCEClientAndDriverSetup(instance *remote.InstanceInfo) (*remote.TestContext, error) {
+func GCEClientAndDriverSetup(instance *remote.InstanceInfo, computeEndpoint string) (*remote.TestContext, error) {
 	port := fmt.Sprintf("%v", 1024+rand.Intn(10000))
 	goPath, ok := os.LookupEnv("GOPATH")
 	if !ok {
@@ -53,10 +53,14 @@ func GCEClientAndDriverSetup(instance *remote.InstanceInfo) (*remote.TestContext
 	binPath := path.Join(pkgPath, "bin/gce-pd-csi-driver")
 
 	endpoint := fmt.Sprintf("tcp://localhost:%s", port)
+	computeFlag := ""
+	if computeEndpoint != "" {
+		computeFlag = fmt.Sprintf("--compute-endpoint %s", computeEndpoint)
+	}
 
 	workspace := remote.NewWorkspaceDir("gce-pd-e2e-")
-	driverRunCmd := fmt.Sprintf("sh -c '/usr/bin/nohup %s/gce-pd-csi-driver -v=4 --endpoint=%s --extra-labels=%s=%s 2> %s/prog.out < /dev/null > /dev/null &'",
-		workspace, endpoint, DiskLabelKey, DiskLabelValue, workspace)
+	driverRunCmd := fmt.Sprintf("sh -c '/usr/bin/nohup %s/gce-pd-csi-driver -v=4 --endpoint=%s %s --extra-labels=%s=%s 2> %s/prog.out < /dev/null > /dev/null &'",
+		workspace, endpoint, computeFlag, DiskLabelKey, DiskLabelValue, workspace)
 
 	config := &remote.ClientConfig{
 		PkgPath:      pkgPath,
@@ -143,19 +147,19 @@ func SetupProwConfig(resourceType string) (project, serviceAccount string) {
 func ForceChmod(instance *remote.InstanceInfo, filePath string, perms string) error {
 	originalumask, err := instance.SSHNoSudo("umask")
 	if err != nil {
-		return fmt.Errorf("failed to umask. Output: %v, errror: %v", originalumask, err)
+		return fmt.Errorf("failed to umask. Output: %v, errror: %v", originalumask, err.Error())
 	}
 	output, err := instance.SSHNoSudo("umask", "0000")
 	if err != nil {
-		return fmt.Errorf("failed to umask. Output: %v, errror: %v", output, err)
+		return fmt.Errorf("failed to umask. Output: %v, errror: %v", output, err.Error())
 	}
 	output, err = instance.SSH("chmod", "-R", perms, filePath)
 	if err != nil {
-		return fmt.Errorf("failed to chmod file %s. Output: %v, errror: %v", filePath, output, err)
+		return fmt.Errorf("failed to chmod file %s. Output: %v, errror: %v", filePath, output, err.Error())
 	}
 	output, err = instance.SSHNoSudo("umask", originalumask)
 	if err != nil {
-		return fmt.Errorf("failed to umask. Output: %v, errror: %v", output, err)
+		return fmt.Errorf("failed to umask. Output: %v, errror: %v", output, err.Error())
 	}
 	return nil
 }
@@ -163,7 +167,7 @@ func ForceChmod(instance *remote.InstanceInfo, filePath string, perms string) er
 func WriteFile(instance *remote.InstanceInfo, filePath, fileContents string) error {
 	output, err := instance.SSHNoSudo("echo", fileContents, ">", filePath)
 	if err != nil {
-		return fmt.Errorf("failed to write test file %s. Output: %v, errror: %v", filePath, output, err)
+		return fmt.Errorf("failed to write test file %s. Output: %v, errror: %v", filePath, output, err.Error())
 	}
 	return nil
 }
@@ -171,7 +175,7 @@ func WriteFile(instance *remote.InstanceInfo, filePath, fileContents string) err
 func ReadFile(instance *remote.InstanceInfo, filePath string) (string, error) {
 	output, err := instance.SSHNoSudo("cat", filePath)
 	if err != nil {
-		return "", fmt.Errorf("failed to read test file %s. Output: %v, errror: %v", filePath, output, err)
+		return "", fmt.Errorf("failed to read test file %s. Output: %v, errror: %v", filePath, output, err.Error())
 	}
 	return output, nil
 }
@@ -179,7 +183,7 @@ func ReadFile(instance *remote.InstanceInfo, filePath string) (string, error) {
 func WriteBlock(instance *remote.InstanceInfo, path, fileContents string) error {
 	output, err := instance.SSHNoSudo("echo", fileContents, "|", "dd", "of="+path)
 	if err != nil {
-		return fmt.Errorf("failed to write test file %s. Output: %v, errror: %v", path, output, err)
+		return fmt.Errorf("failed to write test file %s. Output: %v, errror: %v", path, output, err.Error())
 	}
 	return nil
 }
@@ -188,7 +192,7 @@ func ReadBlock(instance *remote.InstanceInfo, path string, length int) (string, 
 	lengthStr := strconv.Itoa(length)
 	output, err := instance.SSHNoSudo("dd", "if="+path, "bs="+lengthStr, "count=1", "2>", "/dev/null")
 	if err != nil {
-		return "", fmt.Errorf("failed to read test file %s. Output: %v, errror: %v", path, output, err)
+		return "", fmt.Errorf("failed to read test file %s. Output: %v, errror: %v", path, output, err.Error())
 	}
 	return output, nil
 }
@@ -196,7 +200,7 @@ func ReadBlock(instance *remote.InstanceInfo, path string, length int) (string, 
 func GetFSSizeInGb(instance *remote.InstanceInfo, mountPath string) (int64, error) {
 	output, err := instance.SSH("df", "--output=size", "-BG", mountPath, "|", "awk", "'NR==2'")
 	if err != nil {
-		return -1, fmt.Errorf("failed to get size of path %s. Output: %v, error: %v", mountPath, output, err)
+		return -1, fmt.Errorf("failed to get size of path %s. Output: %v, error: %v", mountPath, output, err.Error())
 	}
 	output = strings.TrimSuffix(strings.TrimSpace(output), "G")
 	n, err := strconv.ParseInt(output, 10, 64)
@@ -209,7 +213,7 @@ func GetFSSizeInGb(instance *remote.InstanceInfo, mountPath string) (int64, erro
 func GetBlockSizeInGb(instance *remote.InstanceInfo, devicePath string) (int64, error) {
 	output, err := instance.SSH("blockdev", "--getsize64", devicePath)
 	if err != nil {
-		return -1, fmt.Errorf("failed to get size of path %s. Output: %v, error: %v", devicePath, output, err)
+		return -1, fmt.Errorf("failed to get size of path %s. Output: %v, error: %v", devicePath, output, err.Error())
 	}
 	n, err := strconv.ParseInt(strings.TrimSpace(output), 10, 64)
 	if err != nil {
@@ -221,7 +225,7 @@ func GetBlockSizeInGb(instance *remote.InstanceInfo, devicePath string) (int64, 
 func Symlink(instance *remote.InstanceInfo, src, dest string) error {
 	output, err := instance.SSH("ln", "-s", src, dest)
 	if err != nil {
-		return fmt.Errorf("failed to symlink from %s to %s. Output: %v, errror: %v", src, dest, output, err)
+		return fmt.Errorf("failed to symlink from %s to %s. Output: %v, errror: %v", src, dest, output, err.Error())
 	}
 	return nil
 }
@@ -229,7 +233,7 @@ func Symlink(instance *remote.InstanceInfo, src, dest string) error {
 func RmAll(instance *remote.InstanceInfo, filePath string) error {
 	output, err := instance.SSH("rm", "-rf", filePath)
 	if err != nil {
-		return fmt.Errorf("failed to delete all %s. Output: %v, errror: %v", filePath, output, err)
+		return fmt.Errorf("failed to delete all %s. Output: %v, errror: %v", filePath, output, err.Error())
 	}
 	return nil
 }
@@ -237,7 +241,7 @@ func RmAll(instance *remote.InstanceInfo, filePath string) error {
 func MkdirAll(instance *remote.InstanceInfo, dir string) error {
 	output, err := instance.SSH("mkdir", "-p", dir)
 	if err != nil {
-		return fmt.Errorf("failed to mkdir -p %s. Output: %v, errror: %v", dir, output, err)
+		return fmt.Errorf("failed to mkdir -p %s. Output: %v, errror: %v", dir, output, err.Error())
 	}
 	return nil
 }
@@ -245,7 +249,7 @@ func MkdirAll(instance *remote.InstanceInfo, dir string) error {
 func CopyFile(instance *remote.InstanceInfo, src, dest string) error {
 	output, err := instance.SSH("cp", src, dest)
 	if err != nil {
-		return fmt.Errorf("failed to copy %s to %s. Output: %v, errror: %v", src, dest, output, err)
+		return fmt.Errorf("failed to copy %s to %s. Output: %v, errror: %v", src, dest, output, err.Error())
 	}
 	return nil
 }
@@ -269,7 +273,7 @@ func ValidateLogicalLinkIsDisk(instance *remote.InstanceInfo, link, diskName str
 
 	devFsPath, err := instance.SSH("find", link, "-printf", "'%l'")
 	if err != nil {
-		return false, fmt.Errorf("failed to find symbolic link for %s. Output: %v, errror: %v", link, devFsPath, err)
+		return false, fmt.Errorf("failed to find symbolic link for %s. Output: %v, errror: %v", link, devFsPath, err.Error())
 	}
 	if len(devFsPath) == 0 {
 		return false, nil
@@ -278,7 +282,7 @@ func ValidateLogicalLinkIsDisk(instance *remote.InstanceInfo, link, diskName str
 		fullDevPath := path.Join("/dev/", string(sdx))
 		scsiIDOut, err := instance.SSH("/lib/udev_containerized/scsi_id", "--page=0x83", "--whitelisted", fmt.Sprintf("--device=%v", fullDevPath))
 		if err != nil {
-			return false, fmt.Errorf("failed to find %s's SCSI ID. Output: %v, errror: %v", devFsPath, scsiIDOut, err)
+			return false, fmt.Errorf("failed to find %s's SCSI ID. Output: %v, errror: %v", devFsPath, scsiIDOut, err.Error())
 		}
 		scsiID := scsiRegex.FindStringSubmatch(scsiIDOut)
 		if len(scsiID) == 0 {
@@ -292,7 +296,7 @@ func ValidateLogicalLinkIsDisk(instance *remote.InstanceInfo, link, diskName str
 		fullDevPath := path.Join("/dev/", string(nvmex))
 		nvmeIDOut, err := instance.SSH("/lib/udev_containerized/google_nvme_id", fmt.Sprintf("-d%v", fullDevPath))
 		if err != nil {
-			return false, fmt.Errorf("failed to find %s's NVME ID. Output: %v, errror: %v", devFsPath, nvmeIDOut, err)
+			return false, fmt.Errorf("failed to find %s's NVME ID. Output: %v, errror: %v", devFsPath, nvmeIDOut, err.Error())
 		}
 		nvmeID := nvmeSerialRegex.FindStringSubmatch(nvmeIDOut)
 		if len(nvmeID) == 0 {

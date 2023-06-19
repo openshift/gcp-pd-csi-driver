@@ -30,6 +30,7 @@ import (
 	"k8s.io/mount-utils"
 
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/deviceutils"
 	metadataservice "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/metadata"
 	mountmanager "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/mount-manager"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/resizefs"
@@ -38,7 +39,7 @@ import (
 type GCENodeServer struct {
 	Driver          *GCEDriver
 	Mounter         *mount.SafeFormatAndMount
-	DeviceUtils     mountmanager.DeviceUtils
+	DeviceUtils     deviceutils.DeviceUtils
 	VolumeStatter   mountmanager.Statter
 	MetadataService metadataservice.MetadataService
 
@@ -342,10 +343,9 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 	// Part 4: Resize filesystem.
 	// https://github.com/kubernetes/kubernetes/issues/94929
 	resizer := resizefs.NewResizeFs(ns.Mounter)
-	_, err = resizer.Resize(devicePath, stagingTargetPath)
+	_, err = ns.DeviceUtils.Resize(resizer, devicePath, stagingTargetPath)
 	if err != nil {
-		return nil, status.Error(codes.Internal, fmt.Sprintf("error when resizing volume %s: %v", volumeID, err))
-
+		return nil, status.Error(codes.Internal, fmt.Sprintf("error when resizing volume %s from device '%s' at path '%s': %v", volumeID, devicePath, stagingTargetPath, err.Error()))
 	}
 
 	klog.V(4).Infof("NodeStageVolume succeeded on %v to %s", volumeID, stagingTargetPath)
@@ -508,6 +508,7 @@ func (ns *GCENodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpa
 	_, err = resizer.Resize(devicePath, volumePath)
 	if err != nil {
 		return nil, status.Error(codes.Internal, fmt.Sprintf("error when resizing volume %s from device '%s' at path '%s': %v", volKey.String(), devicePath, volumePath, err.Error()))
+
 	}
 
 	diskSizeBytes, err := getBlockSizeBytes(devicePath, ns.Mounter)

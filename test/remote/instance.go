@@ -28,6 +28,7 @@ import (
 
 	"golang.org/x/oauth2/google"
 	computealpha "google.golang.org/api/compute/v0.alpha"
+	computebeta "google.golang.org/api/compute/v0.beta"
 	compute "google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
 	"k8s.io/apimachinery/pkg/util/uuid"
@@ -71,12 +72,11 @@ func (i *InstanceInfo) GetNodeID() string {
 
 func CreateInstanceInfo(project, instanceArchitecture, instanceZone, name, machineType string, cs *compute.Service) (*InstanceInfo, error) {
 	return &InstanceInfo{
-		project:      project,
-		architecture: instanceArchitecture,
-		zone:         instanceZone,
-		name:         name,
-		machineType:  machineType,
-
+		project:        project,
+		architecture:   instanceArchitecture,
+		zone:           instanceZone,
+		name:           name,
+		machineType:    machineType,
 		computeService: cs,
 	}, nil
 }
@@ -91,7 +91,7 @@ func (i *InstanceInfo) CreateOrGetInstance(imageURL, serviceAccount string) erro
 
 	err = i.createDefaultFirewallRule()
 	if err != nil {
-		return fmt.Errorf("Failed to create firewall rule: %v", err)
+		return fmt.Errorf("Failed to create firewall rule: %v", err.Error())
 	}
 
 	newInst := &compute.Instance{
@@ -143,9 +143,9 @@ func (i *InstanceInfo) CreateOrGetInstance(imageURL, serviceAccount string) erro
 				return err
 			}
 
-			then := time.Now()
+			start := time.Now()
 			err := wait.Poll(15*time.Second, 5*time.Minute, func() (bool, error) {
-				klog.V(2).Infof("Waiting for instance to be deleted. %v elapsed", time.Since(then))
+				klog.V(2).Infof("Waiting for instance to be deleted. %v elapsed", time.Since(start))
 				if curInst, _ = i.computeService.Instances.Get(i.project, i.zone, i.name).Do(); curInst != nil {
 					return false, nil
 				}
@@ -161,7 +161,7 @@ func (i *InstanceInfo) CreateOrGetInstance(imageURL, serviceAccount string) erro
 		op, err := i.computeService.Instances.Insert(i.project, i.zone, newInst).Do()
 		klog.V(4).Infof("Inserted instance %v in project: %v, zone: %v", newInst.Name, i.project, i.zone)
 		if err != nil {
-			ret := fmt.Sprintf("could not create instance %s: API error: %v", i.name, err)
+			ret := fmt.Sprintf("could not create instance %s: API error: %v", i.name, err.Error())
 			if op != nil {
 				ret = fmt.Sprintf("%s. op error: %v", ret, op.Error)
 			}
@@ -173,9 +173,9 @@ func (i *InstanceInfo) CreateOrGetInstance(imageURL, serviceAccount string) erro
 		klog.V(4).Infof("Compute service GOT instance %v, skipping instance creation", newInst.Name)
 	}
 
-	then := time.Now()
+	start := time.Now()
 	err = wait.Poll(15*time.Second, 5*time.Minute, func() (bool, error) {
-		klog.V(2).Infof("Waiting for instance %v to come up. %v elapsed", i.name, time.Since(then))
+		klog.V(2).Infof("Waiting for instance %v to come up. %v elapsed", i.name, time.Since(start))
 
 		instance, err = i.computeService.Instances.Get(i.project, i.zone, i.name).Do()
 		if err != nil {
@@ -194,7 +194,7 @@ func (i *InstanceInfo) CreateOrGetInstance(imageURL, serviceAccount string) erro
 		}
 
 		if sshOut, err := i.SSHCheckAlive(); err != nil {
-			err = fmt.Errorf("Instance %v in state RUNNING but not available by SSH: %v", i.name, err)
+			err = fmt.Errorf("Instance %v in state RUNNING but not available by SSH: %v", i.name, err.Error())
 			klog.Warningf("SSH encountered an error: %v, output: %v", err, sshOut)
 			return false, nil
 		}
@@ -221,6 +221,33 @@ func (i *InstanceInfo) DeleteInstance() {
 		}
 		klog.Errorf("Error deleting instance %q: %w", i.name, err)
 	}
+}
+
+func (i *InstanceInfo) DetachDisk(diskName string) error {
+	klog.V(4).Infof("Detaching disk %q", diskName)
+	op, err := i.computeService.Instances.DetachDisk(i.project, i.zone, i.name, diskName).Do()
+	if err != nil {
+		if isGCEError(err, "notFound") {
+			return nil
+		}
+		klog.Errorf("Error deleting disk %q: %w", diskName, err)
+	}
+
+	start := time.Now()
+	if err := wait.Poll(5*time.Second, 1*time.Minute, func() (bool, error) {
+		klog.V(2).Infof("Waiting for disk %q to be detached from instance %q. %v elapsed", diskName, i.name, time.Since(start))
+
+		op, err = i.computeService.ZoneOperations.Get(i.project, i.zone, op.Name).Do()
+		if err != nil {
+			return true, fmt.Errorf("Failed to get operation %q, err: %v", op.Name, err)
+		}
+		return op.Status == "DONE", nil
+	}); err != nil {
+		return err
+	}
+
+	klog.V(4).Infof("Disk %q has been successfully detached from instance %q\n%v", diskName, i.name, op.Error)
+	return nil
 }
 
 func getexternalIP(instance *compute.Instance) string {
@@ -262,7 +289,7 @@ func (i *InstanceInfo) createDefaultFirewallRule() error {
 				klog.V(4).Infof("Default firewall rule %v already exists, skipping creation", defaultFirewallRule)
 				return nil
 			}
-			return fmt.Errorf("Failed to insert required default SSH firewall Rule %v: %v", defaultFirewallRule, err)
+			return fmt.Errorf("Failed to insert required default SSH firewall Rule %v: %v", defaultFirewallRule, err.Error())
 		}
 	} else {
 		klog.V(4).Infof("Default firewall rule %v already exists, skipping creation", defaultFirewallRule)
@@ -322,6 +349,36 @@ func GetComputeAlphaClient() (*computealpha.Service, error) {
 		}
 
 		cs, err = computealpha.New(client)
+		if err != nil {
+			continue
+		}
+		return cs, nil
+	}
+	return nil, err
+}
+
+func GetComputeBetaClient() (*computebeta.Service, error) {
+	const retries = 10
+	const backoff = time.Second * 6
+
+	klog.V(4).Infof("Getting compute client...")
+
+	// Setup the gce client for provisioning instances
+	// Getting credentials on gce jenkins is flaky, so try a couple times
+	var err error
+	var cs *computebeta.Service
+	for i := 0; i < retries; i++ {
+		if i > 0 {
+			time.Sleep(backoff)
+		}
+
+		var client *http.Client
+		client, err = google.DefaultClient(context.Background(), computebeta.ComputeScope)
+		if err != nil {
+			continue
+		}
+
+		cs, err = computebeta.New(client)
 		if err != nil {
 			continue
 		}

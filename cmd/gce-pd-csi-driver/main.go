@@ -26,6 +26,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/deviceutils"
 	gce "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/compute"
 	metadataservice "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/metadata"
 	driver "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-pd-csi-driver"
@@ -36,6 +37,7 @@ import (
 var (
 	cloudConfigFilePath  = flag.String("cloud-config", "", "Path to GCE cloud provider config")
 	endpoint             = flag.String("endpoint", "unix:/tmp/csi.sock", "CSI endpoint")
+	computeEndpoint      = flag.String("compute-endpoint", "", "If set, used as the endpoint for the GCE API.")
 	runControllerService = flag.Bool("run-controller-service", true, "If set to false then the CSI driver does not activate its controller service (default: true)")
 	runNodeService       = flag.Bool("run-node-service", true, "If set to false then the CSI driver does not activate its node service (default: true)")
 	httpEndpoint         = flag.String("http-endpoint", "", "The TCP network address where the prometheus metrics endpoint will listen (example: `:8080`). The default is empty string, which means metrics endpoint is disabled.")
@@ -57,7 +59,9 @@ var (
 	waitForOpBackoffSteps     = flag.Int("wait-op-backoff-steps", 100, "Steps for wait for operation backoff")
 	waitForOpBackoffCap       = flag.Duration("wait-op-backoff-cap", 0, "Cap for wait for operation backoff")
 
-	maxprocs = flag.Int("maxprocs", 1, "GOMAXPROCS override")
+	maxProcs                = flag.Int("maxprocs", 1, "GOMAXPROCS override")
+	maxConcurrentFormat     = flag.Int("max-concurrent-format", 1, "The maximum number of concurrent format exec calls")
+	concurrentFormatTimeout = flag.Duration("concurrent-format-timeout", 1*time.Minute, "The maximum duration of a format operation before its concurrency token is released")
 
 	version string
 )
@@ -86,7 +90,7 @@ func main() {
 func handle() {
 	var err error
 
-	runtime.GOMAXPROCS(*maxprocs)
+	runtime.GOMAXPROCS(*maxProcs)
 	klog.Infof("Sys info: NumCPU: %v MAXPROC: %v", runtime.NumCPU(), runtime.GOMAXPROCS(0))
 
 	if version == "" {
@@ -108,37 +112,37 @@ func handle() {
 		klog.Fatalf("Bad extra volume labels: %v", err.Error())
 	}
 
-	gceDriver := driver.GetGCEDriver()
-
-	//Initialize GCE Driver
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	//Initialize identity server
+	// Initialize driver
+	gceDriver := driver.GetGCEDriver()
+
+	// Initialize identity server
 	identityServer := driver.NewIdentityServer(gceDriver)
 
-	//Initialize requirements for the controller service
+	// Initialize requirements for the controller service
 	var controllerServer *driver.GCEControllerServer
 	if *runControllerService {
-		cloudProvider, err := gce.CreateCloudProvider(ctx, version, *cloudConfigFilePath)
+		cloudProvider, err := gce.CreateCloudProvider(ctx, version, *cloudConfigFilePath, *computeEndpoint)
 		if err != nil {
 			klog.Fatalf("Failed to get cloud provider: %v", err.Error())
 		}
 		initialBackoffDuration := time.Duration(*errorBackoffInitialDurationMs) * time.Millisecond
-		maxBackoffDuration := time.Duration(*errorBackoffMaxDurationMs) * time.Microsecond
+		maxBackoffDuration := time.Duration(*errorBackoffMaxDurationMs) * time.Millisecond
 		controllerServer = driver.NewControllerServer(gceDriver, cloudProvider, initialBackoffDuration, maxBackoffDuration)
 	} else if *cloudConfigFilePath != "" {
 		klog.Warningf("controller service is disabled but cloud config given - it has no effect")
 	}
 
-	//Initialize requirements for the node service
+	// Initialize requirements for the node service
 	var nodeServer *driver.GCENodeServer
 	if *runNodeService {
-		mounter, err := mountmanager.NewSafeMounter()
+		mounter, err := mountmanager.NewSafeMounter(*maxConcurrentFormat, *concurrentFormatTimeout)
 		if err != nil {
 			klog.Fatalf("Failed to get safe mounter: %v", err.Error())
 		}
-		deviceUtils := mountmanager.NewDeviceUtils()
+		deviceUtils := deviceutils.NewDeviceUtils()
 		statter := mountmanager.NewStatter(mounter)
 		meta, err := metadataservice.NewMetadataService()
 		if err != nil {
