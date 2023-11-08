@@ -1,5 +1,3 @@
-# See the OWNERS docs: https://git.k8s.io/community/contributors/guide/owners.md
-
 aliases:
 
   # SIG-Storage chairs and leads should always have approval rights in all repos.
@@ -31,6 +29,17 @@ aliases:
   - RaunakShah
   - sunnylovestiramisu
   - xing-yang
+
+  # OpenShift maintainers
+  openshift-storage-maintainers:
+    - jsafrane
+    - tsmetana
+    - gnufied
+    - dobsonj
+    - RomanBednar
+    - mpatlasov
+    - dfajmon
+    - rhrmo
 
 # This documents who previously contributed to Kubernetes-CSI
 # as approver.
