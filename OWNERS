@@ -1,24 +1,3 @@
-reviewers:
-  - amacaskill
-  - leiyiz
-  - mattcary
-  - msau42
-  - saikat-royc
-  - sunnylovestiramisu
-  - pwschuurman
-  - tyuchn
-  - songjiaxun
 approvers:
-  - amacaskill
-  - leiyiz
-  - mattcary
-  - msau42
-  - saikat-royc
-  - sunnylovestiramisu
-  - pwschuurman
-  - tyuchn
-  - songjiaxun
-emeritus_reviewers:
-  - davidz627
-  - jingxu97
-  - saad-ali
+- openshift-storage-maintainers
+component: "Storage / Kubernetes External Components"
