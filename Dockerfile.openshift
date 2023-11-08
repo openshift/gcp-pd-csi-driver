@@ -1,0 +1,18 @@
+FROM registry.ci.openshift.org/ocp/builder:rhel-9-golang-1.21-openshift-4.16 AS builder
+WORKDIR /go/src/github.com/kubernetes-sigs/gcp-compute-persistent-disk-csi-driver
+COPY . .
+# Skip Windows driver build
+RUN make gce-pd-driver
+
+FROM registry.ci.openshift.org/ocp/4.16:base-rhel9
+
+# Get all deps
+# nvme-cli and /usr/bin/xxd are deps of google_nvme_id
+RUN yum update -y && \
+    yum install --setopt=tsflags=nodocs -y e2fsprogs xfsprogs util-linux nvme-cli /usr/lib/udev/scsi_id /usr/bin/xxd && \
+    yum clean all && rm -rf /var/cache/yum/* && \
+    mkdir -p /lib/udev_containerized && cp /usr/lib/udev/scsi_id /lib/udev_containerized/scsi_id # The driver assumes this path
+
+COPY --from=builder /go/src/github.com/kubernetes-sigs/gcp-compute-persistent-disk-csi-driver/bin/gce-pd-csi-driver  /usr/bin/
+COPY --from=builder /go/src/github.com/kubernetes-sigs/gcp-compute-persistent-disk-csi-driver/deploy/kubernetes/udev/google_nvme_id /lib/udev_containerized/google_nvme_id
+ENTRYPOINT ["/usr/bin/gce-pd-csi-driver"]
