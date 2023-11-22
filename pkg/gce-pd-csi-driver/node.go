@@ -15,11 +15,12 @@ limitations under the License.
 package gceGCEDriver
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
-
-	"context"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -46,6 +47,15 @@ type GCENodeServer struct {
 	// A map storing all volumes with ongoing operations so that additional operations
 	// for that same volume (as defined by VolumeID) return an Aborted error
 	volumeLocks *common.VolumeLocks
+
+	// If set, this semaphore will be used to serialize formatAndMount. It will be raised
+	// when the operation starts, and lowered either when finished, or when
+	// formatAndMountTimeout has expired.
+	//
+	// This is used only on linux (where memory problems for concurrent fsck and mkfs have
+	// been observed).
+	formatAndMountSemaphore chan any
+	formatAndMountTimeout   time.Duration
 }
 
 var _ csi.NodeServer = &GCENodeServer{}
@@ -84,6 +94,14 @@ func (ns *GCENodeServer) isVolumePathMounted(path string) bool {
 		return true
 	}
 	return false
+}
+
+func (ns *GCENodeServer) WithSerializedFormatAndMount(timeout time.Duration, maxConcurrent int) *GCENodeServer {
+	if maxConcurrent > 0 {
+		ns.formatAndMountSemaphore = make(chan any, maxConcurrent)
+		ns.formatAndMountTimeout = timeout
+	}
+	return ns
 }
 
 func (ns *GCENodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
@@ -318,7 +336,7 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 		klog.V(4).Infof("CSI volume is read-only, mounting with extra option ro")
 	}
 
-	err = formatAndMount(devicePath, stagingTargetPath, fstype, options, ns.Mounter)
+	err = ns.formatAndMount(devicePath, stagingTargetPath, fstype, options, ns.Mounter)
 	if err != nil {
 		// If a volume is created from a content source like snapshot or cloning, the filesystem might get marked
 		// as "dirty" even if it is otherwise consistent and ext3/4 will try to restore to a consistent state by replaying
@@ -329,7 +347,7 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 			klog.V(4).Infof("Failed to mount CSI volume read-only, retry mounting with extra option noload")
 
 			options = append(options, "noload")
-			err = formatAndMount(devicePath, stagingTargetPath, fstype, options, ns.Mounter)
+			err = ns.formatAndMount(devicePath, stagingTargetPath, fstype, options, ns.Mounter)
 			if err == nil {
 				klog.V(4).Infof("NodeStageVolume succeeded with \"noload\" option on %v to %s", volumeID, stagingTargetPath)
 				return &csi.NodeStageVolumeResponse{}, nil
@@ -342,10 +360,12 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 
 	// Part 4: Resize filesystem.
 	// https://github.com/kubernetes/kubernetes/issues/94929
-	resizer := resizefs.NewResizeFs(ns.Mounter)
-	_, err = ns.DeviceUtils.Resize(resizer, devicePath, stagingTargetPath)
-	if err != nil {
-		return nil, status.Error(codes.Internal, fmt.Sprintf("error when resizing volume %s from device '%s' at path '%s': %v", volumeID, devicePath, stagingTargetPath, err.Error()))
+	if !readonly {
+		resizer := resizefs.NewResizeFs(ns.Mounter)
+		_, err = ns.DeviceUtils.Resize(resizer, devicePath, stagingTargetPath)
+		if err != nil {
+			return nil, status.Error(codes.Internal, fmt.Sprintf("error when resizing volume %s from device '%s' at path '%s': %v", volumeID, devicePath, stagingTargetPath, err.Error()))
+		}
 	}
 
 	klog.V(4).Infof("NodeStageVolume succeeded on %v to %s", volumeID, stagingTargetPath)
@@ -375,8 +395,12 @@ func (ns *GCENodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUns
 	devicePath, err := getDevicePath(ns, volumeID, "" /* partition, which is unused */)
 	if err != nil {
 		klog.Errorf("Failed to find device path for volume %s. Device may not be detached cleanly (error is ignored and unstaging is continuing): %v", volumeID, err.Error())
-	} else if err := ns.DeviceUtils.DisableDevice(devicePath); err != nil {
-		klog.Errorf("Failed to disabled device %s for volume %s. Device may not be detached cleanly (error is ignored and unstaging is continuing): %v", devicePath, volumeID, err.Error())
+	} else {
+		if devFsPath, err := filepath.EvalSymlinks(devicePath); err != nil {
+			klog.Errorf("filepath.EvalSymlinks(%q) failed when trying to disable device: %w (ignored, unstaging continues)", devicePath, err)
+		} else if err := ns.DeviceUtils.DisableDevice(devFsPath); err != nil {
+			klog.Errorf("Failed to disabled device %s (aka %s) for volume %s. Device may not be detached cleanly (error is ignored and unstaging is continuing): %w", devicePath, devFsPath, volumeID, err)
+		}
 	}
 
 	klog.V(4).Infof("NodeUnstageVolume succeeded on %v from %s", volumeID, stagingTargetPath)
@@ -499,6 +523,15 @@ func (ns *GCENodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpa
 		if blk := volumeCapability.GetBlock(); blk != nil {
 			// Noop for Block NodeExpandVolume
 			klog.V(4).Infof("NodeExpandVolume succeeded on %v to %s, capability is block so this is a no-op", volumeID, volumePath)
+			return &csi.NodeExpandVolumeResponse{}, nil
+		}
+
+		readonly, err := getReadOnlyFromCapability(volumeCapability)
+		if err != nil {
+			return nil, status.Error(codes.Internal, fmt.Sprintf("failed to check if capability for volume %s is readonly: %v", volumeID, err))
+		}
+		if readonly {
+			klog.V(4).Infof("NodeExpandVolume succeeded on %v to %s, capability access is readonly so this is a no-op", volumeID, volumePath)
 			return &csi.NodeExpandVolumeResponse{}, nil
 		}
 	}

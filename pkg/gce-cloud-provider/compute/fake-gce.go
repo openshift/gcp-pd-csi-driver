@@ -229,15 +229,21 @@ func (cloud *FakeCloudProvider) InsertDisk(ctx context.Context, project string, 
 	switch volKey.Type() {
 	case meta.Zonal:
 		computeDisk.Zone = volKey.Zone
-		computeDisk.SelfLink = fmt.Sprintf("projects/%s/zones/%s/disks/%s", project, volKey.Zone, volKey.Name)
+		computeDisk.SelfLink = fmt.Sprintf("%sprojects/%s/zones/%s/disks/%s", BasePath, project, volKey.Zone, volKey.Name)
 	case meta.Regional:
 		computeDisk.Region = volKey.Region
-		computeDisk.SelfLink = fmt.Sprintf("projects/%s/regions/%s/disks/%s", project, volKey.Region, volKey.Name)
+		computeDisk.SelfLink = fmt.Sprintf("%sprojects/%s/regions/%s/disks/%s", BasePath, project, volKey.Region, volKey.Name)
 	default:
 		return fmt.Errorf("could not create disk, key was neither zonal nor regional, instead got: %v", volKey.String())
 	}
 
-	cloud.disks[volKey.Name] = CloudDiskFromV1(computeDisk)
+	if containsBetaDiskType(hyperdiskTypes, params.DiskType) {
+		betaDisk := convertV1DiskToBetaDisk(computeDisk, params.ProvisionedThroughputOnCreate)
+		betaDisk.EnableConfidentialCompute = params.EnableConfidentialCompute
+		cloud.disks[volKey.Name] = CloudDiskFromBeta(betaDisk)
+	} else {
+		cloud.disks[volKey.Name] = CloudDiskFromV1(computeDisk)
+	}
 	return nil
 }
 
@@ -246,15 +252,16 @@ func (cloud *FakeCloudProvider) DeleteDisk(ctx context.Context, project string, 
 	return nil
 }
 
-func (cloud *FakeCloudProvider) AttachDisk(ctx context.Context, project string, volKey *meta.Key, readWrite, diskType, instanceZone, instanceName string) error {
+func (cloud *FakeCloudProvider) AttachDisk(ctx context.Context, project string, volKey *meta.Key, readWrite, diskType, instanceZone, instanceName string, forceAttach bool) error {
 	source := cloud.GetDiskSourceURI(project, volKey)
 
 	attachedDiskV1 := &computev1.AttachedDisk{
-		DeviceName: volKey.Name,
-		Kind:       diskKind,
-		Mode:       readWrite,
-		Source:     source,
-		Type:       diskType,
+		DeviceName:  volKey.Name,
+		Kind:        diskKind,
+		Mode:        readWrite,
+		Source:      source,
+		Type:        diskType,
+		ForceAttach: forceAttach,
 	}
 	instance, ok := cloud.instances[instanceName]
 	if !ok {
@@ -538,14 +545,14 @@ func (cloud *FakeBlockingCloudProvider) DetachDisk(ctx context.Context, project,
 	return cloud.FakeCloudProvider.DetachDisk(ctx, project, deviceName, instanceZone, instanceName)
 }
 
-func (cloud *FakeBlockingCloudProvider) AttachDisk(ctx context.Context, project string, volKey *meta.Key, readWrite, diskType, instanceZone, instanceName string) error {
+func (cloud *FakeBlockingCloudProvider) AttachDisk(ctx context.Context, project string, volKey *meta.Key, readWrite, diskType, instanceZone, instanceName string, forceAttach bool) error {
 	execute := make(chan Signal)
 	cloud.ReadyToExecute <- execute
 	val := <-execute
 	if val.ReportError {
 		return fmt.Errorf("force mock error for AttachDisk: volkey %s", volKey)
 	}
-	return cloud.FakeCloudProvider.AttachDisk(ctx, project, volKey, readWrite, diskType, instanceZone, instanceName)
+	return cloud.FakeCloudProvider.AttachDisk(ctx, project, volKey, readWrite, diskType, instanceZone, instanceName, forceAttach)
 }
 
 func notFoundError() *googleapi.Error {

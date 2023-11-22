@@ -20,15 +20,22 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 
+	"google.golang.org/grpc/codes"
 	"k8s.io/component-base/metrics"
 	"k8s.io/klog/v2"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
+	gce "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/compute"
 )
 
 const (
 	// envGKEPDCSIVersion is an environment variable set in the PDCSI controller manifest
 	// with the current version of the GKE component.
-	envGKEPDCSIVersion = "GKE_PDCSI_VERSION"
+	envGKEPDCSIVersion               = "GKE_PDCSI_VERSION"
+	pdcsiDriverName                  = "pd.csi.storage.gke.io"
+	DefaultDiskTypeForMetric         = "unknownDiskType"
+	DefaultEnableConfidentialCompute = "unknownConfidentialMode"
 )
 
 var (
@@ -37,28 +44,41 @@ var (
 		Name: "component_version",
 		Help: "Metric to expose the version of the PDCSI GKE component.",
 	}, []string{"component_version"})
+
+	pdcsiOperationErrorsMetric = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Subsystem:      "csidriver",
+			Name:           "operation_errors",
+			Help:           "CSI server side error metrics",
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"driver_name", "method_name", "grpc_status_code", "disk_type", "enable_confidential_storage"})
 )
 
-type metricsManager struct {
+type MetricsManager struct {
 	registry metrics.KubeRegistry
 }
 
-func NewMetricsManager() metricsManager {
-	mm := metricsManager{
+func NewMetricsManager() MetricsManager {
+	mm := MetricsManager{
 		registry: metrics.NewKubeRegistry(),
 	}
 	return mm
 }
 
-func (mm *metricsManager) GetRegistry() metrics.KubeRegistry {
+func (mm *MetricsManager) GetRegistry() metrics.KubeRegistry {
 	return mm.registry
 }
 
-func (mm *metricsManager) registerComponentVersionMetric() {
+func (mm *MetricsManager) registerComponentVersionMetric() {
 	mm.registry.MustRegister(gkeComponentVersion)
 }
 
-func (mm *metricsManager) recordComponentVersionMetric() error {
+func (mm *MetricsManager) RegisterPDCSIMetric() {
+	mm.registry.MustRegister(pdcsiOperationErrorsMetric)
+}
+
+func (mm *MetricsManager) recordComponentVersionMetric() error {
 	v := getEnvVar(envGKEPDCSIVersion)
 	if v == "" {
 		klog.V(2).Info("Skip emitting component version metric")
@@ -70,7 +90,19 @@ func (mm *metricsManager) recordComponentVersionMetric() error {
 	return nil
 }
 
-func (mm *metricsManager) EmitGKEComponentVersion() error {
+func (mm *MetricsManager) RecordOperationErrorMetrics(
+	operationName string,
+	operationErr error,
+	diskType string,
+	enableConfidentialStorage string) {
+	err := codes.OK.String()
+	if operationErr != nil {
+		err = common.CodeForError(operationErr).String()
+	}
+	pdcsiOperationErrorsMetric.WithLabelValues(pdcsiDriverName, "/csi.v1.Controller/"+operationName, err, diskType, enableConfidentialStorage).Inc()
+}
+
+func (mm *MetricsManager) EmitGKEComponentVersion() error {
 	mm.registerComponentVersionMetric()
 	if err := mm.recordComponentVersionMetric(); err != nil {
 		return err
@@ -87,7 +119,7 @@ type Server interface {
 
 // RegisterToServer registers an HTTP handler for this metrics manager to the
 // given server at the specified address/path.
-func (mm *metricsManager) registerToServer(s Server, metricsPath string) {
+func (mm *MetricsManager) registerToServer(s Server, metricsPath string) {
 	s.Handle(metricsPath, metrics.HandlerFor(
 		mm.GetRegistry(),
 		metrics.HandlerOpts{
@@ -95,7 +127,7 @@ func (mm *metricsManager) registerToServer(s Server, metricsPath string) {
 }
 
 // InitializeHttpHandler sets up a server and creates a handler for metrics.
-func (mm *metricsManager) InitializeHttpHandler(address, path string) {
+func (mm *MetricsManager) InitializeHttpHandler(address, path string) {
 	mux := http.NewServeMux()
 	mm.registerToServer(mux, path)
 	go func() {
@@ -122,4 +154,14 @@ func IsGKEComponentVersionAvailable() bool {
 	}
 
 	return true
+}
+
+func GetMetricParameters(disk *gce.CloudDisk) (string, string) {
+	diskType := DefaultDiskTypeForMetric
+	enableConfidentialStorage := DefaultEnableConfidentialCompute
+	if disk != nil {
+		diskType = disk.GetPDType()
+		enableConfidentialStorage = strconv.FormatBool(disk.GetEnableConfidentialCompute())
+	}
+	return diskType, enableConfidentialStorage
 }

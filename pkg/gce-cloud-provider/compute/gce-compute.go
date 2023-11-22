@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -38,9 +39,12 @@ const (
 	waitForImageCreationTimeOut    = 5 * time.Minute
 	diskKind                       = "compute#disk"
 	cryptoKeyVerDelimiter          = "/cryptoKeyVersions"
+	// Example message: "[pd-standard] features are not compatible for creating instance"
+	pdDiskTypeUnsupportedPattern = `\[([a-z-]+)\] features are not compatible for creating instance`
 )
 
-var hyperdiskTypes = []string{"hyperdisk-extreme", "hyperdisk-throughput"}
+var hyperdiskTypes = []string{"hyperdisk-extreme", "hyperdisk-throughput", "hyperdisk-balanced"}
+var pdDiskTypeUnsupportedRegex = regexp.MustCompile(pdDiskTypeUnsupportedPattern)
 
 type GCEAPIVersion string
 
@@ -69,6 +73,15 @@ var WaitForOpBackoff = wait.Backoff{
 	Steps:    100,
 	Cap:      0}
 
+// Custom error type to propagate error messages up to clients.
+type UnsupportedDiskError struct {
+	DiskType string
+}
+
+func (udErr *UnsupportedDiskError) Error() string {
+	return ""
+}
+
 type GCECompute interface {
 	// Metadata information
 	GetDefaultProject() string
@@ -79,7 +92,7 @@ type GCECompute interface {
 	ValidateExistingDisk(ctx context.Context, disk *CloudDisk, params common.DiskParameters, reqBytes, limBytes int64, multiWriter bool) error
 	InsertDisk(ctx context.Context, project string, volKey *meta.Key, params common.DiskParameters, capBytes int64, capacityRange *csi.CapacityRange, replicaZones []string, snapshotID string, volumeContentSourceVolumeID string, multiWriter bool) error
 	DeleteDisk(ctx context.Context, project string, volumeKey *meta.Key) error
-	AttachDisk(ctx context.Context, project string, volKey *meta.Key, readWrite, diskType, instanceZone, instanceName string) error
+	AttachDisk(ctx context.Context, project string, volKey *meta.Key, readWrite, diskType, instanceZone, instanceName string, forceAttach bool) error
 	DetachDisk(ctx context.Context, project, deviceName, instanceZone, instanceName string) error
 	GetDiskSourceURI(project string, volKey *meta.Key) string
 	GetDiskTypeURI(project string, volKey *meta.Key, diskType string) string
@@ -245,6 +258,9 @@ func (cloud *CloudProvider) ListSnapshots(ctx context.Context, filter string) ([
 
 func (cloud *CloudProvider) GetDisk(ctx context.Context, project string, key *meta.Key, gceAPIVersion GCEAPIVersion) (*CloudDisk, error) {
 	klog.V(5).Infof("Getting disk %v", key)
+
+	// Override GCEAPIVersion as hyperdisk is only available in beta and we cannot get the disk-type with get disk call.
+	gceAPIVersion = GCEAPIVersionBeta
 	switch key.Type() {
 	case meta.Zonal:
 		if gceAPIVersion == GCEAPIVersionBeta {
@@ -403,8 +419,19 @@ func convertV1DiskToBetaDisk(v1Disk *computev1.Disk, provisionedThroughputOnCrea
 		Description:       v1Disk.Description,
 		Type:              v1Disk.Type,
 		SourceSnapshot:    v1Disk.SourceSnapshot,
+		SourceImage:       v1Disk.SourceImage,
+		SourceImageId:     v1Disk.SourceImageId,
+		SourceSnapshotId:  v1Disk.SourceSnapshotId,
+		SourceDisk:        v1Disk.SourceDisk,
 		ReplicaZones:      v1Disk.ReplicaZones,
 		DiskEncryptionKey: dek,
+		Zone:              v1Disk.Zone,
+		Region:            v1Disk.Region,
+		Status:            v1Disk.Status,
+		SelfLink:          v1Disk.SelfLink,
+	}
+	if v1Disk.ProvisionedIops > 0 {
+		betaDisk.ProvisionedIops = v1Disk.ProvisionedIops
 	}
 	if provisionedThroughputOnCreate > 0 {
 		betaDisk.ProvisionedThroughput = provisionedThroughputOnCreate
@@ -436,12 +463,11 @@ func (cloud *CloudProvider) insertRegionalDisk(
 	}
 
 	diskToCreate := &computev1.Disk{
-		Name:            volKey.Name,
-		SizeGb:          common.BytesToGbRoundUp(capBytes),
-		Description:     description,
-		Type:            cloud.GetDiskTypeURI(cloud.project, volKey, params.DiskType),
-		Labels:          params.Labels,
-		ProvisionedIops: params.ProvisionedIOPSOnCreate,
+		Name:        volKey.Name,
+		SizeGb:      common.BytesToGbRoundUp(capBytes),
+		Description: description,
+		Type:        cloud.GetDiskTypeURI(cloud.project, volKey, params.DiskType),
+		Labels:      params.Labels,
 	}
 	if snapshotID != "" {
 		_, snapshotType, _, err := common.SnapshotIDToProjectKey(snapshotID)
@@ -543,7 +569,6 @@ func (cloud *CloudProvider) insertZonalDisk(
 		opName        string
 		gceAPIVersion = GCEAPIVersionV1
 	)
-
 	if multiWriter || containsBetaDiskType(hyperdiskTypes, params.DiskType) {
 		gceAPIVersion = GCEAPIVersionBeta
 	}
@@ -554,6 +579,10 @@ func (cloud *CloudProvider) insertZonalDisk(
 		Description: description,
 		Type:        cloud.GetDiskTypeURI(project, volKey, params.DiskType),
 		Labels:      params.Labels,
+	}
+
+	if params.ProvisionedIOPSOnCreate > 0 {
+		diskToCreate.ProvisionedIops = params.ProvisionedIOPSOnCreate
 	}
 
 	if snapshotID != "" {
@@ -584,6 +613,7 @@ func (cloud *CloudProvider) insertZonalDisk(
 		var insertOp *computebeta.Operation
 		betaDiskToCreate := convertV1DiskToBetaDisk(diskToCreate, params.ProvisionedThroughputOnCreate)
 		betaDiskToCreate.MultiWriter = multiWriter
+		betaDiskToCreate.EnableConfidentialCompute = params.EnableConfidentialCompute
 		insertOp, err = cloud.betaService.Disks.Insert(project, volKey.Zone, betaDiskToCreate).Context(ctx).Do()
 		if insertOp != nil {
 			opName = insertOp.Name
@@ -687,7 +717,7 @@ func (cloud *CloudProvider) deleteRegionalDisk(ctx context.Context, project, reg
 	return nil
 }
 
-func (cloud *CloudProvider) AttachDisk(ctx context.Context, project string, volKey *meta.Key, readWrite, diskType, instanceZone, instanceName string) error {
+func (cloud *CloudProvider) AttachDisk(ctx context.Context, project string, volKey *meta.Key, readWrite, diskType, instanceZone, instanceName string, forceAttach bool) error {
 	klog.V(5).Infof("Attaching disk %v to %s", volKey, instanceName)
 	source := cloud.GetDiskSourceURI(project, volKey)
 
@@ -701,9 +731,13 @@ func (cloud *CloudProvider) AttachDisk(ctx context.Context, project string, volK
 		Mode:       readWrite,
 		Source:     source,
 		Type:       diskType,
+		// This parameter is ignored in the call, the ForceAttach decorator
+		// (query parameter) is the important one. We'll set it in both places
+		// in case that behavior changes.
+		ForceAttach: forceAttach,
 	}
 
-	op, err := cloud.service.Instances.AttachDisk(project, instanceZone, instanceName, attachedDiskV1).Context(ctx).Do()
+	op, err := cloud.service.Instances.AttachDisk(project, instanceZone, instanceName, attachedDiskV1).Context(ctx).ForceAttach(forceAttach).Do()
 	if err != nil {
 		return fmt.Errorf("failed cloud service attach disk call: %w", err)
 	}
@@ -838,12 +872,50 @@ func (cloud *CloudProvider) WaitForAttach(ctx context.Context, project string, v
 	})
 }
 
+func wrapOpErr(name string, opErr *computev1.OperationErrorErrors) error {
+	if opErr == nil {
+		return nil
+	}
+
+	if opErr.Code == "UNSUPPORTED_OPERATION" {
+		if diskType := pdDiskTypeUnsupportedRegex.FindStringSubmatch(opErr.Message); diskType != nil {
+			return &UnsupportedDiskError{
+				DiskType: diskType[1],
+			}
+		}
+	}
+	grpcErrCode := codeForGCEOpError(*opErr)
+	return status.Errorf(grpcErrCode, "operation %v failed (%v): %v", name, opErr.Code, opErr.Message)
+}
+
+// codeForGCEOpError return the grpc error code for the passed in
+// gce operation error. All of these error codes are filtered out from our SLO,
+// but will be monitored by the stockout reporting dashboard.
+func codeForGCEOpError(err computev1.OperationErrorErrors) codes.Code {
+	userErrors := map[string]codes.Code{
+		"RESOURCE_NOT_FOUND":                        codes.NotFound,
+		"RESOURCE_ALREADY_EXISTS":                   codes.AlreadyExists,
+		"RESOURCE_IN_USE_BY_ANOTHER_RESOURCE":       codes.InvalidArgument,
+		"OPERATION_CANCELED_BY_USER":                codes.Aborted,
+		"QUOTA_EXCEEDED":                            codes.ResourceExhausted,
+		"ZONE_RESOURCE_POOL_EXHAUSTED":              codes.Unavailable,
+		"ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS": codes.Unavailable,
+		"REGION_QUOTA_EXCEEDED":                     codes.ResourceExhausted,
+		"RATE_LIMIT_EXCEEDED":                       codes.ResourceExhausted,
+		"INVALID_USAGE":                             codes.InvalidArgument,
+	}
+	if code, ok := userErrors[err.Code]; ok {
+		return code
+	}
+	return codes.Internal
+}
+
 func opIsDone(op *computev1.Operation) (bool, error) {
 	if op == nil || op.Status != operationStatusDone {
 		return false, nil
 	}
 	if op.Error != nil && len(op.Error.Errors) > 0 && op.Error.Errors[0] != nil {
-		return true, fmt.Errorf("operation %v failed (%v): %v", op.Name, op.Error.Errors[0].Code, op.Error.Errors[0].Message)
+		return true, wrapOpErr(op.Name, op.Error.Errors[0])
 	}
 	return true, nil
 }

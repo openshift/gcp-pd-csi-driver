@@ -17,14 +17,21 @@ limitations under the License.
 package common
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"regexp"
 	"strings"
 
 	"github.com/GoogleCloudPlatform/k8s-cloud-provider/pkg/cloud/meta"
+	"google.golang.org/api/googleapi"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/sets"
 	volumehelpers "k8s.io/cloud-provider/volume/helpers"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -59,11 +66,27 @@ const (
 	multiRegionalLocationFmt = "^[a-z]+$"
 	// Example: us-east1
 	regionalLocationFmt = "^[a-z]+-[a-z]+[0-9]$"
+
+	// Full or partial URL of the machine type resource, in the format:
+	//   zones/zone/machineTypes/machine-type
+	machineTypePattern = "zones/[^/]+/machineTypes/([^/]+)$"
 )
 
 var (
 	multiRegionalPattern = regexp.MustCompile(multiRegionalLocationFmt)
 	regionalPattern      = regexp.MustCompile(regionalLocationFmt)
+
+	// Full or partial URL of the machine type resource, in the format:
+	//   zones/zone/machineTypes/machine-type
+	machineTypeRegex = regexp.MustCompile(machineTypePattern)
+
+	// userErrorCodeMap tells how API error types are translated to error codes.
+	userErrorCodeMap = map[int]codes.Code{
+		http.StatusForbidden:       codes.PermissionDenied,
+		http.StatusBadRequest:      codes.InvalidArgument,
+		http.StatusTooManyRequests: codes.ResourceExhausted,
+		http.StatusNotFound:        codes.NotFound,
+	}
 )
 
 func BytesToGbRoundDown(bytes int64) int64 {
@@ -267,4 +290,105 @@ func ConvertMiStringToInt64(str string) (int64, error) {
 		return -1, err
 	}
 	return volumehelpers.RoundUpToMiB(quantity)
+}
+
+// ConvertStringToBool converts a string to a boolean.
+func ConvertStringToBool(str string) (bool, error) {
+	switch strings.ToLower(str) {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	}
+	return false, fmt.Errorf("Unexpected boolean string %s", str)
+}
+
+// ConvertStringToAvailabilityClass converts a string to an availability class string.
+func ConvertStringToAvailabilityClass(str string) (string, error) {
+	switch strings.ToLower(str) {
+	case ParameterNoAvailabilityClass:
+		return ParameterNoAvailabilityClass, nil
+	case ParameterRegionalHardFailoverClass:
+		return ParameterRegionalHardFailoverClass, nil
+	}
+	return "", fmt.Errorf("Unexpected boolean string %s", str)
+}
+
+// ParseMachineType returns an extracted machineType from a URL, or empty if not found.
+// machineTypeUrl: Full or partial URL of the machine type resource, in the format:
+//
+//	zones/zone/machineTypes/machine-type
+func ParseMachineType(machineTypeUrl string) (string, error) {
+	machineType := machineTypeRegex.FindStringSubmatch(machineTypeUrl)
+	if machineType == nil {
+		return "", fmt.Errorf("failed to parse machineTypeUrl. Expected suffix: zones/{zone}/machineTypes/{machine-type}. Got: %s", machineTypeUrl)
+	}
+	return machineType[1], nil
+}
+
+// CodeForError returns the grpc error code that maps to the http error code for the
+// passed in user googleapi error or context error. Returns codes.Internal if the given
+// error is not a googleapi error caused by the user. userErrorCodeMap is used for
+// encoding most errors.
+func CodeForError(sourceError error) codes.Code {
+	if sourceError == nil {
+		return codes.Internal
+	}
+
+	if code, err := existingErrorCode(sourceError); err == nil {
+		return code
+	}
+	if code, err := isContextError(sourceError); err == nil {
+		return code
+	}
+
+	var apiErr *googleapi.Error
+	if !errors.As(sourceError, &apiErr) {
+		return codes.Internal
+	}
+	if code, ok := userErrorCodeMap[apiErr.Code]; ok {
+		return code
+	}
+
+	return codes.Internal
+}
+
+// isContextError returns the grpc error code DeadlineExceeded if the passed in error
+// contains the "context deadline exceeded" string and returns the grpc error code
+// Canceled if the error contains the "context canceled" string. It returns and error if
+// err isn't a context error.
+func isContextError(err error) (codes.Code, error) {
+	if err == nil {
+		return codes.Unknown, fmt.Errorf("null error")
+	}
+
+	errStr := err.Error()
+	if strings.Contains(errStr, context.DeadlineExceeded.Error()) {
+		return codes.DeadlineExceeded, nil
+	}
+	if strings.Contains(errStr, context.Canceled.Error()) {
+		return codes.Canceled, nil
+	}
+	return codes.Unknown, fmt.Errorf("Not a context error: %w", err)
+}
+
+func existingErrorCode(err error) (codes.Code, error) {
+	if err == nil {
+		return codes.Unknown, fmt.Errorf("null error")
+	}
+	if status, ok := status.FromError(err); ok {
+		return status.Code(), nil
+	}
+	return codes.Unknown, fmt.Errorf("no existing error code for %w", err)
+}
+
+func LoggedError(msg string, err error) error {
+	klog.Errorf(msg+"%v", err.Error())
+	return status.Errorf(CodeForError(err), msg+"%v", err.Error())
+}
+
+func isValidDiskEncryptionKmsKey(DiskEncryptionKmsKey string) bool {
+	// Validate key against default kmskey pattern
+	kmsKeyPattern := regexp.MustCompile("projects/[^/]+/locations/([^/]+)/keyRings/[^/]+/cryptoKeys/[^/]+")
+	return kmsKeyPattern.MatchString(DiskEncryptionKmsKey)
 }

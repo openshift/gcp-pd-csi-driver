@@ -17,11 +17,17 @@ limitations under the License.
 package common
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"reflect"
 	"testing"
 
 	"github.com/GoogleCloudPlatform/k8s-cloud-provider/pkg/cloud/meta"
+	"google.golang.org/api/googleapi"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -592,6 +598,12 @@ func TestConvertStringToInt64(t *testing.T) {
 			expectError: false,
 		},
 		{
+			desc:        "test higher number",
+			inputStr:    "15000",
+			expInt64:    15000,
+			expectError: false,
+		},
+		{
 			desc:        "round M to number",
 			inputStr:    "1M",
 			expInt64:    1000000,
@@ -797,5 +809,295 @@ func TestConvertMiStringToInt64(t *testing.T) {
 				t.Errorf("Got %d for converting string to int64; expect %d", actualInt64, tc.expInt64)
 			}
 		})
+	}
+}
+
+func TestConvertStringToBool(t *testing.T) {
+	tests := []struct {
+		desc        string
+		inputStr    string
+		expected    bool
+		expectError bool
+	}{
+		{
+			desc:        "valid true",
+			inputStr:    "true",
+			expected:    true,
+			expectError: false,
+		},
+		{
+			desc:        "valid mixed case true",
+			inputStr:    "True",
+			expected:    true,
+			expectError: false,
+		},
+		{
+			desc:        "valid false",
+			inputStr:    "false",
+			expected:    false,
+			expectError: false,
+		},
+		{
+			desc:        "valid mixed case false",
+			inputStr:    "False",
+			expected:    false,
+			expectError: false,
+		},
+		{
+			desc:        "invalid",
+			inputStr:    "yes",
+			expected:    false,
+			expectError: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			got, err := ConvertStringToBool(tc.inputStr)
+			if err != nil && !tc.expectError {
+				t.Errorf("Got error %v converting string to bool %s; expect no error", err, tc.inputStr)
+			}
+			if err == nil && tc.expectError {
+				t.Errorf("Got no error converting string to bool %s; expect an error", tc.inputStr)
+			}
+			if err == nil && got != tc.expected {
+				t.Errorf("Got %v for converting string to bool; expect %v", got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestConvertStringToAvailabilityClass(t *testing.T) {
+	tests := []struct {
+		desc        string
+		inputStr    string
+		expected    string
+		expectError bool
+	}{
+		{
+			desc:        "valid none",
+			inputStr:    "none",
+			expected:    ParameterNoAvailabilityClass,
+			expectError: false,
+		},
+		{
+			desc:        "valid mixed case none",
+			inputStr:    "None",
+			expected:    ParameterNoAvailabilityClass,
+			expectError: false,
+		},
+		{
+			desc:        "valid failover",
+			inputStr:    "regional-hard-failover",
+			expected:    ParameterRegionalHardFailoverClass,
+			expectError: false,
+		},
+		{
+			desc:        "valid mixed case failover",
+			inputStr:    "Regional-Hard-Failover",
+			expected:    ParameterRegionalHardFailoverClass,
+			expectError: false,
+		},
+		{
+			desc:        "invalid",
+			inputStr:    "yes",
+			expected:    "",
+			expectError: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			got, err := ConvertStringToAvailabilityClass(tc.inputStr)
+			if err != nil && !tc.expectError {
+				t.Errorf("Got error %v converting string to availablity class %s; expect no error", err, tc.inputStr)
+			}
+			if err == nil && tc.expectError {
+				t.Errorf("Got no error converting string to availablity class %s; expect an error", tc.inputStr)
+			}
+			if err == nil && got != tc.expected {
+				t.Errorf("Got %v for converting string to availablity class; expect %v", got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestParseMachineType(t *testing.T) {
+	tests := []struct {
+		desc                string
+		inputMachineTypeUrl string
+		expectedMachineType string
+		expectError         bool
+	}{
+		{
+			desc:                "full URL machine type",
+			inputMachineTypeUrl: "https://www.googleapis.com/compute/v1/projects/my-project/zones/us-central1-c/machineTypes/c3-highcpu-4",
+			expectedMachineType: "c3-highcpu-4",
+		},
+		{
+			desc:                "partial URL machine type",
+			inputMachineTypeUrl: "zones/us-central1-c/machineTypes/n2-standard-4",
+			expectedMachineType: "n2-standard-4",
+		},
+		{
+			desc:                "custom partial URL machine type",
+			inputMachineTypeUrl: "zones/us-central1-c/machineTypes/e2-custom-2-4096",
+			expectedMachineType: "e2-custom-2-4096",
+		},
+		{
+			desc:                "incorrect URL",
+			inputMachineTypeUrl: "https://www.googleapis.com/compute/v1/projects/psch-gke-dev/zones/us-central1-c",
+			expectError:         true,
+		},
+		{
+			desc:                "incorrect partial URL",
+			inputMachineTypeUrl: "zones/us-central1-c/machineTypes/",
+			expectError:         true,
+		},
+		{
+			desc:                "missing zone",
+			inputMachineTypeUrl: "zones//machineTypes/n2-standard-4",
+			expectError:         true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			actualMachineFamily, err := ParseMachineType(tc.inputMachineTypeUrl)
+			if err != nil && !tc.expectError {
+				t.Errorf("Got error %v parsing machine type %s; expect no error", err, tc.inputMachineTypeUrl)
+			}
+			if err == nil && tc.expectError {
+				t.Errorf("Got no error parsing machine type %s; expect an error", tc.inputMachineTypeUrl)
+			}
+			if err == nil && actualMachineFamily != tc.expectedMachineType {
+				t.Errorf("Got %s parsing machine type; expect %s", actualMachineFamily, tc.expectedMachineType)
+			}
+		})
+	}
+}
+
+func TestCodeForError(t *testing.T) {
+	testCases := []struct {
+		name     string
+		inputErr error
+		expCode  codes.Code
+	}{
+		{
+			name:     "Not googleapi.Error",
+			inputErr: errors.New("I am not a googleapi.Error"),
+			expCode:  codes.Internal,
+		},
+		{
+			name:     "User error",
+			inputErr: &googleapi.Error{Code: http.StatusBadRequest, Message: "User error with bad request"},
+			expCode:  codes.InvalidArgument,
+		},
+		{
+			name:     "googleapi.Error but not a user error",
+			inputErr: &googleapi.Error{Code: http.StatusInternalServerError, Message: "Internal error"},
+			expCode:  codes.Internal,
+		},
+		{
+			name:     "context canceled error",
+			inputErr: context.Canceled,
+			expCode:  codes.Canceled,
+		},
+		{
+			name:     "context deadline exceeded error",
+			inputErr: context.DeadlineExceeded,
+			expCode:  codes.DeadlineExceeded,
+		},
+		{
+			name:     "status error with Aborted error code",
+			inputErr: status.Error(codes.Aborted, "aborted error"),
+			expCode:  codes.Aborted,
+		},
+		{
+			name:     "nil error",
+			inputErr: nil,
+			expCode:  codes.Internal,
+		},
+	}
+
+	for _, tc := range testCases {
+		errCode := CodeForError(tc.inputErr)
+		if errCode != tc.expCode {
+			t.Errorf("test %v failed: got %v, expected %v", tc.name, errCode, tc.expCode)
+		}
+	}
+}
+
+func TestIsContextError(t *testing.T) {
+	cases := []struct {
+		name            string
+		err             error
+		expectedErrCode codes.Code
+		expectError     bool
+	}{
+		{
+			name:            "deadline exceeded error",
+			err:             context.DeadlineExceeded,
+			expectedErrCode: codes.DeadlineExceeded,
+		},
+		{
+			name:            "contains 'context deadline exceeded'",
+			err:             fmt.Errorf("got error: %w", context.DeadlineExceeded),
+			expectedErrCode: codes.DeadlineExceeded,
+		},
+		{
+			name:            "context canceled error",
+			err:             context.Canceled,
+			expectedErrCode: codes.Canceled,
+		},
+		{
+			name:            "contains 'context canceled'",
+			err:             fmt.Errorf("got error: %w", context.Canceled),
+			expectedErrCode: codes.Canceled,
+		},
+		{
+			name:        "does not contain 'context canceled' or 'context deadline exceeded'",
+			err:         fmt.Errorf("unknown error"),
+			expectError: true,
+		},
+		{
+			name:        "nil error",
+			err:         nil,
+			expectError: true,
+		},
+	}
+
+	for _, test := range cases {
+		errCode, err := isContextError(test.err)
+		if test.expectError {
+			if err == nil {
+				t.Errorf("test %v failed, expected error, got %v", test.name, errCode)
+			}
+		} else if errCode != test.expectedErrCode {
+			t.Errorf("test %v failed: got %v, expected %v", test.name, errCode, test.expectedErrCode)
+		}
+	}
+}
+
+func TestIsValidDiskEncryptionKmsKey(t *testing.T) {
+	cases := []struct {
+		diskEncryptionKmsKey string
+		expectedIsValid      bool
+	}{
+		{
+			diskEncryptionKmsKey: "projects/my-project/locations/us-central1/keyRings/TestKeyRing/cryptoKeys/test-key",
+			expectedIsValid:      true,
+		},
+		{
+			diskEncryptionKmsKey: "projects/my-project/locations/global/keyRings/TestKeyRing/cryptoKeys/test-key",
+			expectedIsValid:      true,
+		},
+		{
+			diskEncryptionKmsKey: "projects/my-project/locations/keyRings/TestKeyRing/cryptoKeys/test-key",
+			expectedIsValid:      false,
+		},
+	}
+	for _, tc := range cases {
+		isValid := isValidDiskEncryptionKmsKey(tc.diskEncryptionKmsKey)
+		if tc.expectedIsValid != isValid {
+			t.Errorf("test failed: the provided key %s expected to be %v bu tgot %v", tc.diskEncryptionKmsKey, tc.expectedIsValid, isValid)
+		}
 	}
 }
