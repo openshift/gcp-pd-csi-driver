@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/util/flowcontrol"
+	"k8s.io/utils/strings/slices"
 
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
@@ -294,11 +295,43 @@ func TestListSnapshotsArguments(t *testing.T) {
 			expectedCount: 1,
 		},
 		{
+			name: "valid image",
+			req: &csi.ListSnapshotsRequest{
+				SnapshotId: testImageID + "0",
+			},
+			numSnapshots:  3,
+			numImages:     2,
+			expectedCount: 1,
+		},
+		{
 			name: "invalid id",
 			req: &csi.ListSnapshotsRequest{
 				SnapshotId: testSnapshotID + "/foo",
 			},
 			expectedCount: 0,
+		},
+		{
+			name: "invalid image id",
+			req: &csi.ListSnapshotsRequest{
+				SnapshotId: testImageID + "/foo",
+			},
+			expectedCount: 0,
+		},
+		{
+			name: "invalid snapshot name",
+			req: &csi.ListSnapshotsRequest{
+				SnapshotId: testSnapshotID + "-invalid-snapshot-",
+			},
+			expectedCount: 0,
+			expErrCode:    codes.InvalidArgument,
+		},
+		{
+			name: "invalid image name",
+			req: &csi.ListSnapshotsRequest{
+				SnapshotId: testImageID + "-invalid-image-",
+			},
+			expectedCount: 0,
+			expErrCode:    codes.InvalidArgument,
 		},
 		{
 			name: "no id",
@@ -411,10 +444,11 @@ func TestListSnapshotsArguments(t *testing.T) {
 
 func TestCreateVolumeArguments(t *testing.T) {
 	testCases := []struct {
-		name       string
-		req        *csi.CreateVolumeRequest
-		expVol     *csi.Volume
-		expErrCode codes.Code
+		name               string
+		req                *csi.CreateVolumeRequest
+		enableStoragePools bool
+		expVol             *csi.Volume
+		expErrCode         codes.Code
 	}{
 		{
 			name: "success default",
@@ -845,6 +879,84 @@ func TestCreateVolumeArguments(t *testing.T) {
 			},
 			expErrCode: codes.InvalidArgument,
 		},
+		{
+			name: "success with storage pools parameter",
+			req: &csi.CreateVolumeRequest{
+				Name:               name,
+				CapacityRange:      stdCapRange,
+				VolumeCapabilities: stdVolCaps,
+				Parameters:         map[string]string{"storage-pools": "projects/test-project/zones/us-central1-a/storagePools/storagePool-1", "type": "hyperdisk-balanced"},
+				AccessibilityRequirements: &csi.TopologyRequirement{
+					Requisite: []*csi.Topology{
+						{
+							Segments: map[string]string{common.TopologyKeyZone: "us-central1-a"},
+						},
+					},
+					Preferred: []*csi.Topology{
+						{
+							Segments: map[string]string{common.TopologyKeyZone: "us-central1-a"},
+						},
+					},
+				},
+			},
+			enableStoragePools: true,
+			expVol: &csi.Volume{
+				CapacityBytes: common.GbToBytes(20),
+				VolumeId:      "projects/test-project/zones/us-central1-a/disks/test-name",
+				VolumeContext: nil,
+				AccessibleTopology: []*csi.Topology{
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-a"},
+					},
+				},
+			},
+		},
+		{
+			name: "fail with storage pools parameter, enableStoragePools is false",
+			req: &csi.CreateVolumeRequest{
+				Name:               name,
+				CapacityRange:      stdCapRange,
+				VolumeCapabilities: stdVolCaps,
+				Parameters:         map[string]string{"storage-pools": "projects/test-project/zones/us-central1-a/storagePools/storagePool-1", "type": "hyperdisk-balanced"},
+				AccessibilityRequirements: &csi.TopologyRequirement{
+					Requisite: []*csi.Topology{
+						{
+							Segments: map[string]string{common.TopologyKeyZone: "us-central1-a"},
+						},
+					},
+					Preferred: []*csi.Topology{
+						{
+							Segments: map[string]string{common.TopologyKeyZone: "us-central1-a"},
+						},
+					},
+				},
+			},
+			enableStoragePools: false,
+			expErrCode:         codes.InvalidArgument,
+		},
+		{
+			name: "fail with invalid storage pools parameter",
+			req: &csi.CreateVolumeRequest{
+				Name:               name,
+				CapacityRange:      stdCapRange,
+				VolumeCapabilities: stdVolCaps,
+				Parameters:         map[string]string{"storage-pools": "zones/us-central1-a/storagePools/storagePool-1", "type": "hyperdisk-balanced"},
+				AccessibilityRequirements: &csi.TopologyRequirement{
+					Requisite: []*csi.Topology{
+						{
+							Segments: map[string]string{common.TopologyKeyZone: "us-central1-a"},
+						},
+					},
+					Preferred: []*csi.Topology{
+						{
+							Segments: map[string]string{common.TopologyKeyZone: "us-central1-a"},
+						},
+					},
+				},
+			},
+			enableStoragePools: true,
+			expErrCode:         codes.InvalidArgument,
+		},
 	}
 
 	// Run test cases
@@ -852,7 +964,7 @@ func TestCreateVolumeArguments(t *testing.T) {
 		t.Logf("test case: %s", tc.name)
 		// Setup new driver each time so no interference
 		gceDriver := initGCEDriver(t, nil)
-
+		gceDriver.cs.enableStoragePools = tc.enableStoragePools
 		// Start Test
 		resp, err := gceDriver.cs.CreateVolume(context.Background(), tc.req)
 		if err != nil {
@@ -1280,6 +1392,7 @@ func TestCreateVolumeWithVolumeSourceFromVolume(t *testing.T) {
 		name                 string
 		volumeOnCloud        bool
 		expErrCode           codes.Code
+		expErrMsg            string
 		sourceVolumeID       string
 		reqParameters        map[string]string
 		sourceReqParameters  map[string]string
@@ -1287,6 +1400,7 @@ func TestCreateVolumeWithVolumeSourceFromVolume(t *testing.T) {
 		requestCapacityRange *csi.CapacityRange
 		sourceTopology       *csi.TopologyRequirement
 		requestTopology      *csi.TopologyRequirement
+		enableStoragePools   bool
 		expCloneKey          *meta.Key
 		// Accessible topologies validates that the replica zones are valid for regional disk clones.
 		expAccessibleTop []*csi.Topology
@@ -1367,6 +1481,31 @@ func TestCreateVolumeWithVolumeSourceFromVolume(t *testing.T) {
 					Segments: map[string]string{common.TopologyKeyZone: "country-region-zone"},
 				},
 			},
+		},
+		{
+			name:                 "fail cloning with storage pools",
+			volumeOnCloud:        true,
+			sourceVolumeID:       testZonalVolumeSourceID,
+			requestCapacityRange: stdCapRange,
+			sourceCapacityRange:  stdCapRange,
+			enableStoragePools:   true,
+			reqParameters: map[string]string{
+				common.ParameterKeyType:                 "test-type",
+				common.ParameterKeyReplicationType:      replicationTypeNone,
+				common.ParameterKeyDiskEncryptionKmsKey: "encryption-key",
+				common.ParameterKeyStoragePools:         "projects/test-project/zones/country-region-zone/storagePools/storagePool-1",
+			},
+			sourceReqParameters: zonalParams,
+			sourceTopology: &csi.TopologyRequirement{
+				Requisite: requisiteTopology,
+				Preferred: prefTopology,
+			},
+			requestTopology: &csi.TopologyRequirement{
+				Requisite: requisiteTopology,
+				Preferred: prefTopology,
+			},
+			expErrCode: codes.InvalidArgument,
+			expErrMsg:  "storage pools do not support disk clones",
 		},
 		{
 			name:                 "success zonal -> zonal cloning, req = all zones in region, pref = req w/ src zone as first element: delayed binding without allowedTopologies",
@@ -1769,6 +1908,7 @@ func TestCreateVolumeWithVolumeSourceFromVolume(t *testing.T) {
 	for _, tc := range testCases {
 		t.Logf("test case: %s", tc.name)
 		gceDriver := initGCEDriver(t, nil)
+		gceDriver.cs.enableStoragePools = tc.enableStoragePools
 
 		req := &csi.CreateVolumeRequest{
 			Name:               testCloneVolumeName,
@@ -1818,6 +1958,9 @@ func TestCreateVolumeWithVolumeSourceFromVolume(t *testing.T) {
 		}
 		if tc.expErrCode != codes.OK {
 			t.Fatalf("Expected error: %v, got no error", tc.expErrCode)
+		}
+		if tc.expErrMsg != "" && tc.expErrMsg != err.Error() {
+			t.Fatalf("Got error: %v, expected error: %v", err.Error(), tc.expErrMsg)
 		}
 
 		// Make sure the response has the source volume.
@@ -2369,12 +2512,13 @@ func TestPrependZone(t *testing.T) {
 
 func TestPickZonesFromTopology(t *testing.T) {
 	testCases := []struct {
-		name     string
-		top      *csi.TopologyRequirement
-		locReq   *locationRequirements
-		numZones int
-		expZones []string
-		expErr   bool
+		name                   string
+		top                    *csi.TopologyRequirement
+		locReq                 *locationRequirements
+		numZones               int
+		fallbackRequisiteZones []string
+		expZones               []string
+		expErr                 bool
 	}{
 		{
 			name: "success: preferred",
@@ -2434,6 +2578,29 @@ func TestPickZonesFromTopology(t *testing.T) {
 			locReq:   &locationRequirements{srcVolRegion: "us-central1", srcVolZone: "us-central1-a", srcReplicationType: replicationTypeNone, cloneReplicationType: replicationTypeNone},
 			numZones: 1,
 			expZones: []string{"us-central1-a"},
+		},
+		{
+			name: "success: requisite, locationRequirements[region:us-central1, zone:us-central1-a, srcReplicationType:none, cloneReplicationType:regional-pd]",
+			top: &csi.TopologyRequirement{
+				Requisite: []*csi.Topology{
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-a"},
+					},
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-b"},
+					},
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-c"},
+					},
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-f"},
+					},
+				},
+				Preferred: []*csi.Topology{},
+			},
+			locReq:   &locationRequirements{srcVolRegion: "us-central1", srcVolZone: "us-central1-c", srcReplicationType: replicationTypeNone, cloneReplicationType: replicationTypeRegionalPD},
+			numZones: 2,
+			expZones: []string{"us-central1-c", "us-central1-f"},
 		},
 		{
 			name: "success: preferred and requisite",
@@ -2501,7 +2668,7 @@ func TestPickZonesFromTopology(t *testing.T) {
 			},
 			locReq:   &locationRequirements{srcVolRegion: "us-central1", srcVolZone: "us-central1-a", srcReplicationType: replicationTypeRegionalPD, cloneReplicationType: replicationTypeRegionalPD},
 			numZones: 5,
-			expZones: []string{"us-central1-b", "us-central1-c", "us-central1-a", "us-central1-d", "us-central1-f"},
+			expZones: []string{"us-central1-b", "us-central1-a", "us-central1-c", "us-central1-d", "us-central1-f"},
 		},
 		{
 			name: "success: preferred and requisite, locationRequirements[region:us-central1, zone:us-central1-a, srcReplicationType:none, cloneReplicationType:regional-pd]",
@@ -2537,6 +2704,149 @@ func TestPickZonesFromTopology(t *testing.T) {
 			expZones: []string{"us-central1-a", "us-central1-b", "us-central1-c", "us-central1-d", "us-central1-f"},
 		},
 		{
+			name: "success: preferred and requisite, locationRequirements[region:us-central1, zone:us-central1-a, srcReplicationType:none, cloneReplicationType:regional-pd], 3 zones {a, b, c}",
+			top: &csi.TopologyRequirement{
+				Requisite: []*csi.Topology{
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-a"},
+					},
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-b"},
+					},
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-c"},
+					},
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-f"},
+					},
+				},
+				Preferred: []*csi.Topology{
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-a"},
+					},
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-c"},
+					},
+				},
+			},
+			locReq:   &locationRequirements{srcVolRegion: "us-central1", srcVolZone: "us-central1-a", srcReplicationType: replicationTypeNone, cloneReplicationType: replicationTypeRegionalPD},
+			numZones: 3,
+			expZones: []string{"us-central1-a", "us-central1-c", "us-central1-b"},
+		},
+		{
+			name: "success: preferred and requisite, locationRequirements[region:us-central1, zone:us-central1-a, srcReplicationType:none, cloneReplicationType:regional-pd], 3 zones {b, c, f}",
+			top: &csi.TopologyRequirement{
+				Requisite: []*csi.Topology{
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-a"},
+					},
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-b"},
+					},
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-c"},
+					},
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-f"},
+					},
+				},
+				Preferred: []*csi.Topology{
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-b"},
+					},
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-c"},
+					},
+				},
+			},
+			locReq:   &locationRequirements{srcVolRegion: "us-central1", srcVolZone: "us-central1-b", srcReplicationType: replicationTypeNone, cloneReplicationType: replicationTypeRegionalPD},
+			numZones: 3,
+			expZones: []string{"us-central1-b", "us-central1-c", "us-central1-f"},
+		},
+		{
+			name: "success: preferred and requisite, locationRequirements[region:us-central1, zone:us-central1-a, srcReplicationType:none, cloneReplicationType:regional-pd], fallback topologies specified but unused",
+			top: &csi.TopologyRequirement{
+				Requisite: []*csi.Topology{
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-a"},
+					},
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-b"},
+					},
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-c"},
+					},
+				},
+				Preferred: []*csi.Topology{
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-a"},
+					},
+				},
+			},
+			fallbackRequisiteZones: []string{"us-central1-a", "us-central1-f", "us-central1-g"},
+			locReq:                 &locationRequirements{srcVolRegion: "us-central1", srcVolZone: "us-central1-a", srcReplicationType: replicationTypeNone, cloneReplicationType: replicationTypeRegionalPD},
+			numZones:               2,
+			expZones:               []string{"us-central1-a", "us-central1-b"},
+		},
+		{
+			name: "success: preferred and requisite, locationRequirements[region:us-central1, zone:us-central1-a, srcReplicationType:none, cloneReplicationType:regional-pd], fallback topologies specified",
+			top: &csi.TopologyRequirement{
+				Requisite: []*csi.Topology{
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-b"},
+					},
+				},
+				Preferred: []*csi.Topology{
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-b"},
+					},
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-west1-b"},
+					},
+				},
+			},
+			fallbackRequisiteZones: []string{"us-central1-a", "us-central1-b", "us-central1-c"},
+			locReq:                 &locationRequirements{srcVolRegion: "us-central1", srcVolZone: "us-central1-b", srcReplicationType: replicationTypeNone, cloneReplicationType: replicationTypeRegionalPD},
+			numZones:               2,
+			expZones:               []string{"us-central1-b", "us-central1-c"},
+		},
+		{
+			name: "success: preferred and requisite, locationRequirements[region:us-central1, zone:us-central1-a, srcReplicationType:regional-pd, cloneReplicationType:regional-pd], fallback topologies specified",
+			top: &csi.TopologyRequirement{
+				Requisite: []*csi.Topology{},
+				Preferred: []*csi.Topology{
+					// This is a bit contrived, a real regional PD should have two zones
+					// This only has one, so we can test that a second is pulled from
+					// fallbackRequisiteZones.
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-b"},
+					},
+				},
+			},
+			fallbackRequisiteZones: []string{"us-central1-a", "us-central1-b", "us-central1-c", "us-central1-f"},
+			locReq:                 &locationRequirements{srcVolRegion: "us-central1", srcVolZone: "us-central1-b", srcReplicationType: replicationTypeRegionalPD, cloneReplicationType: replicationTypeRegionalPD},
+			numZones:               2,
+			expZones:               []string{"us-central1-b", "us-central1-c"},
+		},
+		{
+			name: "success: preferred and requisite, fallback topologies specified",
+			top: &csi.TopologyRequirement{
+				Requisite: []*csi.Topology{
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-b"},
+					},
+				},
+				Preferred: []*csi.Topology{
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-b"},
+					},
+				},
+			},
+			fallbackRequisiteZones: []string{"us-central1-a", "us-central1-b", "us-central1-c"},
+			numZones:               2,
+			expZones:               []string{"us-central1-b", "us-central1-c"},
+		},
+		{
 			name: "fail: not enough topologies",
 			top: &csi.TopologyRequirement{
 				Requisite: []*csi.Topology{
@@ -2564,6 +2874,24 @@ func TestPickZonesFromTopology(t *testing.T) {
 			},
 			numZones: 4,
 			expErr:   true,
+		},
+		{
+			name: "fail: not enough topologies, fallback topologies specified",
+			top: &csi.TopologyRequirement{
+				Requisite: []*csi.Topology{
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-a"},
+					},
+				},
+				Preferred: []*csi.Topology{
+					{
+						Segments: map[string]string{common.TopologyKeyZone: "us-central1-a"},
+					},
+				},
+			},
+			fallbackRequisiteZones: []string{"us-central1-a", "us-central1-b", "us-central1-c"},
+			numZones:               4,
+			expErr:                 true,
 		},
 		{
 			name: "fail: no topologies that match locationRequirment, locationRequirements[region:us-east1, zone:us-east1-a, replicationType:none]",
@@ -2656,7 +2984,7 @@ func TestPickZonesFromTopology(t *testing.T) {
 			expErr:   true,
 		},
 		{
-			name: "success: only requisite, locationRequirements[region:us-central1, zone:us-central1-a, replicationType:regional-pd",
+			name: "success: only requisite, all zones",
 			top: &csi.TopologyRequirement{
 				Requisite: []*csi.Topology{
 					{
@@ -2693,15 +3021,17 @@ func TestPickZonesFromTopology(t *testing.T) {
 		},
 	}
 	for _, tc := range testCases {
+		// Apply a deterministic seed to make the test that calls rand.Intn stable.
+		rand.Seed(8)
 		t.Logf("test case: %s", tc.name)
-		gotZones, err := pickZonesFromTopology(tc.top, tc.numZones, tc.locReq)
+		gotZones, err := pickZonesFromTopology(tc.top, tc.numZones, tc.locReq, tc.fallbackRequisiteZones)
 		if err != nil && !tc.expErr {
 			t.Errorf("got error: %v, but did not expect error", err)
 		}
 		if err == nil && tc.expErr {
 			t.Errorf("got no error, but expected error")
 		}
-		if !sets.NewString(gotZones...).Equal(sets.NewString(tc.expZones...)) {
+		if !slices.Equal(gotZones, tc.expZones) {
 			t.Errorf("Expected zones: %v, but got: %v", tc.expZones, gotZones)
 		}
 	}
@@ -2717,80 +3047,6 @@ func zonesEqual(gotZones, expectedZones []string) bool {
 		}
 	}
 	return true
-}
-
-func TestPickRandAndConsecutive(t *testing.T) {
-	rand.Seed(time.Now().UnixNano())
-	testCases := []struct {
-		name   string
-		slice  []string
-		n      int
-		expErr bool
-	}{
-		{
-			name:  "success: normal",
-			slice: []string{"test", "second", "third"},
-			n:     2,
-		},
-		{
-			name:  "success: full",
-			slice: []string{"test", "second", "third"},
-			n:     3,
-		},
-		{
-			name:  "success: large",
-			slice: []string{"test", "second", "third", "fourth", "fifth", "sixth"},
-			n:     2,
-		},
-		{
-			name:   "fail: n too large",
-			slice:  []string{},
-			n:      2,
-			expErr: true,
-		},
-	}
-	for _, tc := range testCases {
-		t.Logf("test case: %s", tc.name)
-		tot := sets.String{}
-		sort.Strings(tc.slice)
-		for i := 0; i < 25; i++ {
-			theslice, err := pickRandAndConsecutive(tc.slice, tc.n)
-			if err != nil && !tc.expErr {
-				t.Errorf("Did not expect error but got: %v", err)
-			}
-			if err == nil && tc.expErr {
-				t.Errorf("Expected error but got none")
-			}
-			if err != nil {
-				break
-			}
-			if len(theslice) != tc.n {
-				t.Errorf("expected the resulting slice to be length %v, but got %v instead", tc.n, theslice)
-			}
-			// Find where it is in the slice
-			var idx = -1
-			for j, elem := range tc.slice {
-				if elem == theslice[0] {
-					idx = j
-					break
-				}
-			}
-			if idx == -1 {
-				t.Errorf("could not find %v in the original slice %v", theslice[0], tc.slice)
-			}
-			for j := 0; j < tc.n; j++ {
-				if theslice[j] != tc.slice[(idx+j)%len(tc.slice)] {
-					t.Errorf("did not pick sorted consecutive values from the slice")
-				}
-			}
-
-			tot.Insert(theslice...)
-		}
-		if !tot.Equal(sets.NewString(tc.slice...)) {
-			t.Errorf("randomly picking n from slice did not get all %v, instead got only %v", tc.slice, tot)
-		}
-
-	}
 }
 
 func TestVolumeOperationConcurrency(t *testing.T) {

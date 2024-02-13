@@ -21,6 +21,7 @@ import (
 	"math/rand"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -43,6 +44,7 @@ var (
 	httpEndpoint         = flag.String("http-endpoint", "", "The TCP network address where the prometheus metrics endpoint will listen (example: `:8080`). The default is empty string, which means metrics endpoint is disabled.")
 	metricsPath          = flag.String("metrics-path", "/metrics", "The HTTP path where prometheus metrics will be exposed. Default is `/metrics`.")
 	grpcLogCharCap       = flag.Int("grpc-log-char-cap", 10000, "The maximum amount of characters logged for every grpc responses")
+	enableOtelTracing    = flag.Bool("enable-otel-tracing", false, "If set, enable opentelemetry tracing for the driver. The tracing is disabled by default. Configure the exporter endpoint with OTEL_EXPORTER_OTLP_ENDPOINT and other env variables, see https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/#general-sdk-configuration.")
 
 	errorBackoffInitialDurationMs = flag.Int("backoff-initial-duration-ms", 200, "The amount of ms for the initial duration of the backoff condition for controller publish/unpublish CSI operations. Default is 200.")
 	errorBackoffMaxDurationMs     = flag.Int("backoff-max-duration-ms", 300000, "The amount of ms for the max duration of the backoff condition for controller publish/unpublish CSI operations. Default is 300000 (5m).")
@@ -65,6 +67,10 @@ var (
 
 	maxConcurrentFormatAndMount = flag.Int("max-concurrent-format-and-mount", 1, "If set then format and mount operations are serialized on each node. This is stronger than max-concurrent-format as it includes fsck and other mount operations")
 	formatAndMountTimeout       = flag.Duration("format-and-mount-timeout", 1*time.Minute, "The maximum duration of a format and mount operation before another such operation will be started. Used only if --serialize-format-and-mount")
+
+	fallbackRequisiteZonesFlag = flag.String("fallback-requisite-zones", "", "Comma separated list of requisite zones that will be used if there are not sufficient zones present in requisite topologies when provisioning a disk")
+
+	enableStoragePoolsFlag = flag.Bool("enable-storage-pools", false, "If set to true, the CSI Driver will allow volumes to be provisioned in Storage Pools")
 
 	version string
 )
@@ -101,6 +107,22 @@ func handle() {
 	}
 	klog.V(2).Infof("Driver vendor version %v", version)
 
+	// Start tracing as soon as possible
+	if *enableOtelTracing {
+		exporter, err := driver.InitOtelTracing()
+		if err != nil {
+			klog.Fatalf("Failed to initialize otel tracing: %v", err.Error())
+		}
+		// Exporter will flush traces on shutdown
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := exporter.Shutdown(ctx); err != nil {
+				klog.Errorf("Could not shutdown otel exporter: %v", err.Error())
+			}
+		}()
+	}
+
 	if *runControllerService && *httpEndpoint != "" {
 		mm := metrics.NewMetricsManager()
 		mm.InitializeHttpHandler(*httpEndpoint, *metricsPath)
@@ -128,6 +150,9 @@ func handle() {
 	// Initialize identity server
 	identityServer := driver.NewIdentityServer(gceDriver)
 
+	// Initilaize requisite zones
+	fallbackRequisiteZones := strings.Split(*fallbackRequisiteZonesFlag, ",")
+
 	// Initialize requirements for the controller service
 	var controllerServer *driver.GCEControllerServer
 	if *runControllerService {
@@ -137,7 +162,7 @@ func handle() {
 		}
 		initialBackoffDuration := time.Duration(*errorBackoffInitialDurationMs) * time.Millisecond
 		maxBackoffDuration := time.Duration(*errorBackoffMaxDurationMs) * time.Millisecond
-		controllerServer = driver.NewControllerServer(gceDriver, cloudProvider, initialBackoffDuration, maxBackoffDuration)
+		controllerServer = driver.NewControllerServer(gceDriver, cloudProvider, initialBackoffDuration, maxBackoffDuration, fallbackRequisiteZones, *enableStoragePoolsFlag)
 	} else if *cloudConfigFilePath != "" {
 		klog.Warningf("controller service is disabled but cloud config given - it has no effect")
 	}
@@ -178,5 +203,5 @@ func handle() {
 	gce.WaitForOpBackoff.Steps = *waitForOpBackoffSteps
 	gce.WaitForOpBackoff.Cap = *waitForOpBackoffCap
 
-	gceDriver.Run(*endpoint, *grpcLogCharCap)
+	gceDriver.Run(*endpoint, *grpcLogCharCap, *enableOtelTracing)
 }

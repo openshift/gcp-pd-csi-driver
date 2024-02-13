@@ -80,6 +80,8 @@ var (
 	//   zones/zone/machineTypes/machine-type
 	machineTypeRegex = regexp.MustCompile(machineTypePattern)
 
+	storagePoolFieldsRegex = regexp.MustCompile(`^projects/([^/]+)/zones/([^/]+)/storagePools/([^/]+)$`)
+
 	// userErrorCodeMap tells how API error types are translated to error codes.
 	userErrorCodeMap = map[int]codes.Code{
 		http.StatusForbidden:       codes.PermissionDenied,
@@ -335,6 +337,9 @@ func CodeForError(sourceError error) codes.Code {
 		return codes.Internal
 	}
 
+	if code, err := isUserMultiAttachError(sourceError); err == nil {
+		return code
+	}
 	if code, err := existingErrorCode(sourceError); err == nil {
 		return code
 	}
@@ -372,6 +377,17 @@ func isContextError(err error) (codes.Code, error) {
 	return codes.Unknown, fmt.Errorf("Not a context error: %w", err)
 }
 
+// isUserMultiAttachError returns an InvalidArgument if the error is
+// multi-attach detected from the API server. If we get this error from the API
+// server, it means that the kubelet doesn't know about the multiattch so it is
+// due to user configuration.
+func isUserMultiAttachError(err error) (codes.Code, error) {
+	if strings.Contains(err.Error(), "The disk resource") && strings.Contains(err.Error(), "is already being used") {
+		return codes.InvalidArgument, nil
+	}
+	return codes.Unknown, fmt.Errorf("Not a user multiattach error: %w", err)
+}
+
 func existingErrorCode(err error) (codes.Code, error) {
 	if err == nil {
 		return codes.Unknown, fmt.Errorf("null error")
@@ -391,4 +407,74 @@ func isValidDiskEncryptionKmsKey(DiskEncryptionKmsKey string) bool {
 	// Validate key against default kmskey pattern
 	kmsKeyPattern := regexp.MustCompile("projects/[^/]+/locations/([^/]+)/keyRings/[^/]+/cryptoKeys/[^/]+")
 	return kmsKeyPattern.MatchString(DiskEncryptionKmsKey)
+}
+
+// ParseStoragePools returns an error if none of the given storagePools
+// (delimited by a comma) are in the format
+// projects/project/zones/zone/storagePools/storagePool.
+func ParseStoragePools(storagePools string) ([]StoragePool, error) {
+	spSlice := strings.Split(storagePools, ",")
+	parsedStoragePools := []StoragePool{}
+	for _, sp := range spSlice {
+		project, location, spName, err := fieldsFromStoragePoolResourceName(sp)
+		if err != nil {
+			return nil, err
+		}
+		spObj := StoragePool{Project: project, Zone: location, Name: spName, ResourceName: sp}
+		parsedStoragePools = append(parsedStoragePools, spObj)
+
+	}
+	return parsedStoragePools, nil
+}
+
+// fieldsFromResourceName returns the project, zone, and Storage Pool name from the given
+// Storage Pool resource name. The resource name must be in the format
+// projects/project/zones/zone/storagePools/storagePool.
+// All other formats are invalid, and an error will be returned.
+func fieldsFromStoragePoolResourceName(resourceName string) (project, location, spName string, err error) {
+	fieldMatches := storagePoolFieldsRegex.FindStringSubmatch(resourceName)
+	//  Field matches should have 4 strings: [resourceName, project, zone, storagePool]. The first
+	// match is the entire string.
+	if len(fieldMatches) != 4 {
+		err := fmt.Errorf("invalid Storage Pool resource name. Got %s, expected projects/project/zones/zone/storagePools/storagePool", resourceName)
+		return "", "", "", err
+	}
+	project = fieldMatches[1]
+	location = fieldMatches[2]
+	spName = fieldMatches[3]
+	return
+}
+
+// StoragePoolZones returns the unique zones of the given storage pool resource names.
+// Returns an error if multiple storage pools in 1 zone are found.
+func StoragePoolZones(storagePools []StoragePool) ([]string, error) {
+	zonesSet := sets.String{}
+	var zones []string
+	for _, sp := range storagePools {
+		if zonesSet.Has(sp.Zone) {
+			return nil, fmt.Errorf("found multiple storage pools in zone %s. Only one storage pool per zone is allowed", sp.Zone)
+		}
+		zonesSet.Insert(sp.Zone)
+		zones = append(zones, sp.Zone)
+	}
+	return zones, nil
+}
+
+func StoragePoolInZone(storagePools []StoragePool, zone string) *StoragePool {
+	for _, pool := range storagePools {
+		if zone == pool.Zone {
+			return &pool
+		}
+	}
+	return nil
+}
+
+func UnorderedSlicesEqual(slice1 []string, slice2 []string) bool {
+	set1 := sets.NewString(slice1...)
+	set2 := sets.NewString(slice2...)
+	spZonesNotInReq := set1.Difference(set2)
+	if spZonesNotInReq.Len() != 0 {
+		return false
+	}
+	return true
 }

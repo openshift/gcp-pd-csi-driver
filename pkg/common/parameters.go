@@ -31,6 +31,7 @@ const (
 	ParameterKeyProvisionedThroughputOnCreate = "provisioned-throughput-on-create"
 	ParameterAvailabilityClass                = "availability-class"
 	ParameterKeyEnableConfidentialCompute     = "enable-confidential-storage"
+	ParameterKeyStoragePools                  = "storage-pools"
 
 	// Parameters for VolumeSnapshotClass
 	ParameterKeyStorageLocations = "storage-locations"
@@ -94,6 +95,9 @@ type DiskParameters struct {
 	EnableConfidentialCompute bool
 	// Default: false
 	ForceAttach bool
+	// Values: {[]string}
+	// Default: ""
+	StoragePools []StoragePool
 }
 
 // SnapshotParameters contains normalized and defaulted parameters for snapshots
@@ -105,11 +109,18 @@ type SnapshotParameters struct {
 	Labels           map[string]string
 }
 
+type StoragePool struct {
+	Project      string
+	Zone         string
+	Name         string
+	ResourceName string
+}
+
 // ExtractAndDefaultParameters will take the relevant parameters from a map and
 // put them into a well defined struct making sure to default unspecified fields.
 // extraVolumeLabels are added as labels; if there are also labels specified in
 // parameters, any matching extraVolumeLabels will be overridden.
-func ExtractAndDefaultParameters(parameters map[string]string, driverName string, extraVolumeLabels map[string]string) (DiskParameters, error) {
+func ExtractAndDefaultParameters(parameters map[string]string, driverName string, extraVolumeLabels map[string]string, enableStoragePools bool) (DiskParameters, error) {
 	p := DiskParameters{
 		DiskType:             "pd-standard",           // Default
 		ReplicationType:      replicationTypeNone,     // Default
@@ -183,12 +194,20 @@ func ExtractAndDefaultParameters(parameters map[string]string, driverName string
 			if paramEnableConfidentialCompute {
 				// DiskEncryptionKmsKey is needed to enable confidentialStorage
 				if val, ok := parameters[ParameterKeyDiskEncryptionKmsKey]; !ok || !isValidDiskEncryptionKmsKey(val) {
-					return p, fmt.Errorf("Valid %v is required to enbale ConfidentialStorage", ParameterKeyDiskEncryptionKmsKey)
+					return p, fmt.Errorf("Valid %v is required to enable ConfidentialStorage", ParameterKeyDiskEncryptionKmsKey)
 				}
 			}
 
 			p.EnableConfidentialCompute = paramEnableConfidentialCompute
-
+		case ParameterKeyStoragePools:
+			if !enableStoragePools {
+				return p, fmt.Errorf("parameters contains invalid option %q", ParameterKeyStoragePools)
+			}
+			storagePools, err := ParseStoragePools(v)
+			if err != nil {
+				return p, fmt.Errorf("parameters contain invalid value for %s parameter: %w", ParameterKeyStoragePools, err)
+			}
+			p.StoragePools = storagePools
 		default:
 			return p, fmt.Errorf("parameters contains invalid option %q", k)
 		}

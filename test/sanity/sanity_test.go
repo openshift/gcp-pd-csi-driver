@@ -61,12 +61,15 @@ func TestSanity(t *testing.T) {
 		t.Fatalf("Failed to get cloud provider: %v", err.Error())
 	}
 
+	fallbackRequisiteZones := []string{}
+	enableStoragePools := false
+
 	mounter := mountmanager.NewFakeSafeMounter()
 	deviceUtils := deviceutils.NewFakeDeviceUtils(true)
 
 	//Initialize GCE Driver
 	identityServer := driver.NewIdentityServer(gceDriver)
-	controllerServer := driver.NewControllerServer(gceDriver, cloudProvider, 0, 5*time.Minute)
+	controllerServer := driver.NewControllerServer(gceDriver, cloudProvider, 0, 5*time.Minute, fallbackRequisiteZones, enableStoragePools)
 	nodeServer := driver.NewNodeServer(gceDriver, mounter, deviceUtils, metadataservice.NewFakeService(), mountmanager.NewFakeStatter(mounter))
 	err = gceDriver.SetupGCEDriver(driverName, vendorVersion, extraLabels, identityServer, controllerServer, nodeServer)
 	if err != nil {
@@ -92,7 +95,7 @@ func TestSanity(t *testing.T) {
 	}()
 
 	go func() {
-		gceDriver.Run(endpoint, 10000)
+		gceDriver.Run(endpoint, 10000, false)
 	}()
 
 	// TODO(#818): Fix failing tests and remove test skip flag.

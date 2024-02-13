@@ -25,6 +25,7 @@ import (
 	"testing"
 
 	"github.com/GoogleCloudPlatform/k8s-cloud-provider/pkg/cloud/meta"
+	"github.com/google/go-cmp/cmp"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -1015,6 +1016,11 @@ func TestCodeForError(t *testing.T) {
 			inputErr: nil,
 			expCode:  codes.Internal,
 		},
+		{
+			name:     "user multiattach error",
+			inputErr: fmt.Errorf("The disk resource 'projects/foo/disk/bar' is already being used by 'projects/foo/instances/1'"),
+			expCode:  codes.InvalidArgument,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -1076,6 +1082,34 @@ func TestIsContextError(t *testing.T) {
 	}
 }
 
+func TestIsUserMultiAttachError(t *testing.T) {
+	cases := []struct {
+		errorString  string
+		expectedCode codes.Code
+		expectCode   bool
+	}{
+		{
+			errorString:  "The disk resource 'projects/foo/disk/bar' is already being used by 'projects/foo/instance/biz'",
+			expectedCode: codes.InvalidArgument,
+			expectCode:   true,
+		},
+		{
+			errorString: "The disk resource is ok!",
+			expectCode:  false,
+		},
+	}
+	for _, test := range cases {
+		code, err := isUserMultiAttachError(fmt.Errorf(test.errorString))
+		if test.expectCode {
+			if err != nil || code != test.expectedCode {
+				t.Errorf("Failed with non-nil error %v or bad code %v: %s", err, code, test.errorString)
+			}
+		} else if err == nil {
+			t.Errorf("Expected error for test but got none: %s", test.errorString)
+		}
+	}
+}
+
 func TestIsValidDiskEncryptionKmsKey(t *testing.T) {
 	cases := []struct {
 		diskEncryptionKmsKey string
@@ -1099,5 +1133,216 @@ func TestIsValidDiskEncryptionKmsKey(t *testing.T) {
 		if tc.expectedIsValid != isValid {
 			t.Errorf("test failed: the provided key %s expected to be %v bu tgot %v", tc.diskEncryptionKmsKey, tc.expectedIsValid, isValid)
 		}
+	}
+}
+
+func TestFieldsFromResourceName(t *testing.T) {
+	testcases := []struct {
+		name            string
+		resourceName    string
+		expectedProject string
+		expectedZone    string
+		expectedName    string
+		expectedErr     bool
+	}{
+		{
+			name:            "StoragePool_WithValidResourceName_ReturnsFields",
+			resourceName:    "projects/my-project/zones/us-central1-a/storagePools/storagePool-1",
+			expectedProject: "my-project",
+			expectedZone:    "us-central1-a",
+			expectedName:    "storagePool-1",
+		},
+		{
+			name:         "StoragePool_WithFullResourceURL_ReturnsError",
+			resourceName: "https://www.googleapis.com/compute/v1/projects/project/zones/zone/storagePools/storagePool",
+			expectedErr:  true,
+		},
+		{
+			name:         "StoragePool_WithMissingProject_ReturnsError",
+			resourceName: "zones/us-central1-a/storagePools/storagePool-1",
+			expectedErr:  true,
+		},
+		{
+			name:         "StoragePool_WithMissingZone_ReturnsError",
+			resourceName: "projects/my-project/storagePools/storagePool-1",
+			expectedErr:  true,
+		},
+		{
+			name:         "StoragePool_WithMissingStoragePoolName_ReturnsError",
+			resourceName: "projects/my-project/zones/us-central1-a/storagePool-1",
+			expectedErr:  true,
+		},
+	}
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			project, zone, name, err := fieldsFromStoragePoolResourceName(tc.resourceName)
+			input := fmt.Sprintf("fieldsFromStoragePoolResourceName(%q)", tc.resourceName)
+			gotErr := err != nil
+			if gotErr != tc.expectedErr {
+				t.Errorf("%s error presence = %v, expected error presence = %v", input, gotErr, tc.expectedErr)
+			}
+			if project != tc.expectedProject || zone != tc.expectedZone || name != tc.expectedName {
+				t.Errorf("%s returned {project: %q, zone: %q, name: %q}, expected {project: %q, zone: %q, name: %q}", input, project, zone, name, tc.expectedProject, tc.expectedZone, tc.expectedName)
+			}
+		})
+	}
+}
+
+func TestZones(t *testing.T) {
+	testcases := []struct {
+		name          string
+		storagePools  []StoragePool
+		expectedZones []string
+		expectedErr   bool
+	}{
+		{
+			name: "StoragePools_WithValidResourceNames_ReturnsZones",
+			storagePools: []StoragePool{
+				{
+					Project:      "my-project",
+					Zone:         "us-central1-a",
+					Name:         "storagePool-1",
+					ResourceName: "projects/my-project/zones/us-central1-a/storagePools/storagePool-1",
+				},
+				{
+					Project:      "my-project",
+					Zone:         "us-central1-b",
+					Name:         "storagePool-2",
+					ResourceName: "projects/my-project/zones/us-central1-b/storagePools/storagePool-2",
+				},
+			},
+			expectedZones: []string{"us-central1-a", "us-central1-b"},
+		},
+		{
+			name: "StoragePools_WithDuplicateZone_ReturnsError",
+			storagePools: []StoragePool{
+				{
+					Project:      "my-project",
+					Zone:         "us-central1-a",
+					Name:         "storagePool-1",
+					ResourceName: "projects/my-project/zones/us-central1-a/storagePools/storagePool-1",
+				},
+				{
+					Project:      "my-project",
+					Zone:         "us-central1-a",
+					Name:         "storagePool-2",
+					ResourceName: "projects/my-project/zones/us-central1-a/storagePools/storagePool-2",
+				},
+			},
+			expectedErr: true,
+		},
+	}
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			zones, err := StoragePoolZones(tc.storagePools)
+			input := fmt.Sprintf("StoragePoolZones(%q)", tc.storagePools)
+			gotErr := err != nil
+			if gotErr != tc.expectedErr {
+				t.Errorf("%s error presence = %v, expected error presence = %v", input, gotErr, tc.expectedErr)
+			}
+			if diff := cmp.Diff(tc.expectedZones, zones); diff != "" {
+				t.Errorf("%s: -want err, +got err\n%s", input, diff)
+			}
+		})
+	}
+}
+
+func TestStoragePoolInZone(t *testing.T) {
+	testcases := []struct {
+		name                string
+		storagePools        []StoragePool
+		zone                string
+		expectedStoragePool *StoragePool
+		expectedErr         bool
+	}{
+		{
+			name: "ValidStoragePools_ReturnsStoragePoolInZone",
+			storagePools: []StoragePool{
+				{
+					Project:      "my-project",
+					Zone:         "us-central1-a",
+					Name:         "storagePool-1",
+					ResourceName: "projects/my-project/zones/us-central1-a/storagePools/storagePool-1",
+				},
+				{
+					Project:      "my-project",
+					Zone:         "us-central1-b",
+					Name:         "storagePool-2",
+					ResourceName: "projects/my-project/zones/us-central1-b/storagePools/storagePool-2",
+				},
+			},
+			zone: "us-central1-a",
+			expectedStoragePool: &StoragePool{
+				Project:      "my-project",
+				Zone:         "us-central1-a",
+				Name:         "storagePool-1",
+				ResourceName: "projects/my-project/zones/us-central1-a/storagePools/storagePool-1",
+			},
+		},
+		{
+			name: "StoragePoolNotInZone_ReturnsNil",
+			storagePools: []StoragePool{
+				{
+					Project:      "my-project",
+					Zone:         "us-central1-a",
+					Name:         "storagePool-1",
+					ResourceName: "projects/my-project/zones/us-central1-a/storagePools/storagePool-1",
+				},
+			},
+			zone:                "us-central1-b",
+			expectedStoragePool: nil,
+		},
+	}
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			sp := StoragePoolInZone(tc.storagePools, tc.zone)
+			input := fmt.Sprintf("StoragePoolInZone(%q)", tc.storagePools)
+			if diff := cmp.Diff(tc.expectedStoragePool, sp); diff != "" {
+				t.Errorf("%s: -want, +got \n%s", input, diff)
+			}
+		})
+	}
+}
+
+func TestUnorderedSlicesEqual(t *testing.T) {
+	testcases := []struct {
+		name                string
+		slice1              []string
+		slice2              []string
+		expectedSlicesEqual bool
+	}{
+		{
+			name:                "OrderedSlicesEqual_ReturnsTrue",
+			slice1:              []string{"us-central1-a", "us-central1-b"},
+			slice2:              []string{"us-central1-a", "us-central1-b"},
+			expectedSlicesEqual: true,
+		},
+		{
+			name:                "UnorderedSlicesEqual_ReturnsTrue",
+			slice1:              []string{"us-central1-a", "us-central1-b"},
+			slice2:              []string{"us-central1-b", "us-central1-a"},
+			expectedSlicesEqual: true,
+		},
+		{
+			name:                "SlicesNotEqualSameLength_ReturnsFalse",
+			slice1:              []string{"us-central1-a", "us-central1-b"},
+			slice2:              []string{"us-central1-a", "us-central1-a"},
+			expectedSlicesEqual: false,
+		},
+		{
+			name:                "SlicesNotEqualDifferentLength_ReturnsFalse",
+			slice1:              []string{"us-central1-a"},
+			slice2:              []string{},
+			expectedSlicesEqual: false,
+		},
+	}
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			slicesEqual := UnorderedSlicesEqual(tc.slice1, tc.slice2)
+			input := fmt.Sprintf("UnorderedSlicesEqual(%v, %v)", tc.slice1, tc.slice2)
+			if diff := cmp.Diff(tc.expectedSlicesEqual, slicesEqual); diff != "" {
+				t.Errorf("%s: -want, +got \n%s", input, diff)
+			}
+		})
 	}
 }

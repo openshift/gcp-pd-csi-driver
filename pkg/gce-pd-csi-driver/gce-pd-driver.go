@@ -152,22 +152,24 @@ func NewNodeServer(gceDriver *GCEDriver, mounter *mount.SafeFormatAndMount, devi
 	}
 }
 
-func NewControllerServer(gceDriver *GCEDriver, cloudProvider gce.GCECompute, errorBackoffInitialDuration, errorBackoffMaxDuration time.Duration) *GCEControllerServer {
+func NewControllerServer(gceDriver *GCEDriver, cloudProvider gce.GCECompute, errorBackoffInitialDuration, errorBackoffMaxDuration time.Duration, fallbackRequisiteZones []string, enableStoragePools bool) *GCEControllerServer {
 	return &GCEControllerServer{
-		Driver:        gceDriver,
-		CloudProvider: cloudProvider,
-		seen:          map[string]int{},
-		volumeLocks:   common.NewVolumeLocks(),
-		errorBackoff:  newCsiErrorBackoff(errorBackoffInitialDuration, errorBackoffMaxDuration),
+		Driver:                 gceDriver,
+		CloudProvider:          cloudProvider,
+		seen:                   map[string]int{},
+		volumeLocks:            common.NewVolumeLocks(),
+		errorBackoff:           newCsiErrorBackoff(errorBackoffInitialDuration, errorBackoffMaxDuration),
+		fallbackRequisiteZones: fallbackRequisiteZones,
+		enableStoragePools:     enableStoragePools,
 	}
 }
 
-func (gceDriver *GCEDriver) Run(endpoint string, grpcLogCharCap int) {
+func (gceDriver *GCEDriver) Run(endpoint string, grpcLogCharCap int, enableOtelTracing bool) {
 	maxLogChar = grpcLogCharCap
 
 	klog.V(4).Infof("Driver: %v", gceDriver.name)
 	//Start the nonblocking GRPC
-	s := NewNonBlockingGRPCServer()
+	s := NewNonBlockingGRPCServer(enableOtelTracing)
 	// TODO(#34): Only start specific servers based on a flag.
 	// In the future have this only run specific combinations of servers depending on which version this is.
 	// The schema for that was in util. basically it was just s.start but with some nil servers.
