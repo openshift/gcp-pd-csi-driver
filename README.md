@@ -12,7 +12,7 @@ lifecycle of Google Compute Engine Persistent Disks.
 ## Project Status
 
 Status: GA
-Latest stable image: `registry.k8s.io/cloud-provider-gcp/gcp-compute-persistent-disk-csi-driver:v1.10.1`
+Latest stable image: `registry.k8s.io/cloud-provider-gcp/gcp-compute-persistent-disk-csi-driver:v1.13.2`
 
 ### Test Status
 
@@ -35,10 +35,10 @@ versions.
 
 | Kubernetes Version | PD CSI Driver Version |
 |--------------------|-----------------------|
-| HEAD               | v1.10.x               |
+| HEAD               | v1.13.x               |
+| 1.29               | v1.12.x               |
+| 1.28               | v1.12.x               |
 | 1.27               | v1.10.x               |
-| 1.26               | v1.9.x                |
-| 1.25               | v1.8.x                |
 
 The manifest bundle which captures all the driver components (driver pod which includes the containers csi-provisioner, csi-resizer, csi-snapshotter, gce-pd-driver, csi-driver-registrar;
 csi driver object, rbacs, pod security policies etc) for the lastest stable
@@ -59,7 +59,8 @@ See Github [Issues](https://github.com/kubernetes-sigs/gcp-compute-persistent-di
 | disk-encryption-kms-key     | Fully qualified resource identifier for the key to use to encrypt new disks. | Empty string. | Encrypt disk using Customer Managed Encryption Key (CMEK). See [GKE Docs](https://cloud.google.com/kubernetes-engine/docs/how-to/using-cmek#create_a_cmek_protected_attached_disk) for details. |
 | labels                      | `key1=value1,key2=value2` |               | Labels allow you to assign custom [GCE Disk labels](https://cloud.google.com/compute/docs/labeling-resources). |
 | provisioned-iops-on-create  | string (int64 format). Values typically between 10,000 and 120,000 |               | Indicates how many IOPS to provision for the disk. See the [Extreme persistent disk documentation](https://cloud.google.com/compute/docs/disks/extreme-persistent-disk) for details, including valid ranges for IOPS. |
-| provisioned-throughput-on-create  | string (int64 format). Values typically between 1 and 7,124 mb per second |               | Indicates how much throughput to provision for the disk. See the [hyperdisk documentation](TBD) for details, including valid ranges for throughput. |
+| provisioned-throughput-on-create  | string (int64 format). Values typically between 1 and 7,124 mb per second |               | Indicates how much throughput to provision for the disk. See the [hyperdisk documentation]([TBD](https://cloud.google.com/kubernetes-engine/docs/how-to/persistent-volumes/hyperdisk#create)) for details, including valid ranges for throughput. |
+| resource-tags               | `<parent_id1>/<tag_key1>/<tag_value1>,<parent_id2>/<tag_key2>/<tag_value2>` |               | Resource tags allow you to attach user-defined tags to each Compute Disk, Image and Snapshot. See [Tags overview](https://cloud.google.com/resource-manager/docs/tags/tags-overview), [Creating and managing tags](https://cloud.google.com/resource-manager/docs/tags/tags-creating-and-managing). |
 
 ### Topology
 

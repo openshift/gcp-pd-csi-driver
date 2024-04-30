@@ -57,15 +57,13 @@ func GCEClientAndDriverSetup(instance *remote.InstanceInfo, computeEndpoint stri
 		fmt.Sprintf("--extra-labels=%s=%s", DiskLabelKey, DiskLabelValue),
 		"--max-concurrent-format-and-mount=20", // otherwise the serialization times out the e2e test.
 	}
-	if computeEndpoint != "" {
-		extra_flags = append(extra_flags, fmt.Sprintf("--compute-endpoint %s", computeEndpoint))
-	}
+	extra_flags = append(extra_flags, fmt.Sprintf("--compute-endpoint=%s", computeEndpoint))
+
 	workspace := remote.NewWorkspaceDir("gce-pd-e2e-")
 	// Log at V(6) as the compute API calls are emitted at that level and it's
 	// useful to see what's happening when debugging tests.
-	driverRunCmd := fmt.Sprintf("sh -c '/usr/bin/nohup %s/gce-pd-csi-driver -v=6 --endpoint=%s %s 2> %s/prog.out < /dev/null > /dev/null &'",
+	driverRunCmd := fmt.Sprintf("sh -c '/usr/bin/nohup %s/gce-pd-csi-driver -v=6 --endpoint=%s --multi-zone-volume-handle-enable --multi-zone-volume-handle-disk-types=pd-standard --use-instance-api-to-poll-attachment-disk-types=pd-ssd %s 2> %s/prog.out < /dev/null > /dev/null &'",
 		workspace, endpoint, strings.Join(extra_flags, " "), workspace)
-
 	config := &remote.ClientConfig{
 		PkgPath:      pkgPath,
 		BinPath:      binPath,
@@ -96,7 +94,7 @@ func getBoskosProject(resourceType string) *common.Resource {
 		case <-ticker.C:
 			p, err := boskos.Acquire(resourceType, "free", "busy")
 			if err != nil {
-				klog.Warningf("boskos failed to acquire project: %w", err)
+				klog.Warningf("boskos failed to acquire project: %v", err)
 			} else if p == nil {
 				klog.Warningf("boskos does not have a free %s at the moment", resourceType)
 			} else {
@@ -128,17 +126,17 @@ func SetupProwConfig(resourceType string) (project, serviceAccount string) {
 
 	c, err := google.DefaultClient(context.Background(), cloudresourcemanager.CloudPlatformScope)
 	if err != nil {
-		klog.Fatalf("Failed to get Google Default Client: %w", err)
+		klog.Fatalf("Failed to get Google Default Client: %v", err)
 	}
 
 	cloudresourcemanagerService, err := cloudresourcemanager.New(c)
 	if err != nil {
-		klog.Fatalf("Failed to create new cloudresourcemanager: %w", err)
+		klog.Fatalf("Failed to create new cloudresourcemanager: %v", err)
 	}
 
 	resp, err := cloudresourcemanagerService.Projects.Get(project).Do()
 	if err != nil {
-		klog.Fatalf("Failed to get project %v from Cloud Resource Manager: %w", project, err)
+		klog.Fatalf("Failed to get project %v from Cloud Resource Manager: %v", project, err)
 	}
 
 	// Default Compute Engine service account

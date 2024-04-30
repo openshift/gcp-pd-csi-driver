@@ -17,8 +17,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"fmt"
 	"math/rand"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -38,7 +41,6 @@ import (
 var (
 	cloudConfigFilePath  = flag.String("cloud-config", "", "Path to GCE cloud provider config")
 	endpoint             = flag.String("endpoint", "unix:/tmp/csi.sock", "CSI endpoint")
-	computeEndpoint      = flag.String("compute-endpoint", "", "If set, used as the endpoint for the GCE API.")
 	runControllerService = flag.Bool("run-controller-service", true, "If set to false then the CSI driver does not activate its controller service (default: true)")
 	runNodeService       = flag.Bool("run-node-service", true, "If set to false then the CSI driver does not activate its node service (default: true)")
 	httpEndpoint         = flag.String("http-endpoint", "", "The TCP network address where the prometheus metrics endpoint will listen (example: `:8080`). The default is empty string, which means metrics endpoint is disabled.")
@@ -67,10 +69,19 @@ var (
 
 	maxConcurrentFormatAndMount = flag.Int("max-concurrent-format-and-mount", 1, "If set then format and mount operations are serialized on each node. This is stronger than max-concurrent-format as it includes fsck and other mount operations")
 	formatAndMountTimeout       = flag.Duration("format-and-mount-timeout", 1*time.Minute, "The maximum duration of a format and mount operation before another such operation will be started. Used only if --serialize-format-and-mount")
+	fallbackRequisiteZonesFlag  = flag.String("fallback-requisite-zones", "", "Comma separated list of requisite zones that will be used if there are not sufficient zones present in requisite topologies when provisioning a disk")
+	enableStoragePoolsFlag      = flag.Bool("enable-storage-pools", false, "If set to true, the CSI Driver will allow volumes to be provisioned in Storage Pools")
 
-	fallbackRequisiteZonesFlag = flag.String("fallback-requisite-zones", "", "Comma separated list of requisite zones that will be used if there are not sufficient zones present in requisite topologies when provisioning a disk")
+	multiZoneVolumeHandleDiskTypesFlag = flag.String("multi-zone-volume-handle-disk-types", "", "Comma separated list of allowed disk types that can use the multi-zone volumeHandle. Used only if --multi-zone-volume-handle-enable")
+	multiZoneVolumeHandleEnableFlag    = flag.Bool("multi-zone-volume-handle-enable", false, "If set to true, the multi-zone volumeHandle feature will be enabled")
 
-	enableStoragePoolsFlag = flag.Bool("enable-storage-pools", false, "If set to true, the CSI Driver will allow volumes to be provisioned in Storage Pools")
+	computeEnvironment        gce.Environment = gce.EnvironmentProduction
+	computeEndpoint           *url.URL
+	allowedComputeEnvironment = []gce.Environment{gce.EnvironmentStaging, gce.EnvironmentProduction}
+
+	useInstanceAPIOnWaitForAttachDiskTypesFlag = flag.String("use-instance-api-to-poll-attachment-disk-types", "", "Comma separated list of disk types that should use instances.get API when polling for disk attach during ControllerPublish")
+
+	extraTagsStr = flag.String("extra-tags", "", "Extra tags to attach to each Compute Disk, Image, Snapshot created. It is a comma separated list of parent id, key and value like '<parent_id1>/<tag_key1>/<tag_value1>,...,<parent_idN>/<tag_keyN>/<tag_valueN>'. parent_id is the Organization or the Project ID or Project name where the tag key and the tag value resources exist. A maximum of 50 tags bindings is allowed for a resource. See https://cloud.google.com/resource-manager/docs/tags/tags-overview, https://cloud.google.com/resource-manager/docs/tags/tags-creating-and-managing for details")
 
 	version string
 )
@@ -85,6 +96,8 @@ func init() {
 	// Use V(4) for general debug information logging
 	// Use V(5) for GCE Cloud Provider Call informational logging
 	// Use V(6) for extra repeated/polling information
+	enumFlag(&computeEnvironment, "compute-environment", allowedComputeEnvironment, "Operating compute environment")
+	urlFlag(&computeEndpoint, "compute-endpoint", "Compute endpoint")
 	klog.InitFlags(flag.CommandLine)
 	flag.Set("logtostderr", "true")
 }
@@ -92,6 +105,7 @@ func init() {
 func main() {
 	flag.Parse()
 	rand.Seed(time.Now().UnixNano())
+	klog.Infof("Operating compute environment set to: %s and computeEndpoint is set to: %v", computeEnvironment, computeEndpoint)
 	handle()
 	os.Exit(0)
 }
@@ -141,6 +155,14 @@ func handle() {
 		klog.Fatalf("Bad extra volume labels: %v", err.Error())
 	}
 
+	if len(*extraTagsStr) > 0 && !*runControllerService {
+		klog.Fatalf("Extra tags provided but not running controller")
+	}
+	extraTags, err := common.ConvertTagsStringToMap(*extraTagsStr)
+	if err != nil {
+		klog.Fatalf("Bad extra tags: %v", err.Error())
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -150,19 +172,32 @@ func handle() {
 	// Initialize identity server
 	identityServer := driver.NewIdentityServer(gceDriver)
 
-	// Initilaize requisite zones
+	// Initialize requisite zones
 	fallbackRequisiteZones := strings.Split(*fallbackRequisiteZonesFlag, ",")
+
+	// Initialize multi-zone disk types
+	multiZoneVolumeHandleDiskTypes := strings.Split(*multiZoneVolumeHandleDiskTypesFlag, ",")
+	multiZoneVolumeHandleConfig := driver.MultiZoneVolumeHandleConfig{
+		Enable:    *multiZoneVolumeHandleEnableFlag,
+		DiskTypes: multiZoneVolumeHandleDiskTypes,
+	}
+
+	// Initialize waitForAttach config
+	useInstanceAPIOnWaitForAttachDiskTypes := strings.Split(*useInstanceAPIOnWaitForAttachDiskTypesFlag, ",")
+	waitForAttachConfig := gce.WaitForAttachConfig{
+		UseInstancesAPIForDiskTypes: useInstanceAPIOnWaitForAttachDiskTypes,
+	}
 
 	// Initialize requirements for the controller service
 	var controllerServer *driver.GCEControllerServer
 	if *runControllerService {
-		cloudProvider, err := gce.CreateCloudProvider(ctx, version, *cloudConfigFilePath, *computeEndpoint)
+		cloudProvider, err := gce.CreateCloudProvider(ctx, version, *cloudConfigFilePath, computeEndpoint, computeEnvironment, waitForAttachConfig)
 		if err != nil {
 			klog.Fatalf("Failed to get cloud provider: %v", err.Error())
 		}
 		initialBackoffDuration := time.Duration(*errorBackoffInitialDurationMs) * time.Millisecond
 		maxBackoffDuration := time.Duration(*errorBackoffMaxDurationMs) * time.Millisecond
-		controllerServer = driver.NewControllerServer(gceDriver, cloudProvider, initialBackoffDuration, maxBackoffDuration, fallbackRequisiteZones, *enableStoragePoolsFlag)
+		controllerServer = driver.NewControllerServer(gceDriver, cloudProvider, initialBackoffDuration, maxBackoffDuration, fallbackRequisiteZones, *enableStoragePoolsFlag, multiZoneVolumeHandleConfig)
 	} else if *cloudConfigFilePath != "" {
 		klog.Warningf("controller service is disabled but cloud config given - it has no effect")
 	}
@@ -186,7 +221,7 @@ func handle() {
 		}
 	}
 
-	err = gceDriver.SetupGCEDriver(driverName, version, extraVolumeLabels, identityServer, controllerServer, nodeServer)
+	err = gceDriver.SetupGCEDriver(driverName, version, extraVolumeLabels, extraTags, identityServer, controllerServer, nodeServer)
 	if err != nil {
 		klog.Fatalf("Failed to initialize GCE CSI Driver: %v", err.Error())
 	}
@@ -204,4 +239,33 @@ func handle() {
 	gce.WaitForOpBackoff.Cap = *waitForOpBackoffCap
 
 	gceDriver.Run(*endpoint, *grpcLogCharCap, *enableOtelTracing)
+}
+
+func enumFlag(target *gce.Environment, name string, allowedComputeEnvironment []gce.Environment, usage string) {
+	flag.Func(name, usage, func(flagValue string) error {
+		for _, allowedValue := range allowedComputeEnvironment {
+			if gce.Environment(flagValue) == allowedValue {
+				*target = gce.Environment(flagValue)
+				return nil
+			}
+		}
+		errMsg := fmt.Sprintf(`must be one of %v`, allowedComputeEnvironment)
+		return errors.New(errMsg)
+	})
+
+}
+
+func urlFlag(target **url.URL, name string, usage string) {
+	flag.Func(name, usage, func(flagValue string) error {
+		if flagValue == "" {
+			return nil
+		}
+		computeURL, err := url.ParseRequestURI(flagValue)
+		if err == nil {
+			*target = computeURL
+			return nil
+		}
+		klog.Errorf("Error parsing endpoint compute endpoint %v", err)
+		return err
+	})
 }

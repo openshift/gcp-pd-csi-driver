@@ -26,6 +26,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
+	"k8s.io/mount-utils"
 	pathutils "k8s.io/utils/path"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/resizefs"
 )
@@ -36,9 +37,10 @@ const (
 	diskScsiGooglePrefix = "scsi-0Google_PersistentDisk_"
 	diskPartitionSuffix  = "-part"
 	diskSDPath           = "/dev/sd"
-	diskSDPattern        = "/dev/sd*"
+	diskSDGlob           = "/dev/sd*"
 	diskNvmePath         = "/dev/nvme"
 	diskNvmePattern      = "^/dev/nvme[0-9]+n[0-9]+$"
+	diskNvmeGlob         = "/dev/nvme*"
 	// How many times to retry for a consistent read of /proc/mounts.
 	maxListTries = 3
 	// Number of fields per line in /proc/mounts as per the fstab man page.
@@ -69,6 +71,8 @@ var (
 	scsiRegex = regexp.MustCompile(scsiPattern)
 	// regex to parse google_nvme_id output and extract the serial
 	nvmeRegex = regexp.MustCompile(nvmePattern)
+	// regex to filter for disk drive paths from filepath.Glob output of diskNvmeGlob
+	diskNvmeRegex = regexp.MustCompile(diskNvmePattern)
 )
 
 // DeviceUtils are a collection of methods that act on the devices attached
@@ -88,6 +92,13 @@ type DeviceUtils interface {
 
 	// Resize returns whether or not a device needs resizing.
 	Resize(resizer resizefs.Resizefs, devicePath string, deviceMountPath string) (bool, error)
+
+	// IsDeviceFilesystemInUse returns if a device path with the specified fstype
+	// TODO: Mounter is passed in in order to call GetDiskFormat()
+	// This is currently only implemented in mounter_linux, not mounter_windows.
+	// Refactor this interface and function call up the stack to the caller once it is
+	// implemented in mounter_windows.
+	IsDeviceFilesystemInUse(mounter *mount.SafeFormatAndMount, devicePath, devFsPath string) (bool, error)
 }
 
 type deviceUtils struct {
@@ -306,15 +317,28 @@ func getDevFsSerial(devFsPath string) (string, error) {
 	}
 }
 
+func filterAvailableNvmeDevFsPaths(devNvmePaths []string) []string {
+	// Devices under /dev/nvme need to be filtered for disk drive paths only.
+	diskNvmePaths := []string{}
+	for _, devNvmePath := range devNvmePaths {
+		if diskNvmeRegex.MatchString(devNvmePath) {
+			diskNvmePaths = append(diskNvmePaths, devNvmePath)
+		}
+	}
+	return diskNvmePaths
+}
+
 func findAvailableDevFsPaths() ([]string, error) {
-	diskSDPaths, err := filepath.Glob(diskSDPattern)
+	diskSDPaths, err := filepath.Glob(diskSDGlob)
 	if err != nil {
-		return nil, fmt.Errorf("failed to filepath.Glob(\"%s\"): %w", diskSDPattern, err)
+		return nil, fmt.Errorf("failed to filepath.Glob(\"%s\"): %w", diskSDGlob, err)
 	}
-	diskNvmePaths, err := filepath.Glob(diskNvmePattern)
+	devNvmePaths, err := filepath.Glob(diskNvmeGlob)
 	if err != nil {
-		return nil, fmt.Errorf("failed to filepath.Glob(\"%s\"): %w", diskNvmePattern, err)
+		return nil, fmt.Errorf("failed to filepath.Glob(\"%s\"): %w", diskNvmeGlob, err)
 	}
+	// Devices under /dev/nvme need to be filtered for disk drive paths only.
+	diskNvmePaths := filterAvailableNvmeDevFsPaths(devNvmePaths)
 	return append(diskSDPaths, diskNvmePaths...), nil
 }
 

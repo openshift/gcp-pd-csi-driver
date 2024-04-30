@@ -249,7 +249,7 @@ func (cloud *FakeCloudProvider) InsertDisk(ctx context.Context, project string, 
 	}
 
 	if containsBetaDiskType(hyperdiskTypes, params.DiskType) {
-		betaDisk := convertV1DiskToBetaDisk(computeDisk, params.ProvisionedThroughputOnCreate)
+		betaDisk := convertV1DiskToBetaDisk(computeDisk)
 		betaDisk.EnableConfidentialCompute = params.EnableConfidentialCompute
 		cloud.disks[volKey.Name] = CloudDiskFromBeta(betaDisk)
 	} else {
@@ -318,7 +318,7 @@ func (cloud *FakeCloudProvider) getRegionalDiskTypeURI(project, region, diskType
 	return fmt.Sprintf(diskTypeURITemplateRegional, project, region, diskType)
 }
 
-func (cloud *FakeCloudProvider) WaitForAttach(ctx context.Context, project string, volKey *meta.Key, instanceZone, instanceName string) error {
+func (cloud *FakeCloudProvider) WaitForAttach(ctx context.Context, project string, volKey *meta.Key, diskType, instanceZone, instanceName string) error {
 	return nil
 }
 

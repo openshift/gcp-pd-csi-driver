@@ -67,6 +67,7 @@ var (
 
 	testVolumeID           = fmt.Sprintf("projects/%s/zones/%s/disks/%s", project, zone, name)
 	underspecifiedVolumeID = fmt.Sprintf("projects/UNSPECIFIED/zones/UNSPECIFIED/disks/%s", name)
+	multiZoneVolumeID      = fmt.Sprintf("projects/%s/zones/multi-zone/disks/%s", project, name)
 
 	region, _      = common.GetRegionFromZones([]string{zone})
 	testRegionalID = fmt.Sprintf("projects/%s/regions/%s/disks/%s", project, region, name)
@@ -179,6 +180,36 @@ func TestCreateSnapshotArguments(t *testing.T) {
 				Name:           name,
 				SourceVolumeId: testVolumeID,
 				Parameters:     map[string]string{common.ParameterKeyStorageLocations: "bad-region"},
+			},
+			seedDisks: []*gce.CloudDisk{
+				createZonalCloudDisk(name),
+			},
+			expErrCode: codes.InvalidArgument,
+		},
+		{
+			name: "success with resource-tags parameter",
+			req: &csi.CreateSnapshotRequest{
+				Name:           name,
+				SourceVolumeId: testVolumeID,
+				Parameters:     map[string]string{"resource-tags": "parent1/key1/value1,parent2/key2/value2"},
+			},
+			seedDisks: []*gce.CloudDisk{
+				createZonalCloudDisk(name),
+			},
+			expSnapshot: &csi.Snapshot{
+				SnapshotId:     testSnapshotID,
+				SourceVolumeId: testVolumeID,
+				CreationTime:   tp,
+				SizeBytes:      common.GbToBytes(gce.DiskSizeGb),
+				ReadyToUse:     false,
+			},
+		},
+		{
+			name: "fail with malformed resource-tags parameter",
+			req: &csi.CreateSnapshotRequest{
+				Name:           name,
+				SourceVolumeId: testVolumeID,
+				Parameters:     map[string]string{"resource-tags": "parent1/key1/value1,parent2/key2/"},
 			},
 			seedDisks: []*gce.CloudDisk{
 				createZonalCloudDisk(name),
@@ -957,6 +988,31 @@ func TestCreateVolumeArguments(t *testing.T) {
 			enableStoragePools: true,
 			expErrCode:         codes.InvalidArgument,
 		},
+		{
+			name: "success with resource-tags parameter",
+			req: &csi.CreateVolumeRequest{
+				Name:               name,
+				CapacityRange:      stdCapRange,
+				VolumeCapabilities: stdVolCaps,
+				Parameters:         map[string]string{"resource-tags": "parent1/key1/value1,parent2/key2/value2"},
+			},
+			expVol: &csi.Volume{
+				CapacityBytes:      common.GbToBytes(20),
+				VolumeId:           testVolumeID,
+				VolumeContext:      nil,
+				AccessibleTopology: stdTopology,
+			},
+		},
+		{
+			name: "fail with malformed resource-tags parameter",
+			req: &csi.CreateVolumeRequest{
+				Name:               name,
+				CapacityRange:      stdCapRange,
+				VolumeCapabilities: stdVolCaps,
+				Parameters:         map[string]string{"resource-tags": "parent1/key1/value1,parent2/key2/"},
+			},
+			expErrCode: codes.InvalidArgument,
+		},
 	}
 
 	// Run test cases
@@ -1182,7 +1238,7 @@ func TestCreateVolumeWithVolumeSourceFromSnapshot(t *testing.T) {
 		// Setup new driver each time so no interference
 		gceDriver := initGCEDriver(t, nil)
 
-		snapshotParams, err := common.ExtractAndDefaultSnapshotParameters(nil, gceDriver.name)
+		snapshotParams, err := common.ExtractAndDefaultSnapshotParameters(nil, gceDriver.name, nil)
 		if err != nil {
 			t.Errorf("Got error extracting snapshot parameters: %v", err)
 		}
@@ -3726,7 +3782,7 @@ func TestCreateConfidentialVolume(t *testing.T) {
 			gceDriver := initGCEDriverWithCloudProvider(t, fcp)
 
 			if tc.req.VolumeContentSource.GetType() != nil {
-				snapshotParams, err := common.ExtractAndDefaultSnapshotParameters(nil, gceDriver.name)
+				snapshotParams, err := common.ExtractAndDefaultSnapshotParameters(nil, gceDriver.name, nil)
 				if err != nil {
 					t.Errorf("Got error extracting snapshot parameters: %v", err)
 				}
@@ -3781,10 +3837,10 @@ func backoffDriver(t *testing.T, config *backoffDriverConfig) *GCEDriver {
 
 	driver := GetGCEDriver()
 	driver.cs = &GCEControllerServer{
-		Driver:       driver,
-		seen:         map[string]int{},
-		volumeLocks:  common.NewVolumeLocks(),
-		errorBackoff: newFakeCSIErrorBackoff(config.clock),
+		Driver:            driver,
+		volumeEntriesSeen: map[string]int{},
+		volumeLocks:       common.NewVolumeLocks(),
+		errorBackoff:      newFakeCSIErrorBackoff(config.clock),
 	}
 
 	driver.cs.CloudProvider = fcp

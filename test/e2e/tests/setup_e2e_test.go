@@ -43,6 +43,7 @@ var (
 	imageURL        = flag.String("image-url", "projects/debian-cloud/global/images/family/debian-11", "OS image url to get image from")
 	runInProw       = flag.Bool("run-in-prow", false, "If true, use a Boskos loaned project and special CI service accounts and ssh keys")
 	deleteInstances = flag.Bool("delete-instances", false, "Delete the instances after tests run")
+	cloudtopHost    = flag.Bool("cloudtop-host", false, "The local host is cloudtop, a kind of googler machine with special requirements to access GCP")
 
 	testContexts        = []*remote.TestContext{}
 	computeService      *compute.Service
@@ -116,34 +117,44 @@ var _ = AfterSuite(func() {
 	}
 })
 
+func getRemoteInstanceConfig() *remote.InstanceConfig {
+	return &remote.InstanceConfig{
+		Project:        *project,
+		Architecture:   *architecture,
+		MachineType:    *machineType,
+		ServiceAccount: *serviceAccount,
+		ImageURL:       *imageURL,
+		CloudtopHost:   *cloudtopHost}
+}
+
 func NewTestContext(zone string) *remote.TestContext {
 	nodeID := fmt.Sprintf("gce-pd-csi-e2e-%s", zone)
 	klog.Infof("Setting up node %s", nodeID)
 
-	i, err := remote.SetupInstance(*project, *architecture, zone, nodeID, *machineType, *serviceAccount, *imageURL, computeService)
+	i, err := remote.SetupInstance(getRemoteInstanceConfig(), zone, nodeID, computeService)
 	if err != nil {
-		klog.Fatalf("Failed to setup instance %v: %w", nodeID, err)
+		klog.Fatalf("Failed to setup instance %v: %v", nodeID, err)
 	}
 
 	err = testutils.MkdirAll(i, "/lib/udev_containerized")
 	if err != nil {
-		klog.Fatalf("Failed to make scsi_id containerized directory: %w", err)
+		klog.Fatalf("Failed to make scsi_id containerized directory: %v", err)
 	}
 
 	err = testutils.CopyFile(i, "/lib/udev/scsi_id", "/lib/udev_containerized/scsi_id")
 	if err != nil {
-		klog.Fatalf("Failed to copy scsi_id to containerized directory: %w", err)
+		klog.Fatalf("Failed to copy scsi_id to containerized directory: %v", err)
 	}
 
 	err = testutils.CopyFile(i, "/lib/udev/google_nvme_id", "/lib/udev_containerized/google_nvme_id")
 	if err != nil {
-		klog.Fatalf("Failed to copy google_nvme_id to containerized directory: %w", err)
+		klog.Fatalf("Failed to copy google_nvme_id to containerized directory: %v", err)
 	}
 
 	klog.Infof("Creating new driver and client for node %s", i.GetName())
 	tc, err := testutils.GCEClientAndDriverSetup(i, "")
 	if err != nil {
-		klog.Fatalf("Failed to set up TestContext for instance %v: %w", i.GetName(), err)
+		klog.Fatalf("Failed to set up TestContext for instance %v: %v", i.GetName(), err)
 	}
 
 	klog.Infof("Finished creating TestContext for node %s", tc.Instance.GetName())

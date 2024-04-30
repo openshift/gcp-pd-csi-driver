@@ -17,16 +17,23 @@ package gcecloudprovider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"regexp"
 	"strings"
 	"time"
 
+	rscmgr "cloud.google.com/go/resourcemanager/apiv3"
+	rscmgrpb "cloud.google.com/go/resourcemanager/apiv3/resourcemanagerpb"
 	"github.com/GoogleCloudPlatform/k8s-cloud-provider/pkg/cloud/meta"
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
-	computealpha "google.golang.org/api/compute/v0.alpha"
+	"github.com/googleapis/gax-go/v2"
+	"github.com/googleapis/gax-go/v2/apierror"
+	"golang.org/x/oauth2"
 	computebeta "google.golang.org/api/compute/v0.beta"
 	computev1 "google.golang.org/api/compute/v1"
+	"google.golang.org/api/iterator"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -54,8 +61,6 @@ const (
 	GCEAPIVersionV1 GCEAPIVersion = "v1"
 	// Beta key type
 	GCEAPIVersionBeta GCEAPIVersion = "beta"
-	// Alpha key type
-	GCEAPIVersionAlpha GCEAPIVersion = "alpha"
 )
 
 // AttachDiskBackoff is backoff used to wait for AttachDisk to complete.
@@ -99,7 +104,7 @@ type GCECompute interface {
 	DetachDisk(ctx context.Context, project, deviceName, instanceZone, instanceName string) error
 	GetDiskSourceURI(project string, volKey *meta.Key) string
 	GetDiskTypeURI(project string, volKey *meta.Key, diskType string) string
-	WaitForAttach(ctx context.Context, project string, volKey *meta.Key, instanceZone, instanceName string) error
+	WaitForAttach(ctx context.Context, project string, volKey *meta.Key, diskType, instanceZone, instanceName string) error
 	ResizeDisk(ctx context.Context, project string, volKey *meta.Key, requestBytes int64) (int64, error)
 	ListDisks(ctx context.Context) ([]*computev1.Disk, string, error)
 	// Regional Disk Methods
@@ -269,9 +274,6 @@ func (cloud *CloudProvider) GetDisk(ctx context.Context, project string, key *me
 		if gceAPIVersion == GCEAPIVersionBeta {
 			disk, err := cloud.getZonalBetaDiskOrError(ctx, project, key.Zone, key.Name)
 			return CloudDiskFromBeta(disk), err
-		} else if gceAPIVersion == GCEAPIVersionAlpha {
-			disk, err := cloud.getZonalAlphaDiskOrError(ctx, project, key.Zone, key.Name)
-			return CloudDiskFromAlpha(disk), err
 		} else {
 			disk, err := cloud.getZonalDiskOrError(ctx, project, key.Zone, key.Name)
 			return CloudDiskFromV1(disk), err
@@ -299,14 +301,6 @@ func (cloud *CloudProvider) getZonalDiskOrError(ctx context.Context, project, vo
 
 func (cloud *CloudProvider) getRegionalDiskOrError(ctx context.Context, project, volumeRegion, volumeName string) (*computev1.Disk, error) {
 	disk, err := cloud.service.RegionDisks.Get(project, volumeRegion, volumeName).Context(ctx).Do()
-	if err != nil {
-		return nil, err
-	}
-	return disk, nil
-}
-
-func (cloud *CloudProvider) getZonalAlphaDiskOrError(ctx context.Context, project, volumeZone, volumeName string) (*computealpha.Disk, error) {
-	disk, err := cloud.alphaService.Disks.Get(project, volumeZone, volumeName).Context(ctx).Do()
 	if err != nil {
 		return nil, err
 	}
@@ -419,11 +413,26 @@ func convertV1CustomerEncryptionKeyToBeta(v1Key *computev1.CustomerEncryptionKey
 	}
 }
 
-func convertV1DiskToBetaDisk(v1Disk *computev1.Disk, provisionedThroughputOnCreate int64) *computebeta.Disk {
+func convertV1DiskParamsToBeta(v1DiskParams *computev1.DiskParams) *computebeta.DiskParams {
+	resourceManagerTags := make(map[string]string)
+	for k, v := range v1DiskParams.ResourceManagerTags {
+		resourceManagerTags[k] = v
+	}
+	return &computebeta.DiskParams{
+		ResourceManagerTags: resourceManagerTags,
+	}
+}
+
+func convertV1DiskToBetaDisk(v1Disk *computev1.Disk) *computebeta.Disk {
 	var dek *computebeta.CustomerEncryptionKey = nil
 
 	if v1Disk.DiskEncryptionKey != nil {
 		dek = convertV1CustomerEncryptionKeyToBeta(v1Disk.DiskEncryptionKey)
+	}
+
+	var params *computebeta.DiskParams = nil
+	if v1Disk.Params != nil {
+		params = convertV1DiskParamsToBeta(v1Disk.Params)
 	}
 
 	// Note: this is an incomplete list. It only includes the fields we use for disk creation.
@@ -443,46 +452,21 @@ func convertV1DiskToBetaDisk(v1Disk *computev1.Disk, provisionedThroughputOnCrea
 		Region:            v1Disk.Region,
 		Status:            v1Disk.Status,
 		SelfLink:          v1Disk.SelfLink,
+		Params:            params,
 	}
+
+	// Hyperdisk doesn't currently support multiWriter (https://cloud.google.com/compute/docs/disks/hyperdisks#limitations),
+	// but if multiWriter + hyperdisk is supported in the future, we want the PDCSI driver to support this feature without
+	// any additional code change.
 	if v1Disk.ProvisionedIops > 0 {
 		betaDisk.ProvisionedIops = v1Disk.ProvisionedIops
 	}
-	if provisionedThroughputOnCreate > 0 {
-		betaDisk.ProvisionedThroughput = provisionedThroughputOnCreate
+	if v1Disk.ProvisionedThroughput > 0 {
+		betaDisk.ProvisionedThroughput = v1Disk.ProvisionedThroughput
 	}
+	betaDisk.StoragePool = v1Disk.StoragePool
 
 	return betaDisk
-}
-
-func convertV1DiskToAlphaDisk(v1Disk *computev1.Disk, provisionedThroughputOnCreate int64, storagePool *common.StoragePool) *computealpha.Disk {
-	// Note: this is an incomplete list. It only includes the fields we use for disk creation.
-	alphaDisk := &computealpha.Disk{
-		Name:             v1Disk.Name,
-		SizeGb:           v1Disk.SizeGb,
-		Description:      v1Disk.Description,
-		Type:             v1Disk.Type,
-		SourceSnapshot:   v1Disk.SourceSnapshot,
-		SourceImage:      v1Disk.SourceImage,
-		SourceImageId:    v1Disk.SourceImageId,
-		SourceSnapshotId: v1Disk.SourceSnapshotId,
-		SourceDisk:       v1Disk.SourceDisk,
-		ReplicaZones:     v1Disk.ReplicaZones,
-		Zone:             v1Disk.Zone,
-		Region:           v1Disk.Region,
-		Status:           v1Disk.Status,
-		SelfLink:         v1Disk.SelfLink,
-	}
-	if v1Disk.ProvisionedIops > 0 {
-		alphaDisk.ProvisionedIops = v1Disk.ProvisionedIops
-	}
-	if provisionedThroughputOnCreate > 0 {
-		alphaDisk.ProvisionedThroughput = provisionedThroughputOnCreate
-	}
-	if storagePool != nil {
-		alphaDisk.StoragePool = storagePool.ResourceName
-	}
-
-	return alphaDisk
 }
 
 func (cloud *CloudProvider) insertRegionalDisk(
@@ -540,10 +524,20 @@ func (cloud *CloudProvider) insertRegionalDisk(
 			KmsKeyName: params.DiskEncryptionKMSKey,
 		}
 	}
+	resourceTags, err := getResourceManagerTags(ctx, cloud.tokenSource, params.ResourceTags)
+	if err != nil {
+		return err
+	}
+
+	if len(resourceTags) > 0 {
+		diskToCreate.Params = &computev1.DiskParams{
+			ResourceManagerTags: resourceTags,
+		}
+	}
 
 	if gceAPIVersion == GCEAPIVersionBeta {
 		var insertOp *computebeta.Operation
-		betaDiskToCreate := convertV1DiskToBetaDisk(diskToCreate, 0)
+		betaDiskToCreate := convertV1DiskToBetaDisk(diskToCreate)
 		betaDiskToCreate.MultiWriter = multiWriter
 		insertOp, err = cloud.betaService.RegionDisks.Insert(project, volKey.Region, betaDiskToCreate).Context(ctx).Do()
 		if insertOp != nil {
@@ -562,7 +556,7 @@ func (cloud *CloudProvider) insertRegionalDisk(
 			if err != nil {
 				// failed to GetDisk, however the Disk may already exist
 				// the error code should be non-Final
-				return status.Error(codes.Unavailable, err.Error())
+				return common.NewTemporaryError(codes.Unavailable, fmt.Errorf("error when getting disk: %w", err))
 			}
 			err = cloud.ValidateExistingDisk(ctx, disk, params,
 				int64(capacityRange.GetRequiredBytes()),
@@ -586,7 +580,7 @@ func (cloud *CloudProvider) insertRegionalDisk(
 		if IsGCEError(err, "alreadyExists") {
 			disk, err := cloud.GetDisk(ctx, project, volKey, gceAPIVersion)
 			if err != nil {
-				return status.Errorf(codes.Unavailable, "error when getting disk: %v", err.Error())
+				return common.NewTemporaryError(codes.Unavailable, fmt.Errorf("error when getting disk: %w", err))
 			}
 			err = cloud.ValidateExistingDisk(ctx, disk, params,
 				int64(capacityRange.GetRequiredBytes()),
@@ -598,7 +592,7 @@ func (cloud *CloudProvider) insertRegionalDisk(
 			klog.Warningf("GCE PD %s already exists after wait, reusing", volKey.Name)
 			return nil
 		}
-		return status.Errorf(codes.Unavailable, "unknown error when polling the operation: %v", err.Error())
+		return common.NewTemporaryError(codes.Unavailable, fmt.Errorf("unknown error when polling the operation: %w", err))
 	}
 	return nil
 }
@@ -619,12 +613,8 @@ func (cloud *CloudProvider) insertZonalDisk(
 		opName        string
 		gceAPIVersion = GCEAPIVersionV1
 	)
-	if multiWriter || containsBetaDiskType(hyperdiskTypes, params.DiskType) {
+	if multiWriter {
 		gceAPIVersion = GCEAPIVersionBeta
-	}
-	storagePoolsEnabled := params.StoragePools != nil
-	if storagePoolsEnabled {
-		gceAPIVersion = GCEAPIVersionAlpha
 	}
 
 	diskToCreate := &computev1.Disk{
@@ -637,6 +627,17 @@ func (cloud *CloudProvider) insertZonalDisk(
 
 	if params.ProvisionedIOPSOnCreate > 0 {
 		diskToCreate.ProvisionedIops = params.ProvisionedIOPSOnCreate
+	}
+	if params.ProvisionedThroughputOnCreate > 0 {
+		diskToCreate.ProvisionedThroughput = params.ProvisionedThroughputOnCreate
+	}
+
+	if params.StoragePools != nil {
+		sp := common.StoragePoolInZone(params.StoragePools, volKey.Zone)
+		if sp == nil {
+			return status.Errorf(codes.InvalidArgument, "cannot create disk in zone %q: no Storage Pools exist in zone", volKey.Zone)
+		}
+		diskToCreate.StoragePool = sp.ResourceName
 	}
 
 	if snapshotID != "" {
@@ -662,29 +663,24 @@ func (cloud *CloudProvider) insertZonalDisk(
 			KmsKeyName: params.DiskEncryptionKMSKey,
 		}
 	}
+	diskToCreate.EnableConfidentialCompute = params.EnableConfidentialCompute
+
+	resourceTags, err := getResourceManagerTags(ctx, cloud.tokenSource, params.ResourceTags)
+	if err != nil {
+		return err
+	}
+
+	if len(resourceTags) > 0 {
+		diskToCreate.Params = &computev1.DiskParams{
+			ResourceManagerTags: resourceTags,
+		}
+	}
 
 	if gceAPIVersion == GCEAPIVersionBeta {
 		var insertOp *computebeta.Operation
-		betaDiskToCreate := convertV1DiskToBetaDisk(diskToCreate, params.ProvisionedThroughputOnCreate)
+		betaDiskToCreate := convertV1DiskToBetaDisk(diskToCreate)
 		betaDiskToCreate.MultiWriter = multiWriter
-		betaDiskToCreate.EnableConfidentialCompute = params.EnableConfidentialCompute
 		insertOp, err = cloud.betaService.Disks.Insert(project, volKey.Zone, betaDiskToCreate).Context(ctx).Do()
-		if insertOp != nil {
-			opName = insertOp.Name
-		}
-	} else if gceAPIVersion == GCEAPIVersionAlpha {
-		var insertOp *computealpha.Operation
-		var storagePool *common.StoragePool
-		if storagePoolsEnabled {
-			storagePool = common.StoragePoolInZone(params.StoragePools, volKey.Zone)
-			if storagePool == nil {
-				return status.Errorf(codes.InvalidArgument, "cannot create disk in zone %q: no Storage Pools exist in zone", volKey.Zone)
-			}
-		}
-		alphaDiskToCreate := convertV1DiskToAlphaDisk(diskToCreate, params.ProvisionedThroughputOnCreate, storagePool)
-		alphaDiskToCreate.MultiWriter = multiWriter
-		alphaDiskToCreate.EnableConfidentialCompute = params.EnableConfidentialCompute
-		insertOp, err = cloud.alphaService.Disks.Insert(project, volKey.Zone, alphaDiskToCreate).Context(ctx).Do()
 		if insertOp != nil {
 			opName = insertOp.Name
 		}
@@ -702,7 +698,7 @@ func (cloud *CloudProvider) insertZonalDisk(
 			if err != nil {
 				// failed to GetDisk, however the Disk may already exist
 				// the error code should be non-Final
-				return status.Error(codes.Unavailable, err.Error())
+				return common.NewTemporaryError(codes.Unavailable, fmt.Errorf("error when getting disk: %w", err))
 			}
 			err = cloud.ValidateExistingDisk(ctx, disk, params,
 				int64(capacityRange.GetRequiredBytes()),
@@ -727,7 +723,7 @@ func (cloud *CloudProvider) insertZonalDisk(
 		if IsGCEError(err, "alreadyExists") {
 			disk, err := cloud.GetDisk(ctx, project, volKey, gceAPIVersion)
 			if err != nil {
-				return status.Errorf(codes.Unavailable, "error when getting disk: %v", err.Error())
+				return common.NewTemporaryError(codes.Unavailable, fmt.Errorf("error when getting disk: %w", err))
 			}
 			err = cloud.ValidateExistingDisk(ctx, disk, params,
 				int64(capacityRange.GetRequiredBytes()),
@@ -739,7 +735,7 @@ func (cloud *CloudProvider) insertZonalDisk(
 			klog.Warningf("GCE PD %s already exists after wait, reusing", volKey.Name)
 			return nil
 		}
-		return status.Errorf(codes.Unavailable, "unknown error when polling the operation: %v", err.Error())
+		return common.NewTemporaryError(codes.Unavailable, fmt.Errorf("unknown error when polling the operation: %w", err))
 	}
 	return nil
 }
@@ -924,18 +920,46 @@ func (cloud *CloudProvider) waitForGlobalOp(ctx context.Context, project, opName
 	})
 }
 
-func (cloud *CloudProvider) WaitForAttach(ctx context.Context, project string, volKey *meta.Key, instanceZone, instanceName string) error {
+func (cloud *CloudProvider) waitForAttachOnInstance(ctx context.Context, project string, volKey *meta.Key, instanceZone, instanceName string) error {
 	klog.V(5).Infof("Waiting for attach of disk %v to instance %v to complete...", volKey.Name, instanceName)
 	start := time.Now()
 	return wait.ExponentialBackoff(AttachDiskBackoff, func() (bool, error) {
-		klog.V(6).Infof("Polling for attach of disk %v to instance %v to complete for %v", volKey.Name, instanceName, time.Since(start))
+		klog.V(6).Infof("Polling instances.get for attach of disk %v to instance %v to complete for %v", volKey.Name, instanceName, time.Since(start))
+		instance, err := cloud.GetInstanceOrError(ctx, instanceZone, instanceName)
+		if err != nil {
+			return false, fmt.Errorf("GetInstance failed to get instance: %w", err)
+		}
+
+		if instance == nil {
+			return false, fmt.Errorf("instance %v could not be found", instanceName)
+		}
+
+		for _, disk := range instance.Disks {
+			deviceName, err := common.GetDeviceName(volKey)
+			if err != nil {
+				return false, fmt.Errorf("failed to get disk device name for %s: %w", volKey, err)
+			}
+
+			if deviceName == disk.DeviceName {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+}
+
+func (cloud *CloudProvider) waitForAttachOnDisk(ctx context.Context, project string, volKey *meta.Key, instanceZone, instanceName string) error {
+	klog.V(5).Infof("Waiting for attach of disk %v to instance %v to complete...", volKey.Name, instanceName)
+	start := time.Now()
+	return wait.ExponentialBackoff(AttachDiskBackoff, func() (bool, error) {
+		klog.V(6).Infof("Polling disks.get for attach of disk %v to instance %v to complete for %v", volKey.Name, instanceName, time.Since(start))
 		disk, err := cloud.GetDisk(ctx, project, volKey, GCEAPIVersionV1)
 		if err != nil {
 			return false, fmt.Errorf("GetDisk failed to get disk: %w", err)
 		}
 
 		if disk == nil {
-			return false, fmt.Errorf("Disk %v could not be found", volKey.Name)
+			return false, fmt.Errorf("disk %v could not be found", volKey.Name)
 		}
 
 		for _, user := range disk.GetUsers() {
@@ -945,6 +969,14 @@ func (cloud *CloudProvider) WaitForAttach(ctx context.Context, project string, v
 		}
 		return false, nil
 	})
+}
+
+func (cloud *CloudProvider) WaitForAttach(ctx context.Context, project string, volKey *meta.Key, diskType, instanceZone, instanceName string) error {
+	if cloud.waitForAttachConfig.ShouldUseGetInstanceAPI(diskType) {
+		return cloud.waitForAttachOnInstance(ctx, project, volKey, instanceZone, instanceName)
+	} else {
+		return cloud.waitForAttachOnDisk(ctx, project, volKey, instanceZone, instanceName)
+	}
 }
 
 func wrapOpErr(name string, opErr *computev1.OperationErrorErrors) error {
@@ -978,6 +1010,7 @@ func codeForGCEOpError(err computev1.OperationErrorErrors) codes.Code {
 		"REGION_QUOTA_EXCEEDED":                     codes.ResourceExhausted,
 		"RATE_LIMIT_EXCEEDED":                       codes.ResourceExhausted,
 		"INVALID_USAGE":                             codes.InvalidArgument,
+		"UNSUPPORTED_OPERATION":                     codes.InvalidArgument,
 	}
 	if code, ok := userErrors[err.Code]; ok {
 		return code
@@ -1087,7 +1120,13 @@ func (cloud *CloudProvider) CreateImage(ctx context.Context, project string, vol
 		return nil, err
 	}
 
-	return cloud.waitForImageCreation(ctx, project, imageName)
+	newImage, err := cloud.waitForImageCreation(ctx, project, imageName)
+
+	if err == nil {
+		err = cloud.attachTagsToResource(ctx, snapshotParams.ResourceTags, project, newImage.Id, imagesType, "", false, resourceManagerHostSubPath)
+	}
+
+	return newImage, err
 }
 
 func (cloud *CloudProvider) waitForImageCreation(ctx context.Context, project, imageName string) (*computev1.Image, error) {
@@ -1238,7 +1277,13 @@ func (cloud *CloudProvider) createZonalDiskSnapshot(ctx context.Context, project
 		return nil, err
 	}
 
-	return cloud.waitForSnapshotCreation(ctx, project, snapshotName)
+	snapshot, err := cloud.waitForSnapshotCreation(ctx, project, snapshotName)
+
+	if err == nil {
+		err = cloud.attachTagsToResource(ctx, snapshotParams.ResourceTags, project, snapshot.Id, snapshotsType, "", false, resourceManagerHostSubPath)
+	}
+
+	return snapshot, err
 }
 
 func (cloud *CloudProvider) createRegionalDiskSnapshot(ctx context.Context, project string, volKey *meta.Key, snapshotName string, snapshotParams common.SnapshotParameters, description string) (*computev1.Snapshot, error) {
@@ -1254,7 +1299,13 @@ func (cloud *CloudProvider) createRegionalDiskSnapshot(ctx context.Context, proj
 		return nil, err
 	}
 
-	return cloud.waitForSnapshotCreation(ctx, project, snapshotName)
+	snapshot, err := cloud.waitForSnapshotCreation(ctx, project, snapshotName)
+
+	if err == nil {
+		err = cloud.attachTagsToResource(ctx, snapshotParams.ResourceTags, project, snapshot.Id, snapshotsType, "", false, resourceManagerHostSubPath)
+	}
+
+	return snapshot, err
 
 }
 
@@ -1283,6 +1334,160 @@ func (cloud *CloudProvider) waitForSnapshotCreation(ctx context.Context, project
 			return nil, fmt.Errorf("Timeout waiting for snapshot %s to be created.", snapshotName)
 		}
 	}
+}
+
+// getResourceManagerTags returns the map of tag keys and values. The tag keys are in the form `tagKeys/{tag_key_id}`
+// and the tag values are in the format `tagValues/456`.
+func getResourceManagerTags(ctx context.Context, tokenSource oauth2.TokenSource, tagsMap map[string]string) (map[string]string, error) {
+	if len(tagsMap) <= 0 {
+		return nil, nil
+	}
+
+	tagValuesClient, err := createTagValuesClient(ctx, tokenSource, resourceManagerHostSubPath)
+	if err != nil {
+		return nil, err
+	}
+	defer tagValuesClient.Close()
+
+	tagKeyValueMap := make(map[string]string, len(tagsMap))
+	for tagParentIDKey, tagValue := range tagsMap {
+		getTagValuesReq := &rscmgrpb.GetNamespacedTagValueRequest{
+			Name: fmt.Sprintf("%s/%s", tagParentIDKey, tagValue),
+		}
+		value, err := tagValuesClient.GetNamespacedTagValue(ctx, getTagValuesReq, getRetryCallOptions()...)
+		if err != nil {
+			return nil, err
+		}
+		tagKeyValueMap[value.Parent] = value.Name
+	}
+
+	return tagKeyValueMap, nil
+}
+
+// getRetryCallOptions returns a list of additional call options. If the
+// call encounters TooManyRequests error then it will be retried with an
+// exponential backoff.
+func getRetryCallOptions() []gax.CallOption {
+	return []gax.CallOption{
+		gax.WithRetry(func() gax.Retryer {
+			return gax.OnHTTPCodes(gax.Backoff{
+				Initial:    90 * time.Second,
+				Max:        5 * time.Minute,
+				Multiplier: 2,
+			},
+				http.StatusTooManyRequests)
+		}),
+	}
+}
+
+// getFilteredTagsMap returns the map of tag keys and the tag values to apply on the resources after
+// filtering the tags already existing on a given resource.
+func getFilteredTagsMap(ctx context.Context, client *rscmgr.TagBindingsClient, parent string, tagsMap map[string]string) map[string]string {
+	if len(tagsMap) <= 0 {
+		klog.Infof("getFilteredTagsMap: tags map is empty for %s compute", parent)
+		return nil
+	}
+
+	filteredTagsMap := make(map[string]string, len(tagsMap))
+	for key, value := range tagsMap {
+		filteredTagsMap[key] = value
+	}
+
+	listBindingsReq := &rscmgrpb.ListEffectiveTagsRequest{
+		Parent: parent,
+	}
+	bindings := client.ListEffectiveTags(ctx, listBindingsReq)
+	for i := 0; i < 50; i++ {
+		binding, err := bindings.Next()
+		if errors.Is(err, iterator.Done) {
+			break
+		}
+		if err != nil || binding == nil {
+			klog.Errorf("failed to list effective tags on %s compute resource: %v: %v", parent, binding, err)
+			break
+		}
+		namespacedTagKey := binding.GetNamespacedTagKey()
+		if _, exists := filteredTagsMap[namespacedTagKey]; exists {
+			delete(filteredTagsMap, namespacedTagKey)
+			klog.V(1).Infof("getFilteredTagsMap: skipping tag %s already exists on the %s compute resource", namespacedTagKey, parent)
+		}
+	}
+
+	return filteredTagsMap
+}
+
+// attachTagsToResource attaches tags to a compute resource. As GCP has a rate limit of 600
+// requests per minute, the tags list is filtered so that only the tags which are not attached
+// to the resource are attached. The calls to create the tag binding resource for the tags are
+// rate limited to 8 requests per second.
+func (cloud *CloudProvider) attachTagsToResource(
+	ctx context.Context,
+	tagsMap map[string]string,
+	project string,
+	resourceID uint64,
+	resourceType ResourceType,
+	location string,
+	isZonal bool,
+	resourceManagerHostSubPath string) error {
+	if len(tagsMap) <= 0 {
+		return nil
+	}
+
+	tagBindingsClient, err := createTagBindingsClient(ctx, cloud.tokenSource, location, resourceManagerHostSubPath)
+	if err != nil || tagBindingsClient == nil {
+		return fmt.Errorf("failed to create tag binding client for adding tags to %d compute %s: %w", resourceID, resourceType, err)
+	}
+	defer tagBindingsClient.Close()
+
+	var fullResourceID string
+	if location != "" {
+		if isZonal {
+			fullResourceID = fmt.Sprintf(zonalOrRegionalComputeParentPathFmt, project, "zones", location, resourceType, resourceID)
+		} else {
+			fullResourceID = fmt.Sprintf(zonalOrRegionalComputeParentPathFmt, project, "regions", location, resourceType, resourceID)
+		}
+	} else {
+		fullResourceID = fmt.Sprintf(globalComputeParentPathFmt, project, resourceType, resourceID)
+	}
+
+	filteredTagsMap := getFilteredTagsMap(ctx, tagBindingsClient, fullResourceID, tagsMap)
+
+	errFlag := false
+	for tagParentIDKey, tagValue := range filteredTagsMap {
+		if err := cloud.tagsRateLimiter.Wait(ctx); err != nil {
+			errFlag = true
+			klog.Errorf("rate limiting request to add %s tag to %d compute %s failed: %v", tagValue, resourceID, resourceType, err)
+			continue
+		}
+
+		tagBindingReq := &rscmgrpb.CreateTagBindingRequest{
+			TagBinding: &rscmgrpb.TagBinding{
+				Parent:                 fullResourceID,
+				TagValueNamespacedName: fmt.Sprintf("%s/%s", tagParentIDKey, tagValue),
+			},
+		}
+
+		result, err := tagBindingsClient.CreateTagBinding(ctx, tagBindingReq, getRetryCallOptions()...)
+		if err != nil {
+			e, ok := err.(*apierror.APIError)
+			if ok && e.HTTPCode() == http.StatusConflict {
+				klog.Infof("tag binding %d: %s/%s already exists", resourceID, tagParentIDKey, tagValue)
+				continue
+			}
+			errFlag = true
+			klog.Errorf("request to add %s/%s tag to %d compute %s failed: %v", tagParentIDKey, tagValue, resourceID, resourceType, err)
+			continue
+		}
+
+		if _, err = result.Wait(ctx); err != nil {
+			errFlag = true
+			klog.Errorf("failed to add %s/%s tag to %d compute %s: %v", tagParentIDKey, tagValue, resourceID, resourceType, err)
+		}
+	}
+	if errFlag {
+		return fmt.Errorf("failed to add tags to %d compute %s", resourceID, resourceType)
+	}
+	return nil
 }
 
 // kmsKeyEqual returns true if fetchedKMSKey and storageClassKMSKey refer to the same key.

@@ -16,10 +16,13 @@ package gceGCEDriver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -72,6 +75,12 @@ const (
 	defaultLinuxFsType         = "ext4"
 	defaultWindowsFsType       = "ntfs"
 	fsTypeExt3                 = "ext3"
+
+	readAheadKBMountFlagRegexPattern = "^read_ahead_kb=(.+)$"
+)
+
+var (
+	readAheadKBMountFlagRegex = regexp.MustCompile(readAheadKBMountFlagRegexPattern)
 )
 
 func getDefaultFsType() string {
@@ -83,7 +92,7 @@ func getDefaultFsType() string {
 }
 func (ns *GCENodeServer) isVolumePathMounted(path string) bool {
 	notMnt, err := ns.Mounter.Interface.IsLikelyNotMountPoint(path)
-	klog.V(4).Infof("NodePublishVolume check volume path %s is mounted %t: error %v", path, !notMnt, err)
+	klog.V(4).Infof("Checking volume path %s is mounted %t: error %v", path, !notMnt, err)
 	if err == nil && !notMnt {
 		// TODO(#95): check if mount is compatible. Return OK if it is, or appropriate error.
 		/*
@@ -318,12 +327,19 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 	// Part 3: Mount device to stagingTargetPath
 	fstype := getDefaultFsType()
 
+	shouldUpdateReadAhead := false
+	var readAheadKB int64
 	options := []string{}
 	if mnt := volumeCapability.GetMount(); mnt != nil {
 		if mnt.FsType != "" {
 			fstype = mnt.FsType
 		}
 		options = collectMountOptions(fstype, mnt.MountFlags)
+
+		readAheadKB, shouldUpdateReadAhead, err = extractReadAheadKBMountFlag(mnt.MountFlags)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "failure parsing mount flags: %v", err.Error())
+		}
 	} else if blk := volumeCapability.GetBlock(); blk != nil {
 		// Noop for Block NodeStageVolume
 		klog.V(4).Infof("NodeStageVolume succeeded on %v to %s, capability is block so this is a no-op", volumeID, stagingTargetPath)
@@ -368,8 +384,51 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 		}
 	}
 
+	// Part 5: Update read_ahead
+	if shouldUpdateReadAhead {
+		if err := ns.updateReadAhead(devicePath, readAheadKB); err != nil {
+			return nil, status.Errorf(codes.Internal, "failure updating readahead for %s to %dKB: %v", devicePath, readAheadKB, err.Error())
+		}
+	}
+
 	klog.V(4).Infof("NodeStageVolume succeeded on %v to %s", volumeID, stagingTargetPath)
 	return &csi.NodeStageVolumeResponse{}, nil
+}
+
+func (ns *GCENodeServer) updateReadAhead(devicePath string, readAheadKB int64) error {
+	isBlock, err := ns.VolumeStatter.IsBlockDevice(devicePath)
+	if err != nil {
+		return fmt.Errorf("failed to determine whether %s is a block device: %v", devicePath, err)
+	}
+	if !isBlock {
+		return nil
+	}
+
+	if err := setReadAheadKB(devicePath, readAheadKB, ns.Mounter); err != nil {
+		return fmt.Errorf("failed to set readahead: %v", err)
+	}
+
+	return nil
+}
+
+func extractReadAheadKBMountFlag(mountFlags []string) (int64, bool, error) {
+	for _, mountFlag := range mountFlags {
+		if readAheadKB := readAheadKBMountFlagRegex.FindStringSubmatch(mountFlag); len(readAheadKB) == 2 {
+			// There is only one matching pattern in readAheadKBMountFlagRegex
+			// If found, it will be at index 1
+			readAheadKBInt, err := strconv.ParseInt(readAheadKB[1], 10, 0)
+			if err != nil {
+				return -1, false, fmt.Errorf("invalid read_ahead_kb mount flag %q: %v", mountFlag, err)
+			}
+			if readAheadKBInt < 0 {
+				// Negative values can result in unintuitive values when setting read ahead
+				// (due to blockdev intepreting negative integers as large positive integers).
+				return -1, false, fmt.Errorf("invalid negative value for read_ahead_kb mount flag: %q", mountFlag)
+			}
+			return readAheadKBInt, true, nil
+		}
+	}
+	return -1, false, nil
 }
 
 func (ns *GCENodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
@@ -392,19 +451,44 @@ func (ns *GCENodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUns
 		return nil, status.Error(codes.Internal, fmt.Sprintf("NodeUnstageVolume failed: %v\nUnmounting arguments: %s\n", err.Error(), stagingTargetPath))
 	}
 
-	devicePath, err := getDevicePath(ns, volumeID, "" /* partition, which is unused */)
-	if err != nil {
-		klog.Errorf("Failed to find device path for volume %s. Device may not be detached cleanly (error is ignored and unstaging is continuing): %v", volumeID, err.Error())
-	} else {
-		if devFsPath, err := filepath.EvalSymlinks(devicePath); err != nil {
-			klog.Warningf("filepath.EvalSymlinks(%q) failed when trying to disable device: %w (ignored, unstaging continues)", devicePath, err)
-		} else if err := ns.DeviceUtils.DisableDevice(devFsPath); err != nil {
-			klog.Warningf("Failed to disabled device %s (aka %s) for volume %s. Device may not be detached cleanly (ignored, unstaging continues): %w", devicePath, devFsPath, volumeID, err)
+	if err := ns.safelyDisableDevice(volumeID); err != nil {
+		var targetErr *ignoreableError
+		if errors.As(err, &targetErr) {
+			klog.Warningf("Device may not be detached cleanly for volume %s (ignored, unstaging continues): %v", volumeID, err)
+		} else {
+			return nil, status.Errorf(codes.Internal, "NodeUnstageVolume for volume %s failed: %v", volumeID, err)
 		}
 	}
 
 	klog.V(4).Infof("NodeUnstageVolume succeeded on %v from %s", volumeID, stagingTargetPath)
 	return &csi.NodeUnstageVolumeResponse{}, nil
+}
+
+// A private error wrapper used to pass control flow decisions up to the caller
+type ignoreableError struct{ error }
+
+func (ns *GCENodeServer) safelyDisableDevice(volumeID string) error {
+	devicePath, err := getDevicePath(ns, volumeID, "" /* partition, which is unused */)
+	if err != nil {
+		return &ignoreableError{fmt.Errorf("failed to find device path for volume %s: %v", volumeID, err.Error())}
+	}
+
+	devFsPath, err := filepath.EvalSymlinks(devicePath)
+	if err != nil {
+		return &ignoreableError{fmt.Errorf("filepath.EvalSymlinks(%q) failed: %v", devicePath, err)}
+	}
+
+	if inUse, err := ns.DeviceUtils.IsDeviceFilesystemInUse(ns.Mounter, devicePath, devFsPath); err != nil {
+		return &ignoreableError{fmt.Errorf("failed to check if device %s (aka %s) is in use: %v", devicePath, devFsPath, err)}
+	} else if inUse {
+		return fmt.Errorf("device %s (aka %s) is still in use", devicePath, devFsPath)
+	}
+
+	if err := ns.DeviceUtils.DisableDevice(devFsPath); err != nil {
+		return &ignoreableError{fmt.Errorf("failed to disable device %s (aka %s): %v", devicePath, devFsPath, err)}
+	}
+
+	return nil
 }
 
 func (ns *GCENodeServer) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
