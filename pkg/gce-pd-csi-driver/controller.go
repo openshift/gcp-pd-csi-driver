@@ -28,6 +28,7 @@ import (
 	"github.com/GoogleCloudPlatform/k8s-cloud-provider/pkg/cloud/meta"
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
 	compute "google.golang.org/api/compute/v1"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -47,8 +48,8 @@ type GCEControllerServer struct {
 	CloudProvider gce.GCECompute
 	Metrics       metrics.MetricsManager
 
-	disks []*compute.Disk
-	seen  map[string]int
+	volumeEntries     []*csi.ListVolumesResponse_Entry
+	volumeEntriesSeen map[string]int
 
 	snapshots      []*csi.ListSnapshotsResponse_Entry
 	snapshotTokens map[string]int
@@ -103,6 +104,42 @@ type GCEControllerServer struct {
 
 	// If set to true, the CSI Driver will allow volumes to be provisioned in Storage Pools.
 	enableStoragePools bool
+
+	multiZoneVolumeHandleConfig MultiZoneVolumeHandleConfig
+
+	listVolumesConfig ListVolumesConfig
+}
+
+type MultiZoneVolumeHandleConfig struct {
+	// A set of supported disk types that are compatible with multi-zone volumeHandles.
+	// The disk type is only validated on ControllerPublish.
+	// Other operations that interacti with volumeHandle (ListVolumes/ControllerUnpublish)
+	// don't validate the disk type. This ensures existing published multi-zone volumes
+	// are listed and unpublished correctly. This allows this flag
+	// to be ratcheted to be more restricted without affecting volumes that are already
+	// published.
+	DiskTypes []string
+
+	// If set to true, the CSI driver will enable the multi-zone volumeHandle feature.
+	// If set to false, volumeHandles that contain 'multi-zone' will not be translated
+	// to their respective attachment zone (based on the node), which will result in
+	// an "Unknown zone" error on ControllerPublish/ControllerUnpublish.
+	Enable bool
+}
+
+type ListVolumesConfig struct {
+	UseInstancesAPIForPublishedNodes bool
+}
+
+func (c ListVolumesConfig) listDisksFields() []googleapi.Field {
+	if c.UseInstancesAPIForPublishedNodes {
+		// If we are using the instances.list API in ListVolumes,
+		// don't include the users field in the response, as an optimization.
+		// We rely on instances.list items.disks for attachment pairings.
+		return listDisksFieldsWithoutUsers
+	}
+
+	return listDisksFieldsWithUsers
 }
 
 type csiErrorBackoffId string
@@ -156,10 +193,31 @@ const (
 	resourceApiScheme  = "https"
 	resourceApiService = "compute"
 	resourceProject    = "projects"
+
+	listDisksUsersField = googleapi.Field("items/users")
+
+	readOnlyManyAccessMode = "READ_ONLY_MANY"
 )
 
 var (
-	validResourceApiVersions = map[string]bool{"v1": true, "alpha": true, "beta": true}
+	validResourceApiVersions = map[string]bool{"v1": true, "alpha": true, "beta": true, "staging_v1": true, "staging_beta": true, "staging_alpha": true}
+
+	// By default GCE returns a lot of data for each instance. Request only a subset of the fields.
+	listInstancesFields = []googleapi.Field{
+		"items/disks/deviceName",
+		"items/disks/source",
+		"items/selfLink",
+		"nextPageToken",
+	}
+
+	// By default GCE returns a lot of data for each disk. Request only a subset of the fields.
+	listDisksFieldsWithoutUsers = []googleapi.Field{
+		"items/labels",
+		"items/selfLink",
+		"nextPageToken",
+	}
+	listDisksFieldsWithUsers      = append(listDisksFieldsWithoutUsers, "items/users")
+	disksWithModifiableAccessMode = []string{"hyperdisk-ml"}
 )
 
 func isDiskReady(disk *gce.CloudDisk) (bool, error) {
@@ -224,6 +282,15 @@ func useVolumeCloning(req *csi.CreateVolumeRequest) bool {
 }
 
 func (gceCS *GCEControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
+	response, err := gceCS.createVolumeInternal(ctx, req)
+	if err != nil && req != nil {
+		klog.V(4).Infof("CreateVolume succeeded for volume %v", req.Name)
+	}
+
+	return response, err
+}
+
+func (gceCS *GCEControllerServer) createVolumeInternal(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
 	var err error
 	diskTypeForMetric := metrics.DefaultDiskTypeForMetric
 	enableConfidentialCompute := metrics.DefaultEnableConfidentialCompute
@@ -233,17 +300,16 @@ func (gceCS *GCEControllerServer) CreateVolume(ctx context.Context, req *csi.Cre
 	}()
 	// Validate arguments
 	volumeCapabilities := req.GetVolumeCapabilities()
-	name := req.GetName()
 	capacityRange := req.GetCapacityRange()
-	if len(name) == 0 {
+	if len(req.GetName()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "CreateVolume Name must be provided")
 	}
 	if volumeCapabilities == nil || len(volumeCapabilities) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "CreateVolume Volume capabilities must be provided")
 	}
 
-	capBytes, err := getRequestCapacity(capacityRange)
-	if err != nil {
+	// Validate request capacity early
+	if _, err := getRequestCapacity(capacityRange); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "CreateVolume Request Capacity is invalid: %v", err.Error())
 	}
 
@@ -254,7 +320,7 @@ func (gceCS *GCEControllerServer) CreateVolume(ctx context.Context, req *csi.Cre
 
 	// Apply Parameters (case-insensitive). We leave validation of
 	// the values to the cloud provider.
-	params, err := common.ExtractAndDefaultParameters(req.GetParameters(), gceCS.Driver.name, gceCS.Driver.extraVolumeLabels, gceCS.enableStoragePools)
+	params, err := gceCS.parameterProcessor().ExtractAndDefaultParameters(req.GetParameters(), gceCS.Driver.extraVolumeLabels, gceCS.Driver.extraTags)
 	diskTypeForMetric = params.DiskType
 	enableConfidentialCompute = strconv.FormatBool(params.EnableConfidentialCompute)
 	hasStoragePools := len(params.StoragePools) > 0
@@ -262,15 +328,28 @@ func (gceCS *GCEControllerServer) CreateVolume(ctx context.Context, req *csi.Cre
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to extract parameters: %v", err.Error())
 	}
-	// Determine multiWriter
-	gceAPIVersion := gce.GCEAPIVersionV1
-	multiWriter, _ := getMultiWriterFromCapabilities(volumeCapabilities)
-	if multiWriter {
-		gceAPIVersion = gce.GCEAPIVersionBeta
+	// Validate multiwriter
+	if _, err := getMultiWriterFromCapabilities(volumeCapabilities); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "VolumeCapabilities is invalid: %v", err.Error())
 	}
 
-	if err := validateStoragePools(req, params, gceCS.CloudProvider.GetDefaultProject()); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "CreateVolume failed to validate storage pools: %v", err)
+	err = validateStoragePools(req, params, gceCS.CloudProvider.GetDefaultProject())
+	if err != nil {
+		// Reassign error so that all errors are reported as InvalidArgument to RecordOperationErrorMetrics.
+		err = status.Errorf(codes.InvalidArgument, "CreateVolume failed to validate storage pools: %v", err)
+		return nil, err
+	}
+
+	// Validate VolumeContentSource is set when access mode is read only
+	readonly, _ := getReadOnlyFromCapabilities(volumeCapabilities)
+	if readonly && req.GetVolumeContentSource() == nil {
+		return nil, status.Error(codes.InvalidArgument, "VolumeContentSource must be provided when AccessMode is set to read only")
+	}
+
+	// Validate multi-zone provisioning configuration
+	err = gceCS.validateMultiZoneProvisioning(req, params)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "CreateVolume failed to validate multi-zone provisioning request: %v", err)
 	}
 
 	// Verify that the regional availability class is only used on regional disks.
@@ -278,6 +357,159 @@ func (gceCS *GCEControllerServer) CreateVolume(ctx context.Context, req *csi.Cre
 		return nil, status.Errorf(codes.InvalidArgument, "invalid availabilty class for zonal disk")
 	}
 
+	if gceCS.multiZoneVolumeHandleConfig.Enable && params.MultiZoneProvisioning {
+		// Create multi-zone disk, that may have up to N disks.
+		return gceCS.createMultiZoneDisk(ctx, req, params)
+	}
+
+	// Create single device zonal or regional disk
+	return gceCS.createSingleDeviceDisk(ctx, req, params)
+}
+
+func (gceCS *GCEControllerServer) getSupportedZonesForPDType(ctx context.Context, zones []string, diskType string) ([]string, error) {
+	project := gceCS.CloudProvider.GetDefaultProject()
+	zones, err := gceCS.CloudProvider.ListCompatibleDiskTypeZones(ctx, project, zones, diskType)
+	if err != nil {
+		return nil, err
+	}
+	return zones, nil
+}
+
+func (gceCS *GCEControllerServer) getMultiZoneProvisioningZones(ctx context.Context, req *csi.CreateVolumeRequest, params common.DiskParameters) ([]string, error) {
+	top := req.GetAccessibilityRequirements()
+	if top == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "no topology specified")
+	}
+	prefZones, err := getZonesFromTopology(top.GetPreferred())
+	if err != nil {
+		return nil, fmt.Errorf("could not get zones from preferred topology: %w", err)
+	}
+	reqZones, err := getZonesFromTopology(top.GetRequisite())
+	if err != nil {
+		return nil, fmt.Errorf("could not get zones from requisite topology: %w", err)
+	}
+	prefSet := sets.NewString(prefZones...)
+	reqSet := sets.NewString(reqZones...)
+	prefAndReqSet := prefSet.Union(reqSet)
+	availableZones := prefAndReqSet.List()
+	if prefAndReqSet.Len() == 0 {
+		// If there are no specified zones, this means that there were no aggregate
+		// zones (eg: no nodes running) in the cluster
+		availableZones = gceCS.fallbackRequisiteZones
+	}
+
+	supportedZones, err := gceCS.getSupportedZonesForPDType(ctx, availableZones, params.DiskType)
+	if err != nil {
+		return nil, fmt.Errorf("could not get supported zones for disk type %v from zone list %v: %w", params.DiskType, prefAndReqSet.List(), err)
+	}
+
+	// It's possible that the provided requisite zones shifted since the last time that
+	// CreateVolume was called (eg: due to a node being removed in a zone)
+	// Ensure that we combine the supportedZones with any existing zones to get the full set.
+	existingZones, err := gceCS.getZonesWithDiskNameAndType(ctx, req.Name, params.DiskType)
+	if err != nil {
+		return nil, common.LoggedError(fmt.Sprintf("failed to check existing list of zones for request: %v", req.Name), err)
+	}
+
+	supportedSet := sets.NewString(supportedZones...)
+	existingSet := sets.NewString(existingZones...)
+	combinedZones := existingSet.Union(supportedSet)
+
+	return combinedZones.List(), nil
+}
+
+func (gceCS *GCEControllerServer) createMultiZoneDisk(ctx context.Context, req *csi.CreateVolumeRequest, params common.DiskParameters) (*csi.CreateVolumeResponse, error) {
+	// Determine the zones that are needed.
+	var err error
+
+	// For multi-zone, we either select:
+	// 1) The zones specified in requisite topology requirements
+	// 2) All zones in the region that are compatible with the selected disk type
+	zones, err := gceCS.getMultiZoneProvisioningZones(ctx, req, params)
+	if err != nil {
+		return nil, err
+	}
+
+	multiZoneVolKey := meta.ZonalKey(req.GetName(), common.MultiZoneValue)
+	volumeID, err := common.KeyToVolumeID(multiZoneVolKey, gceCS.CloudProvider.GetDefaultProject())
+	if err != nil {
+		return nil, err
+	}
+	if acquired := gceCS.volumeLocks.TryAcquire(volumeID); !acquired {
+		return nil, status.Errorf(codes.Aborted, common.VolumeOperationAlreadyExistsFmt, volumeID)
+	}
+	defer gceCS.volumeLocks.Release(volumeID)
+
+	createDiskErrs := []error{}
+	createdDisks := make([]*gce.CloudDisk, 0, len(zones))
+	for _, zone := range zones {
+		volKey := meta.ZonalKey(req.GetName(), zone)
+		klog.V(4).Infof("Creating single zone disk for zone %q and volume: %v", zone, volKey)
+		disk, err := gceCS.createSingleDisk(ctx, req, params, volKey, []string{zone})
+		if err != nil {
+			createDiskErrs = append(createDiskErrs, err)
+			continue
+		}
+
+		createdDisks = append(createdDisks, disk)
+	}
+	if len(createDiskErrs) > 0 {
+		return nil, common.LoggedError("Failed to create multi-zone disk: ", errors.Join(createDiskErrs...))
+	}
+
+	if len(createdDisks) == 0 {
+		return nil, status.Errorf(codes.Internal, "could not create any disks for request: %v", req)
+	}
+
+	// Use the first response as a template
+	volumeId := fmt.Sprintf("projects/%s/zones/%s/disks/%s", gceCS.CloudProvider.GetDefaultProject(), common.MultiZoneValue, req.GetName())
+	klog.V(4).Infof("CreateVolume succeeded for multi-zone disks in zones %s: %v", zones, multiZoneVolKey)
+	return generateCreateVolumeResponseWithVolumeId(createdDisks[0], zones, params, volumeId), nil
+}
+
+func (gceCS *GCEControllerServer) getZonesWithDiskNameAndType(ctx context.Context, name string, diskType string) ([]string, error) {
+	zoneOnlyFields := []googleapi.Field{"items/zone", "items/type"}
+	nameAndRegionFilter := fmt.Sprintf("name=%s", name)
+	disksWithZone, _, err := gceCS.CloudProvider.ListDisksWithFilter(ctx, zoneOnlyFields, nameAndRegionFilter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check existing zones for disk name %v: %w", name, err)
+	}
+	zones := []string{}
+	for _, disk := range disksWithZone {
+		if !strings.Contains(disk.Type, diskType) || disk.Zone == "" {
+			continue
+		}
+		diskZone, err := common.ParseZoneFromURI(disk.Zone)
+		if err != nil {
+			klog.Warningf("Malformed zone URI %v for disk %v from ListDisks call. Skipping", disk.Zone, name)
+			continue
+		}
+		zones = append(zones, diskZone)
+	}
+	return zones, nil
+}
+
+func (gceCS *GCEControllerServer) updateAccessModeIfNecessary(ctx context.Context, volKey *meta.Key, disk *gce.CloudDisk, readonly bool) error {
+	if !slices.Contains(disksWithModifiableAccessMode, disk.GetPDType()) {
+		// If this isn't a disk that has access mode (eg: Hyperdisk ML), return
+		// So far, HyperdiskML is the only disk type that allows the disk type to be modified.
+		return nil
+	}
+	if !readonly {
+		// Only update the access mode if we're converting from ReadWrite to ReadOnly
+		return nil
+	}
+	project := gceCS.CloudProvider.GetDefaultProject()
+	if disk.GetAccessMode() == readOnlyManyAccessMode {
+		// If the access mode is already readonly, return
+		return nil
+	}
+
+	return gceCS.CloudProvider.SetDiskAccessMode(ctx, project, volKey, readOnlyManyAccessMode)
+}
+
+func (gceCS *GCEControllerServer) createSingleDeviceDisk(ctx context.Context, req *csi.CreateVolumeRequest, params common.DiskParameters) (*csi.CreateVolumeResponse, error) {
+	var err error
 	var locationTopReq *locationRequirements
 	if useVolumeCloning(req) {
 		locationTopReq, err = cloningLocationRequirements(req, params.ReplicationType)
@@ -298,7 +530,7 @@ func (gceCS *GCEControllerServer) CreateVolume(ctx context.Context, req *csi.Cre
 		if len(zones) != 1 {
 			return nil, status.Errorf(codes.Internal, "Failed to pick exactly 1 zone for zonal disk, got %v instead", len(zones))
 		}
-		volKey = meta.ZonalKey(name, zones[0])
+		volKey = meta.ZonalKey(req.GetName(), zones[0])
 
 	case replicationTypeRegionalPD:
 		zones, err = gceCS.pickZones(ctx, req.GetAccessibilityRequirements(), 2, locationTopReq)
@@ -309,7 +541,7 @@ func (gceCS *GCEControllerServer) CreateVolume(ctx context.Context, req *csi.Cre
 		if err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "CreateVolume failed to get region from zones: %v", err.Error())
 		}
-		volKey = meta.RegionalKey(name, region)
+		volKey = meta.RegionalKey(req.GetName(), region)
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "CreateVolume replication type '%s' is not supported", params.ReplicationType)
 	}
@@ -322,9 +554,27 @@ func (gceCS *GCEControllerServer) CreateVolume(ctx context.Context, req *csi.Cre
 		return nil, status.Errorf(codes.Aborted, common.VolumeOperationAlreadyExistsFmt, volumeID)
 	}
 	defer gceCS.volumeLocks.Release(volumeID)
+	disk, err := gceCS.createSingleDisk(ctx, req, params, volKey, zones)
+
+	if err != nil {
+		return nil, common.LoggedError("CreateVolume failed: %v", err)
+	}
+
+	return generateCreateVolumeResponseWithVolumeId(disk, zones, params, volumeID), err
+}
+
+func (gceCS *GCEControllerServer) createSingleDisk(ctx context.Context, req *csi.CreateVolumeRequest, params common.DiskParameters, volKey *meta.Key, zones []string) (*gce.CloudDisk, error) {
+	capacityRange := req.GetCapacityRange()
+	capBytes, _ := getRequestCapacity(capacityRange)
+	multiWriter, _ := getMultiWriterFromCapabilities(req.GetVolumeCapabilities())
+	readonly, _ := getReadOnlyFromCapabilities(req.GetVolumeCapabilities())
+	accessMode := ""
+	if readonly && slices.Contains(disksWithModifiableAccessMode, params.DiskType) {
+		accessMode = readOnlyManyAccessMode
+	}
 
 	// Validate if disk already exists
-	existingDisk, err := gceCS.CloudProvider.GetDisk(ctx, gceCS.CloudProvider.GetDefaultProject(), volKey, gceAPIVersion)
+	existingDisk, err := gceCS.CloudProvider.GetDisk(ctx, gceCS.CloudProvider.GetDefaultProject(), volKey, getGCEApiVersion(multiWriter))
 	if err != nil {
 		if !gce.IsGCEError(err, "notFound") {
 			// failed to GetDisk, however the Disk may already be created, the error code should be non-Final
@@ -351,7 +601,7 @@ func (gceCS *GCEControllerServer) CreateVolume(ctx context.Context, req *csi.Cre
 
 		// If there is no validation error, immediately return success
 		klog.V(4).Infof("CreateVolume succeeded for disk %v, it already exists and was compatible", volKey)
-		return generateCreateVolumeResponse(existingDisk, zones, params)
+		return existingDisk, nil
 	}
 
 	snapshotID := ""
@@ -379,7 +629,7 @@ func (gceCS *GCEControllerServer) CreateVolume(ctx context.Context, req *csi.Cre
 			}
 
 			// Verify that the volume in VolumeContentSource exists.
-			diskFromSourceVolume, err := gceCS.CloudProvider.GetDisk(ctx, project, sourceVolKey, gceAPIVersion)
+			diskFromSourceVolume, err := gceCS.CloudProvider.GetDisk(ctx, project, sourceVolKey, getGCEApiVersion(multiWriter))
 			if err != nil {
 				if gce.IsGCEError(err, "notFound") {
 					return nil, status.Errorf(codes.NotFound, "CreateVolume source volume %s does not exist", volumeContentSourceVolumeID)
@@ -427,20 +677,18 @@ func (gceCS *GCEControllerServer) CreateVolume(ctx context.Context, req *csi.Cre
 				return nil, status.Errorf(codes.Aborted, "CreateVolume disk from source volume %v is not ready", sourceVolKey)
 			}
 		}
-	} else { // if VolumeContentSource is nil, validate access mode is not read only
-		if readonly, _ := getReadOnlyFromCapabilities(volumeCapabilities); readonly {
-			return nil, status.Error(codes.InvalidArgument, "VolumeContentSource must be provided when AccessMode is set to read only")
-		}
 	}
 
 	// Create the disk
 	var disk *gce.CloudDisk
+	name := req.GetName()
+
 	switch params.ReplicationType {
 	case replicationTypeNone:
 		if len(zones) != 1 {
 			return nil, status.Errorf(codes.Internal, "CreateVolume failed to get a single zone for creating zonal disk, instead got: %v", zones)
 		}
-		disk, err = createSingleZoneDisk(ctx, gceCS.CloudProvider, name, zones, params, capacityRange, capBytes, snapshotID, volumeContentSourceVolumeID, multiWriter)
+		disk, err = createSingleZoneDisk(ctx, gceCS.CloudProvider, name, zones, params, capacityRange, capBytes, snapshotID, volumeContentSourceVolumeID, multiWriter, accessMode)
 		if err != nil {
 			return nil, common.LoggedError("CreateVolume failed to create single zonal disk "+name+": ", err)
 		}
@@ -448,7 +696,7 @@ func (gceCS *GCEControllerServer) CreateVolume(ctx context.Context, req *csi.Cre
 		if len(zones) != 2 {
 			return nil, status.Errorf(codes.Internal, "CreateVolume failed to get a 2 zones for creating regional disk, instead got: %v", zones)
 		}
-		disk, err = createRegionalDisk(ctx, gceCS.CloudProvider, name, zones, params, capacityRange, capBytes, snapshotID, volumeContentSourceVolumeID, multiWriter)
+		disk, err = createRegionalDisk(ctx, gceCS.CloudProvider, name, zones, params, capacityRange, capBytes, snapshotID, volumeContentSourceVolumeID, multiWriter, accessMode)
 		if err != nil {
 			return nil, common.LoggedError("CreateVolume failed to create regional disk "+name+": ", err)
 		}
@@ -465,18 +713,11 @@ func (gceCS *GCEControllerServer) CreateVolume(ctx context.Context, req *csi.Cre
 	}
 
 	klog.V(4).Infof("CreateVolume succeeded for disk %v", volKey)
-	return generateCreateVolumeResponse(disk, zones, params)
-
+	return disk, nil
 }
 
 func (gceCS *GCEControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
 	var err error
-	diskTypeForMetric := metrics.DefaultDiskTypeForMetric
-	enableConfidentialCompute := metrics.DefaultEnableConfidentialCompute
-	enableStoragePools := metrics.DefaultEnableStoragePools
-	defer func() {
-		gceCS.Metrics.RecordOperationErrorMetrics("DeleteVolume", err, diskTypeForMetric, enableConfidentialCompute, enableStoragePools)
-	}()
 	// Validate arguments
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
@@ -491,6 +732,78 @@ func (gceCS *GCEControllerServer) DeleteVolume(ctx context.Context, req *csi.Del
 		return &csi.DeleteVolumeResponse{}, nil
 	}
 
+	volumeIsMultiZone := isMultiZoneVolKey(volKey)
+	if gceCS.multiZoneVolumeHandleConfig.Enable && volumeIsMultiZone {
+		// Delete multi-zone disk, that may have up to N disks.
+		return gceCS.deleteMultiZoneDisk(ctx, req, project, volKey)
+	}
+
+	// Delete zonal or regional disk
+	return gceCS.deleteSingleDeviceDisk(ctx, req, project, volKey)
+}
+
+func getGCEApiVersion(multiWriter bool) gce.GCEAPIVersion {
+	if multiWriter {
+		return gce.GCEAPIVersionBeta
+	}
+
+	return gce.GCEAPIVersionV1
+}
+
+func (gceCS *GCEControllerServer) deleteMultiZoneDisk(ctx context.Context, req *csi.DeleteVolumeRequest, project string, volKey *meta.Key) (*csi.DeleteVolumeResponse, error) {
+	// List disks with same name
+	var err error
+	diskTypeForMetric := metrics.DefaultDiskTypeForMetric
+	enableConfidentialCompute := metrics.DefaultEnableConfidentialCompute
+	enableStoragePools := metrics.DefaultEnableStoragePools
+	defer func() {
+		gceCS.Metrics.RecordOperationErrorMetrics("DeleteVolume", err, diskTypeForMetric, enableConfidentialCompute, enableStoragePools)
+	}()
+	existingZones := []string{gceCS.CloudProvider.GetDefaultZone()}
+	zones, err := getDefaultZonesInRegion(ctx, gceCS, existingZones)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list default zones: %w", err)
+	}
+
+	volumeID := req.GetVolumeId()
+	if acquired := gceCS.volumeLocks.TryAcquire(volumeID); !acquired {
+		return nil, status.Errorf(codes.Aborted, common.VolumeOperationAlreadyExistsFmt, volumeID)
+	}
+	defer gceCS.volumeLocks.Release(volumeID)
+
+	deleteDiskErrs := []error{}
+	for _, zone := range zones {
+		zonalVolKey := &meta.Key{
+			Name:   volKey.Name,
+			Region: volKey.Region,
+			Zone:   zone,
+		}
+		disk, _ := gceCS.CloudProvider.GetDisk(ctx, project, zonalVolKey, gce.GCEAPIVersionV1)
+		// TODO: Consolidate the parameters here, rather than taking the last.
+		diskTypeForMetric, enableConfidentialCompute, enableStoragePools = metrics.GetMetricParameters(disk)
+		err := gceCS.CloudProvider.DeleteDisk(ctx, project, zonalVolKey)
+		if err != nil {
+			deleteDiskErrs = append(deleteDiskErrs, gceCS.CloudProvider.DeleteDisk(ctx, project, volKey))
+		}
+	}
+
+	if len(deleteDiskErrs) > 0 {
+		return nil, common.LoggedError("Failed to delete multi-zone disk: ", errors.Join(deleteDiskErrs...))
+	}
+
+	klog.V(4).Infof("DeleteVolume succeeded for disk %v", volKey)
+	return &csi.DeleteVolumeResponse{}, nil
+}
+
+func (gceCS *GCEControllerServer) deleteSingleDeviceDisk(ctx context.Context, req *csi.DeleteVolumeRequest, project string, volKey *meta.Key) (*csi.DeleteVolumeResponse, error) {
+	var err error
+	diskTypeForMetric := metrics.DefaultDiskTypeForMetric
+	enableConfidentialCompute := metrics.DefaultEnableConfidentialCompute
+	enableStoragePools := metrics.DefaultEnableStoragePools
+	defer func() {
+		gceCS.Metrics.RecordOperationErrorMetrics("DeleteVolume", err, diskTypeForMetric, enableConfidentialCompute, enableStoragePools)
+	}()
+	volumeID := req.GetVolumeId()
 	project, volKey, err = gceCS.CloudProvider.RepairUnderspecifiedVolumeKey(ctx, project, volKey)
 	if err != nil {
 		if gce.IsGCENotFoundError(err) {
@@ -588,6 +901,52 @@ func parseMachineType(machineTypeUrl string) string {
 	return machineType
 }
 
+func convertMultiZoneVolKeyToZoned(volumeKey *meta.Key, instanceZone string) *meta.Key {
+	volumeKey.Zone = instanceZone
+	return volumeKey
+}
+
+func (gceCS *GCEControllerServer) validateMultiZoneDisk(volumeID string, disk *gce.CloudDisk) error {
+	if !slices.Contains(gceCS.multiZoneVolumeHandleConfig.DiskTypes, disk.GetPDType()) {
+		return status.Errorf(codes.InvalidArgument, "Multi-zone volumeID %q points to disk with unsupported disk type %q: %v", volumeID, disk.GetPDType(), disk.GetSelfLink())
+	}
+	if _, ok := disk.GetLabels()[common.MultiZoneLabel]; !ok {
+		return status.Errorf(codes.InvalidArgument, "Multi-zone volumeID %q points to disk that is missing label %q: %v", volumeID, common.MultiZoneLabel, disk.GetSelfLink())
+	}
+	return nil
+}
+
+func (gceCS *GCEControllerServer) validateMultiZoneProvisioning(req *csi.CreateVolumeRequest, params common.DiskParameters) error {
+	if !gceCS.multiZoneVolumeHandleConfig.Enable {
+		return nil
+	}
+	if !params.MultiZoneProvisioning {
+		return nil
+	}
+
+	// For volume populator, we want to allow multiple RWO disks to be created
+	// with the same name, so they can be hydrated across multiple zones.
+
+	// We don't have support volume cloning from an existing PVC
+	if useVolumeCloning(req) {
+		return fmt.Errorf("%q parameter does not support volume cloning", common.ParameterKeyEnableMultiZoneProvisioning)
+	}
+
+	if readonly, _ := getReadOnlyFromCapabilities(req.GetVolumeCapabilities()); !readonly && req.GetVolumeContentSource() != nil {
+		return fmt.Errorf("%q parameter does not support specifying volume content source in readwrite mode", common.ParameterKeyEnableMultiZoneProvisioning)
+	}
+
+	if !slices.Contains(gceCS.multiZoneVolumeHandleConfig.DiskTypes, params.DiskType) {
+		return fmt.Errorf("%q parameter with unsupported disk type: %v", common.ParameterKeyEnableMultiZoneProvisioning, params.DiskType)
+	}
+
+	return nil
+}
+
+func isMultiZoneVolKey(volumeKey *meta.Key) bool {
+	return volumeKey.Type() == meta.Zonal && volumeKey.Zone == common.MultiZoneValue
+}
+
 func (gceCS *GCEControllerServer) executeControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error, *gce.CloudDisk) {
 	project, volKey, pdcsiContext, err := gceCS.validateControllerPublishVolumeRequest(ctx, req)
 	if err != nil {
@@ -601,6 +960,21 @@ func (gceCS *GCEControllerServer) executeControllerPublishVolume(ctx context.Con
 
 	pubVolResp := &csi.ControllerPublishVolumeResponse{
 		PublishContext: nil,
+	}
+
+	instanceZone, instanceName, err := common.NodeIDToZoneAndName(nodeID)
+	if err != nil {
+		return nil, status.Errorf(codes.NotFound, "could not split nodeID: %v", err.Error()), nil
+	}
+
+	volumeIsMultiZone := isMultiZoneVolKey(volKey)
+	if gceCS.multiZoneVolumeHandleConfig.Enable && volumeIsMultiZone {
+		// Only allow read-only attachment for "multi-zone" volumes
+		if !readOnly {
+			return nil, status.Errorf(codes.InvalidArgument, "'multi-zone' volume only supports 'readOnly': %v", volumeID), nil
+		}
+
+		volKey = convertMultiZoneVolKeyToZoned(volKey, instanceZone)
 	}
 
 	project, volKey, err = gceCS.CloudProvider.RepairUnderspecifiedVolumeKey(ctx, project, volKey)
@@ -625,16 +999,18 @@ func (gceCS *GCEControllerServer) executeControllerPublishVolume(ctx context.Con
 		}
 		return nil, common.LoggedError("Failed to getDisk: ", err), disk
 	}
-	instanceZone, instanceName, err := common.NodeIDToZoneAndName(nodeID)
-	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "could not split nodeID: %v", err.Error()), disk
-	}
 	instance, err := gceCS.CloudProvider.GetInstanceOrError(ctx, instanceZone, instanceName)
 	if err != nil {
 		if gce.IsGCENotFoundError(err) {
 			return nil, status.Errorf(codes.NotFound, "Could not find instance %v: %v", nodeID, err.Error()), disk
 		}
 		return nil, common.LoggedError("Failed to get instance: ", err), disk
+	}
+
+	if gceCS.multiZoneVolumeHandleConfig.Enable && volumeIsMultiZone {
+		if err := gceCS.validateMultiZoneDisk(volumeID, disk); err != nil {
+			return nil, err, disk
+		}
 	}
 
 	readWrite := "READ_WRITE"
@@ -656,6 +1032,9 @@ func (gceCS *GCEControllerServer) executeControllerPublishVolume(ctx context.Con
 		klog.V(4).Infof("ControllerPublishVolume succeeded for disk %v to instance %v, already attached.", volKey, nodeID)
 		return pubVolResp, nil, disk
 	}
+	if err := gceCS.updateAccessModeIfNecessary(ctx, volKey, disk, readOnly); err != nil {
+		return nil, common.LoggedError("Failed to update access mode: ", err), disk
+	}
 	instanceZone, instanceName, err = common.NodeIDToZoneAndName(nodeID)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "could not split nodeID: %v", err.Error()), disk
@@ -672,7 +1051,7 @@ func (gceCS *GCEControllerServer) executeControllerPublishVolume(ctx context.Con
 		return nil, common.LoggedError("Failed to Attach: ", err), disk
 	}
 
-	err = gceCS.CloudProvider.WaitForAttach(ctx, project, volKey, instanceZone, instanceName)
+	err = gceCS.CloudProvider.WaitForAttach(ctx, project, volKey, disk.GetPDType(), instanceZone, instanceName)
 	if err != nil {
 		return nil, common.LoggedError("Errored during WaitForAttach: ", err), disk
 	}
@@ -739,6 +1118,16 @@ func (gceCS *GCEControllerServer) executeControllerUnpublishVolume(ctx context.C
 
 	volumeID := req.GetVolumeId()
 	nodeID := req.GetNodeId()
+
+	instanceZone, instanceName, err := common.NodeIDToZoneAndName(nodeID)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "could not split nodeID: %v", err.Error()), nil
+	}
+
+	if gceCS.multiZoneVolumeHandleConfig.Enable && isMultiZoneVolKey(volKey) {
+		volKey = convertMultiZoneVolKeyToZoned(volKey, instanceZone)
+	}
+
 	project, volKey, err = gceCS.CloudProvider.RepairUnderspecifiedVolumeKey(ctx, project, volKey)
 	if err != nil {
 		if gce.IsGCENotFoundError(err) {
@@ -756,10 +1145,6 @@ func (gceCS *GCEControllerServer) executeControllerUnpublishVolume(ctx context.C
 	}
 	defer gceCS.volumeLocks.Release(lockingVolumeID)
 	diskToUnpublish, _ := gceCS.CloudProvider.GetDisk(ctx, project, volKey, gce.GCEAPIVersionV1)
-	instanceZone, instanceName, err := common.NodeIDToZoneAndName(nodeID)
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "could not split nodeID: %v", err.Error()), diskToUnpublish
-	}
 	instance, err := gceCS.CloudProvider.GetInstanceOrError(ctx, instanceZone, instanceName)
 	if err != nil {
 		if gce.IsGCENotFoundError(err) {
@@ -791,6 +1176,14 @@ func (gceCS *GCEControllerServer) executeControllerUnpublishVolume(ctx context.C
 	return &csi.ControllerUnpublishVolumeResponse{}, nil, diskToUnpublish
 }
 
+func (gceCS *GCEControllerServer) parameterProcessor() *common.ParameterProcessor {
+	return &common.ParameterProcessor{
+		DriverName:         gceCS.Driver.name,
+		EnableStoragePools: gceCS.enableStoragePools,
+		EnableMultiZone:    gceCS.multiZoneVolumeHandleConfig.Enable,
+	}
+}
+
 func (gceCS *GCEControllerServer) ValidateVolumeCapabilities(ctx context.Context, req *csi.ValidateVolumeCapabilitiesRequest) (*csi.ValidateVolumeCapabilitiesResponse, error) {
 	var err error
 	diskTypeForMetric := metrics.DefaultDiskTypeForMetric
@@ -810,6 +1203,7 @@ func (gceCS *GCEControllerServer) ValidateVolumeCapabilities(ctx context.Context
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "Volume ID is invalid: %v", err.Error())
 	}
+
 	project, volKey, err = gceCS.CloudProvider.RepairUnderspecifiedVolumeKey(ctx, project, volKey)
 	if err != nil {
 		if gce.IsGCENotFoundError(err) {
@@ -838,7 +1232,7 @@ func (gceCS *GCEControllerServer) ValidateVolumeCapabilities(ctx context.Context
 	}
 
 	// Validate the disk parameters match the disk we GET
-	params, err := common.ExtractAndDefaultParameters(req.GetParameters(), gceCS.Driver.name, gceCS.Driver.extraVolumeLabels, gceCS.enableStoragePools)
+	params, err := gceCS.parameterProcessor().ExtractAndDefaultParameters(req.GetParameters(), gceCS.Driver.extraVolumeLabels, gceCS.Driver.extraTags)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to extract parameters: %v", err.Error())
 	}
@@ -872,6 +1266,22 @@ func generateFailedValidationMessage(format string, a ...interface{}) *csi.Valid
 	}
 }
 
+func (gceCS *GCEControllerServer) listVolumeEntries(ctx context.Context) ([]*csi.ListVolumesResponse_Entry, error) {
+	diskList, _, err := gceCS.CloudProvider.ListDisks(ctx, gceCS.listVolumesConfig.listDisksFields())
+	if err != nil {
+		return nil, err
+	}
+
+	var instanceList []*compute.Instance = nil
+	if gceCS.listVolumesConfig.UseInstancesAPIForPublishedNodes {
+		instanceList, _, err = gceCS.CloudProvider.ListInstances(ctx, listInstancesFields)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return gceCS.disksAndInstancesToVolumeEntries(diskList, instanceList), nil
+}
+
 func (gceCS *GCEControllerServer) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (*csi.ListVolumesResponse, error) {
 	// https://cloud.google.com/compute/docs/reference/beta/disks/list
 	if req.MaxEntries < 0 {
@@ -879,20 +1289,21 @@ func (gceCS *GCEControllerServer) ListVolumes(ctx context.Context, req *csi.List
 			"ListVolumes got max entries request %v. GCE only supports values >0", req.MaxEntries)
 	}
 
-	offset := 0
+	offsetLow := 0
 	var ok bool
 	if req.StartingToken == "" {
-		diskList, _, err := gceCS.CloudProvider.ListDisks(ctx)
+		volumeEntries, err := gceCS.listVolumeEntries(ctx)
 		if err != nil {
 			if gce.IsGCEInvalidError(err) {
 				return nil, status.Errorf(codes.Aborted, "ListVolumes error with invalid request: %v", err.Error())
 			}
-			return nil, common.LoggedError("Failed to list disk: ", err)
+			return nil, common.LoggedError("Failed to list volumes: ", err)
 		}
-		gceCS.disks = diskList
-		gceCS.seen = map[string]int{}
+
+		gceCS.volumeEntries = volumeEntries
+		gceCS.volumeEntriesSeen = map[string]int{}
 	} else {
-		offset, ok = gceCS.seen[req.StartingToken]
+		offsetLow, ok = gceCS.volumeEntriesSeen[req.StartingToken]
 		if !ok {
 			return nil, status.Errorf(codes.Aborted, "ListVolumes error with invalid startingToken: %s", req.StartingToken)
 		}
@@ -903,43 +1314,109 @@ func (gceCS *GCEControllerServer) ListVolumes(ctx context.Context, req *csi.List
 		maxEntries = maxListVolumesResponseEntries
 	}
 
-	entries := []*csi.ListVolumesResponse_Entry{}
-	for i := 0; i+offset < len(gceCS.disks) && i < maxEntries; i++ {
-		d := gceCS.disks[i+offset]
-		diskRsrc, err := getResourceId(d.SelfLink)
+	nextToken := ""
+	offsetHigh := offsetLow + maxEntries
+	if offsetHigh < len(gceCS.volumeEntries) {
+		nextToken = string(uuid.NewUUID())
+		gceCS.volumeEntriesSeen[nextToken] = offsetHigh
+	} else {
+		offsetHigh = len(gceCS.volumeEntries)
+	}
+
+	return &csi.ListVolumesResponse{
+		Entries:   gceCS.volumeEntries[offsetLow:offsetHigh],
+		NextToken: nextToken,
+	}, nil
+}
+
+// isMultiZoneDisk returns the multi-zone volumeId of a disk if it is
+// "multi-zone", otherwise returns an empty string
+// The second parameter indiciates if it is a "multi-zone" disk
+func isMultiZoneDisk(diskRsrc string, diskLabels map[string]string) (string, bool) {
+	isMultiZoneDisk := false
+	for l := range diskLabels {
+		if l == common.MultiZoneLabel {
+			isMultiZoneDisk = true
+		}
+	}
+	if !isMultiZoneDisk {
+		return "", false
+	}
+
+	multiZoneVolumeId, err := common.VolumeIdAsMultiZone(diskRsrc)
+	if err != nil {
+		klog.Warningf("Error converting multi-zone volume handle for disk %s, skipped: %v", diskRsrc, err)
+		return "", false
+	}
+	return multiZoneVolumeId, true
+}
+
+// disksAndInstancesToVolumeEntries converts a list of disks and instances to a list
+// of CSI ListVolumeResponse entries.
+// It appends "multi-zone" volumeHandles at the end. These are volumeHandles which
+// map to multiple volumeHandles in different zones
+func (gceCS *GCEControllerServer) disksAndInstancesToVolumeEntries(disks []*compute.Disk, instances []*compute.Instance) []*csi.ListVolumesResponse_Entry {
+	nodesByVolumeId := map[string][]string{}
+	multiZoneVolumeIdsByVolumeId := map[string]string{}
+	for _, d := range disks {
+		volumeId, err := getResourceId(d.SelfLink)
 		if err != nil {
 			klog.Warningf("Bad ListVolumes disk resource %s, skipped: %v (%+v)", d.SelfLink, err, d)
 			continue
 		}
-		users := []string{}
+
+		instanceIds := make([]string, len(d.Users))
 		for _, u := range d.Users {
-			rsrc, err := getResourceId(u)
+			instanceId, err := getResourceId(u)
 			if err != nil {
 				klog.Warningf("Bad ListVolumes user %s, skipped: %v", u, err)
 			} else {
-				users = append(users, rsrc)
+				instanceIds = append(instanceIds, instanceId)
 			}
 		}
+
+		nodesByVolumeId[volumeId] = instanceIds
+
+		if gceCS.multiZoneVolumeHandleConfig.Enable {
+			if multiZoneVolumeId, isMultiZone := isMultiZoneDisk(volumeId, d.Labels); isMultiZone {
+				multiZoneVolumeIdsByVolumeId[volumeId] = multiZoneVolumeId
+				nodesByVolumeId[multiZoneVolumeId] = append(nodesByVolumeId[multiZoneVolumeId], instanceIds...)
+			}
+		}
+	}
+
+	entries := []*csi.ListVolumesResponse_Entry{}
+	for _, instance := range instances {
+		instanceId, err := getResourceId(instance.SelfLink)
+		if err != nil {
+			klog.Warningf("Bad ListVolumes instance resource %s, skipped: %v (%+v)", instance.SelfLink, err, instance)
+			continue
+		}
+		for _, disk := range instance.Disks {
+			volumeId, err := getResourceId(disk.Source)
+			if err != nil {
+				klog.Warningf("Bad ListVolumes instance disk source %s, skipped: %v (%+v)", disk.Source, err, instance)
+				continue
+			}
+
+			nodesByVolumeId[volumeId] = append(nodesByVolumeId[volumeId], instanceId)
+			if multiZoneVolumeId, isMultiZone := multiZoneVolumeIdsByVolumeId[volumeId]; isMultiZone {
+				nodesByVolumeId[multiZoneVolumeId] = append(nodesByVolumeId[multiZoneVolumeId], instanceId)
+			}
+		}
+	}
+
+	for volumeId, nodeIds := range nodesByVolumeId {
 		entries = append(entries, &csi.ListVolumesResponse_Entry{
 			Volume: &csi.Volume{
-				VolumeId: diskRsrc,
+				VolumeId: volumeId,
 			},
 			Status: &csi.ListVolumesResponse_VolumeStatus{
-				PublishedNodeIds: users,
+				PublishedNodeIds: nodeIds,
 			},
 		})
 	}
-
-	nextToken := ""
-	if len(entries)+offset < len(gceCS.disks) {
-		nextToken = string(uuid.NewUUID())
-		gceCS.seen[nextToken] = len(entries) + offset
-	}
-
-	return &csi.ListVolumesResponse{
-		Entries:   entries,
-		NextToken: nextToken,
-	}, nil
+	return entries
 }
 
 func (gceCS *GCEControllerServer) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest) (*csi.GetCapacityResponse, error) {
@@ -976,6 +1453,11 @@ func (gceCS *GCEControllerServer) CreateSnapshot(ctx context.Context, req *csi.C
 		return nil, status.Errorf(codes.InvalidArgument, "CreateSnapshot Volume ID is invalid: %v", err.Error())
 	}
 
+	volumeIsMultiZone := isMultiZoneVolKey(volKey)
+	if gceCS.multiZoneVolumeHandleConfig.Enable && volumeIsMultiZone {
+		return nil, status.Errorf(codes.InvalidArgument, "CreateSnapshot for volume %v failed. Snapshots are not supported with the multi-zone PV volumeHandle feature", volumeID)
+	}
+
 	if acquired := gceCS.volumeLocks.TryAcquire(volumeID); !acquired {
 		return nil, status.Errorf(codes.Aborted, common.VolumeOperationAlreadyExistsFmt, volumeID)
 	}
@@ -991,7 +1473,7 @@ func (gceCS *GCEControllerServer) CreateSnapshot(ctx context.Context, req *csi.C
 		return nil, common.LoggedError("CreateSnapshot, failed to getDisk: ", err)
 	}
 
-	snapshotParams, err := common.ExtractAndDefaultSnapshotParameters(req.GetParameters(), gceCS.Driver.name)
+	snapshotParams, err := common.ExtractAndDefaultSnapshotParameters(req.GetParameters(), gceCS.Driver.name, gceCS.Driver.extraTags)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "Invalid snapshot parameters: %v", err.Error())
 	}
@@ -1021,6 +1503,7 @@ func (gceCS *GCEControllerServer) createPDSnapshot(ctx context.Context, project 
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "Invalid volume key: %v", volKey)
 	}
+
 	// Check if PD snapshot already exists
 	var snapshot *compute.Snapshot
 	snapshot, err = gceCS.CloudProvider.GetSnapshot(ctx, project, snapshotName)
@@ -1300,6 +1783,7 @@ func (gceCS *GCEControllerServer) ListSnapshots(ctx context.Context, req *csi.Li
 }
 
 func (gceCS *GCEControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
+
 	var err error
 	diskTypeForMetric := metrics.DefaultDiskTypeForMetric
 	enableConfidentialCompute := metrics.DefaultEnableConfidentialCompute
@@ -1322,12 +1806,19 @@ func (gceCS *GCEControllerServer) ControllerExpandVolume(ctx context.Context, re
 		return nil, status.Errorf(codes.InvalidArgument, "ControllerExpandVolume Volume ID is invalid: %v", err.Error())
 	}
 	project, volKey, err = gceCS.CloudProvider.RepairUnderspecifiedVolumeKey(ctx, project, volKey)
+
 	if err != nil {
 		if gce.IsGCENotFoundError(err) {
 			return nil, status.Errorf(codes.NotFound, "ControllerExpandVolume could not find volume with ID %v: %v", volumeID, err.Error())
 		}
 		return nil, common.LoggedError("ControllerExpandVolume error repairing underspecified volume key: ", err)
 	}
+
+	volumeIsMultiZone := isMultiZoneVolKey(volKey)
+	if gceCS.multiZoneVolumeHandleConfig.Enable && volumeIsMultiZone {
+		return nil, status.Errorf(codes.InvalidArgument, "ControllerExpandVolume is not supported with the multi-zone PVC volumeHandle feature. Please re-create the volume %v from source if you want a larger size", volumeID)
+	}
+
 	sourceDisk, err := gceCS.CloudProvider.GetDisk(ctx, project, volKey, gce.GCEAPIVersionV1)
 	diskTypeForMetric, enableConfidentialCompute, enableStoragePools = metrics.GetMetricParameters(sourceDisk)
 	resizedGb, err := gceCS.CloudProvider.ResizeDisk(ctx, project, volKey, reqBytes)
@@ -1710,7 +2201,7 @@ func (gceCS *GCEControllerServer) pickZones(ctx context.Context, top *csi.Topolo
 			existingZones = []string{locationTopReq.srcVolZone}
 		}
 		// If topology is nil, then the Immediate binding mode was used without setting allowedTopologies in the storageclass.
-		zones, err = getDefaultZonesInRegion(ctx, gceCS, existingZones, numZones)
+		zones, err = getNumDefaultZonesInRegion(ctx, gceCS, existingZones, numZones)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get default %v zones in region: %w", numZones, err)
 		}
@@ -1720,15 +2211,23 @@ func (gceCS *GCEControllerServer) pickZones(ctx context.Context, top *csi.Topolo
 	return zones, nil
 }
 
-func getDefaultZonesInRegion(ctx context.Context, gceCS *GCEControllerServer, existingZones []string, numZones int) ([]string, error) {
+func getDefaultZonesInRegion(ctx context.Context, gceCS *GCEControllerServer, existingZones []string) ([]string, error) {
 	region, err := common.GetRegionFromZones(existingZones)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get region from zones: %w", err)
 	}
-	needToGet := numZones - len(existingZones)
 	totZones, err := gceCS.CloudProvider.ListZones(ctx, region)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list zones from cloud provider: %w", err)
+	}
+	return totZones, nil
+}
+
+func getNumDefaultZonesInRegion(ctx context.Context, gceCS *GCEControllerServer, existingZones []string, numZones int) ([]string, error) {
+	needToGet := numZones - len(existingZones)
+	totZones, err := getDefaultZonesInRegion(ctx, gceCS, existingZones)
+	if err != nil {
+		return nil, err
 	}
 	remainingZones := sets.NewString(totZones...).Difference(sets.NewString(existingZones...))
 	l := remainingZones.List()
@@ -1771,12 +2270,7 @@ func extractVolumeContext(context map[string]string) (*PDCSIContext, error) {
 	return info, nil
 }
 
-func generateCreateVolumeResponse(disk *gce.CloudDisk, zones []string, params common.DiskParameters) (*csi.CreateVolumeResponse, error) {
-	volumeId, err := getResourceId(disk.GetSelfLink())
-	if err != nil {
-		return nil, fmt.Errorf("cannot get volume id from %s: %w", disk.GetSelfLink(), err)
-	}
-
+func generateCreateVolumeResponseWithVolumeId(disk *gce.CloudDisk, zones []string, params common.DiskParameters, volumeId string) *csi.CreateVolumeResponse {
 	tops := []*csi.Topology{}
 	for _, zone := range zones {
 		tops = append(tops, &csi.Topology{
@@ -1826,7 +2320,7 @@ func generateCreateVolumeResponse(disk *gce.CloudDisk, zones []string, params co
 		}
 		createResp.Volume.ContentSource = contentSource
 	}
-	return createResp, nil
+	return createResp
 }
 
 func getResourceId(resourceLink string) (string, error) {
@@ -1858,7 +2352,7 @@ func getResourceId(resourceLink string) (string, error) {
 	return strings.Join(elts[3:], "/"), nil
 }
 
-func createRegionalDisk(ctx context.Context, cloudProvider gce.GCECompute, name string, zones []string, params common.DiskParameters, capacityRange *csi.CapacityRange, capBytes int64, snapshotID string, volumeContentSourceVolumeID string, multiWriter bool) (*gce.CloudDisk, error) {
+func createRegionalDisk(ctx context.Context, cloudProvider gce.GCECompute, name string, zones []string, params common.DiskParameters, capacityRange *csi.CapacityRange, capBytes int64, snapshotID string, volumeContentSourceVolumeID string, multiWriter bool, accessMode string) (*gce.CloudDisk, error) {
 	project := cloudProvider.GetDefaultProject()
 	region, err := common.GetRegionFromZones(zones)
 	if err != nil {
@@ -1871,7 +2365,7 @@ func createRegionalDisk(ctx context.Context, cloudProvider gce.GCECompute, name 
 			fullyQualifiedReplicaZones, cloudProvider.GetReplicaZoneURI(project, replicaZone))
 	}
 
-	err = cloudProvider.InsertDisk(ctx, project, meta.RegionalKey(name, region), params, capBytes, capacityRange, fullyQualifiedReplicaZones, snapshotID, volumeContentSourceVolumeID, multiWriter)
+	err = cloudProvider.InsertDisk(ctx, project, meta.RegionalKey(name, region), params, capBytes, capacityRange, fullyQualifiedReplicaZones, snapshotID, volumeContentSourceVolumeID, multiWriter, accessMode)
 	if err != nil {
 		return nil, fmt.Errorf("failed to insert regional disk: %w", err)
 	}
@@ -1883,18 +2377,18 @@ func createRegionalDisk(ctx context.Context, cloudProvider gce.GCECompute, name 
 	// failed to GetDisk, however the Disk may already be created, the error code should be non-Final
 	disk, err := cloudProvider.GetDisk(ctx, project, meta.RegionalKey(name, region), gceAPIVersion)
 	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "failed to get disk after creating regional disk: %v", err.Error())
+		return nil, common.NewTemporaryError(codes.Unavailable, fmt.Errorf("failed to get disk after creating regional disk: %w", err))
 	}
 	return disk, nil
 }
 
-func createSingleZoneDisk(ctx context.Context, cloudProvider gce.GCECompute, name string, zones []string, params common.DiskParameters, capacityRange *csi.CapacityRange, capBytes int64, snapshotID string, volumeContentSourceVolumeID string, multiWriter bool) (*gce.CloudDisk, error) {
+func createSingleZoneDisk(ctx context.Context, cloudProvider gce.GCECompute, name string, zones []string, params common.DiskParameters, capacityRange *csi.CapacityRange, capBytes int64, snapshotID string, volumeContentSourceVolumeID string, multiWriter bool, accessMode string) (*gce.CloudDisk, error) {
 	project := cloudProvider.GetDefaultProject()
 	if len(zones) != 1 {
 		return nil, fmt.Errorf("got wrong number of zones for zonal create volume: %v", len(zones))
 	}
 	diskZone := zones[0]
-	err := cloudProvider.InsertDisk(ctx, project, meta.ZonalKey(name, diskZone), params, capBytes, capacityRange, nil, snapshotID, volumeContentSourceVolumeID, multiWriter)
+	err := cloudProvider.InsertDisk(ctx, project, meta.ZonalKey(name, diskZone), params, capBytes, capacityRange, nil, snapshotID, volumeContentSourceVolumeID, multiWriter, accessMode)
 	if err != nil {
 		return nil, fmt.Errorf("failed to insert zonal disk: %w", err)
 	}
@@ -1906,7 +2400,7 @@ func createSingleZoneDisk(ctx context.Context, cloudProvider gce.GCECompute, nam
 	// failed to GetDisk, however the Disk may already be created, the error code should be non-Final
 	disk, err := cloudProvider.GetDisk(ctx, project, meta.ZonalKey(name, diskZone), gceAPIVersion)
 	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "failed to get disk after creating zonal disk: %v", err.Error())
+		return nil, common.NewTemporaryError(codes.Unavailable, fmt.Errorf("failed to get disk after creating zonal disk: %w", err))
 	}
 	return disk, nil
 }

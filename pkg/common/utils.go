@@ -22,9 +22,13 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/GoogleCloudPlatform/k8s-cloud-provider/pkg/cloud/meta"
+	"github.com/googleapis/gax-go/v2/apierror"
+	"golang.org/x/time/rate"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -70,6 +74,10 @@ const (
 	// Full or partial URL of the machine type resource, in the format:
 	//   zones/zone/machineTypes/machine-type
 	machineTypePattern = "zones/[^/]+/machineTypes/([^/]+)$"
+
+	// Full or partial URL of the zone resource, in the format:
+	//   projects/{project}/zones/{zone}
+	zoneURIPattern = "projects/[^/]+/zones/([^/]+)$"
 )
 
 var (
@@ -82,6 +90,8 @@ var (
 
 	storagePoolFieldsRegex = regexp.MustCompile(`^projects/([^/]+)/zones/([^/]+)/storagePools/([^/]+)$`)
 
+	zoneURIRegex = regexp.MustCompile(zoneURIPattern)
+
 	// userErrorCodeMap tells how API error types are translated to error codes.
 	userErrorCodeMap = map[int]codes.Code{
 		http.StatusForbidden:       codes.PermissionDenied,
@@ -89,6 +99,13 @@ var (
 		http.StatusTooManyRequests: codes.ResourceExhausted,
 		http.StatusNotFound:        codes.NotFound,
 	}
+
+	// Regular expressions for validating parent_id, key and value of a resource tag.
+	regexParent = regexp.MustCompile(`(^[1-9][0-9]{0,31}$)|(^[a-z][a-z0-9-]{4,28}[a-z0-9]$)`)
+	regexKey    = regexp.MustCompile(`^[a-zA-Z0-9]([0-9A-Za-z_.-]{0,61}[a-zA-Z0-9])?$`)
+	regexValue  = regexp.MustCompile(`^[a-zA-Z0-9]([0-9A-Za-z_.@%=+:,*#&()\[\]{}\-\s]{0,61}[a-zA-Z0-9])?$`)
+
+	csiRetryableErrorCodes = []codes.Code{codes.Canceled, codes.DeadlineExceeded, codes.Unavailable, codes.Aborted, codes.ResourceExhausted}
 )
 
 func BytesToGbRoundDown(bytes int64) int64 {
@@ -257,6 +274,86 @@ func ConvertLabelsStringToMap(labels string) (map[string]string, error) {
 	return labelsMap, nil
 }
 
+// ConvertTagsStringToMap converts the tags from string to Tag slice
+// example: "parent_id1/tag_key1/tag_value1,parent_id2/tag_key2/tag_value2" gets
+// converted into {"parent_id1/tag_key1":"tag_value1", "parent_id2/tag_key2":"tag_value2"}
+// See https://cloud.google.com/resource-manager/docs/tags/tags-overview,
+// https://cloud.google.com/resource-manager/docs/tags/tags-creating-and-managing for details
+func ConvertTagsStringToMap(tags string) (map[string]string, error) {
+	const tagsDelimiter = ","
+	const tagsParentIDKeyValueDelimiter = "/"
+
+	tagsMap := make(map[string]string)
+	if tags == "" {
+		return nil, nil
+	}
+
+	checkTagParentIDFn := func(tag, parentID string) error {
+		if !regexParent.MatchString(parentID) {
+			return fmt.Errorf("tag parent_id %q for tag %q is invalid. parent_id can have a maximum of 32 characters and cannot be empty. parent_id can be either OrganizationID or ProjectID. OrganizationID must consist of decimal numbers, and cannot have leading zeroes and ProjectID must be 6 to 30 characters in length, can only contain lowercase letters, numbers, and hyphens, and must start with a letter, and cannot end with a hyphen", parentID, tag)
+		}
+		return nil
+	}
+
+	checkTagKeyFn := func(tag, key string) error {
+		if !regexKey.MatchString(key) {
+			return fmt.Errorf("tag key %q for tag %q is invalid. Tag key can have a maximum of 63 characters and cannot be empty. Tag key must begin and end with an alphanumeric character, and must contain only uppercase, lowercase alphanumeric characters, and the following special characters `._-`", key, tag)
+		}
+		return nil
+	}
+
+	checkTagValueFn := func(tag, value string) error {
+		if !regexValue.MatchString(value) {
+			return fmt.Errorf("tag value %q for tag %q is invalid. Tag value can have a maximum of 63 characters and cannot be empty. Tag value must begin and end with an alphanumeric character, and must contain only uppercase, lowercase alphanumeric characters, and the following special characters `_-.@%%=+:,*#&(){}[]` and spaces", value, tag)
+		}
+
+		return nil
+	}
+
+	checkTagParentIDKey := sets.String{}
+	parentIDkeyValueStrings := strings.Split(tags, tagsDelimiter)
+	for _, parentIDkeyValueString := range parentIDkeyValueStrings {
+		parentIDKeyValue := strings.Split(parentIDkeyValueString, tagsParentIDKeyValueDelimiter)
+
+		if len(parentIDKeyValue) != 3 {
+			return nil, fmt.Errorf("tag %q is invalid, correct format: 'parent_id1/key1/value1,parent_id2/key2/value2'", parentIDkeyValueString)
+		}
+
+		parentID := strings.TrimSpace(parentIDKeyValue[0])
+		if err := checkTagParentIDFn(parentIDkeyValueString, parentID); err != nil {
+			return nil, err
+		}
+
+		key := strings.TrimSpace(parentIDKeyValue[1])
+		if err := checkTagKeyFn(parentIDkeyValueString, key); err != nil {
+			return nil, err
+		}
+
+		value := strings.TrimSpace(parentIDKeyValue[2])
+		if err := checkTagValueFn(parentIDkeyValueString, value); err != nil {
+			return nil, err
+		}
+
+		parentIDKeyStr := fmt.Sprintf("%s/%s", parentID, key)
+		if checkTagParentIDKey.Has(parentIDKeyStr) {
+			return nil, fmt.Errorf("tag parent_id & key combination %q exists more than once", parentIDKeyStr)
+		}
+		checkTagParentIDKey.Insert(parentIDKeyStr)
+
+		tagsMap[parentIDKeyStr] = value
+	}
+
+	// The maximum number of tags allowed per resource is 50. For more details check the following:
+	// https://cloud.google.com/resource-manager/docs/tags/tags-creating-and-managing#attaching
+	// https://cloud.google.com/resource-manager/docs/limits#tag-limits
+	const maxNumberOfTags = 50
+	if len(tagsMap) > maxNumberOfTags {
+		return nil, fmt.Errorf("more than %d tags is not allowed, given: %d", maxNumberOfTags, len(tagsMap))
+	}
+
+	return tagsMap, nil
+}
+
 // ProcessStorageLocations trims and normalizes storage location to lower letters.
 func ProcessStorageLocations(storageLocations string) ([]string, error) {
 	normalizedLoc := strings.ToLower(strings.TrimSpace(storageLocations))
@@ -336,7 +433,6 @@ func CodeForError(sourceError error) codes.Code {
 	if sourceError == nil {
 		return codes.Internal
 	}
-
 	if code, err := isUserMultiAttachError(sourceError); err == nil {
 		return code
 	}
@@ -346,12 +442,10 @@ func CodeForError(sourceError error) codes.Code {
 	if code, err := isContextError(sourceError); err == nil {
 		return code
 	}
-
-	var apiErr *googleapi.Error
-	if !errors.As(sourceError, &apiErr) {
-		return codes.Internal
+	if code, err := isConnectionResetError(sourceError); err == nil {
+		return code
 	}
-	if code, ok := userErrorCodeMap[apiErr.Code]; ok {
+	if code, err := isGoogleAPIError(sourceError); err == nil {
 		return code
 	}
 
@@ -377,6 +471,20 @@ func isContextError(err error) (codes.Code, error) {
 	return codes.Unknown, fmt.Errorf("Not a context error: %w", err)
 }
 
+// isConnectionResetError returns the grpc error code Unavailable if the
+// passed in error contains the "connection reset by peer" string.
+func isConnectionResetError(err error) (codes.Code, error) {
+	if err == nil {
+		return codes.Unknown, fmt.Errorf("null error")
+	}
+
+	errStr := err.Error()
+	if strings.Contains(errStr, "connection reset by peer") {
+		return codes.Unavailable, nil
+	}
+	return codes.Unknown, fmt.Errorf("Not a connection reset error: %w", err)
+}
+
 // isUserMultiAttachError returns an InvalidArgument if the error is
 // multi-attach detected from the API server. If we get this error from the API
 // server, it means that the kubelet doesn't know about the multiattch so it is
@@ -388,25 +496,109 @@ func isUserMultiAttachError(err error) (codes.Code, error) {
 	return codes.Unknown, fmt.Errorf("Not a user multiattach error: %w", err)
 }
 
+// existingErrorCode returns the existing gRPC Status error code for the given error, if one exists,
+// or an error if one doesn't exist. Since github.com/googleapis/gax-go/v2/apierror now wraps googleapi
+// errors (returned from GCE API calls), and sets their status error code to Unknown, we now have to
+// make sure we only return existing error codes from errors that are either TemporaryErrors, or errors
+// that do not wrap googleAPI errors. Otherwise, we will return Unknown for all GCE API calls that
+// return googleapi errors.
 func existingErrorCode(err error) (codes.Code, error) {
 	if err == nil {
 		return codes.Unknown, fmt.Errorf("null error")
 	}
-	if status, ok := status.FromError(err); ok {
-		return status.Code(), nil
+	var tmpError *TemporaryError
+	// This explicitly checks our error is a temporary error before extracting its
+	// status, as there can be other errors that can qualify as statusable
+	// while not necessarily being temporary.
+	if errors.As(err, &tmpError) {
+		if status, ok := status.FromError(err); ok {
+			return status.Code(), nil
+		}
 	}
+	// We want to make sure we catch other error types that are statusable.
+	// (eg. grpc-go/internal/status/status.go Error struct that wraps a status)
+	var googleErr *googleapi.Error
+	if !errors.As(err, &googleErr) {
+		if status, ok := status.FromError(err); ok {
+			return status.Code(), nil
+		}
+	}
+
 	return codes.Unknown, fmt.Errorf("no existing error code for %w", err)
 }
 
-func LoggedError(msg string, err error) error {
+// isGoogleAPIError returns the gRPC status code for the given googleapi error by mapping
+// the googleapi error's HTTP code to the corresponding gRPC error code. If the error is
+// wrapped in an APIError (github.com/googleapis/gax-go/v2/apierror), it maps the wrapped
+// googleAPI error's HTTP code to the corresponding gRPC error code. Returns an error if
+// the given error is not a googleapi error.
+func isGoogleAPIError(err error) (codes.Code, error) {
+	var googleErr *googleapi.Error
+	if !errors.As(err, &googleErr) {
+		return codes.Unknown, fmt.Errorf("error %w is not a googleapi.Error", err)
+	}
+	var sourceCode int
+	var apiErr *apierror.APIError
+	if errors.As(err, &apiErr) {
+		// When googleapi.Err is used as a wrapper, we return the error code of the wrapped contents.
+		sourceCode = apiErr.HTTPCode()
+	} else {
+		// Rely on error code in googleapi.Err when it is our primary error.
+		sourceCode = googleErr.Code
+	}
+	// Map API error code to user error code.
+	if code, ok := userErrorCodeMap[sourceCode]; ok {
+		return code, nil
+	}
+
+	return codes.Unknown, fmt.Errorf("googleapi.Error %w does not map to any known errors", err)
+}
+
+func loggedErrorForCode(msg string, code codes.Code, err error) error {
 	klog.Errorf(msg+"%v", err.Error())
-	return status.Errorf(CodeForError(err), msg+"%v", err.Error())
+	return status.Errorf(code, msg+"%v", err.Error())
+}
+
+func LoggedError(msg string, err error) error {
+	return loggedErrorForCode(msg, CodeForError(err), err)
+}
+
+// NewCombinedError tries to return an appropriate wrapped error that captures
+// useful information as an error code
+// If there are multiple errors, it extracts the first "retryable" error
+// as interpreted by the CSI sidecar.
+func NewCombinedError(msg string, errs []error) error {
+	// If there is only one error, return it as the single error code
+	if len(errs) == 1 {
+		LoggedError(msg, errs[0])
+	}
+
+	for _, err := range errs {
+		code := CodeForError(err)
+		if slices.Contains(csiRetryableErrorCodes, code) {
+			// Return this as a TemporaryError to lock-in the retryable code
+			// This will invoke the "existing" error code check in CodeForError
+			return NewTemporaryError(code, fmt.Errorf("%s: %w", msg, err))
+		}
+	}
+
+	// None of these error codes were retryable. Just return a combined error
+	// The first matching error (based on our CodeForError) logic will be returned.
+	return LoggedError(msg, errors.Join(errs...))
 }
 
 func isValidDiskEncryptionKmsKey(DiskEncryptionKmsKey string) bool {
 	// Validate key against default kmskey pattern
 	kmsKeyPattern := regexp.MustCompile("projects/[^/]+/locations/([^/]+)/keyRings/[^/]+/cryptoKeys/[^/]+")
 	return kmsKeyPattern.MatchString(DiskEncryptionKmsKey)
+}
+
+func ParseZoneFromURI(zoneURI string) (string, error) {
+	zoneMatch := zoneURIRegex.FindStringSubmatch(zoneURI)
+	if zoneMatch == nil {
+		return "", fmt.Errorf("failed to parse zone URI. Expected projects/{project}/zones/{zone}. Got: %s", zoneURI)
+	}
+	return zoneMatch[1], nil
 }
 
 // ParseStoragePools returns an error if none of the given storagePools
@@ -477,4 +669,29 @@ func UnorderedSlicesEqual(slice1 []string, slice2 []string) bool {
 		return false
 	}
 	return true
+}
+
+func VolumeIdAsMultiZone(volumeId string) (string, error) {
+	splitId := strings.Split(volumeId, "/")
+	if len(splitId) != volIDTotalElements {
+		return "", fmt.Errorf("failed to get id components. Expected projects/{project}/zones/{zone}/disks/{name}. Got: %s", volumeId)
+	}
+	if splitId[volIDToplogyKey] != "zones" {
+		return "", fmt.Errorf("expected id to be zonal. Got: %s", volumeId)
+	}
+	splitId[volIDToplogyValue] = MultiZoneValue
+	return strings.Join(splitId, "/"), nil
+}
+
+// NewLimiter returns a token bucket based request rate limiter after initializing
+// the passed values for limit, burst (or token bucket) size. If opted for emptyBucket
+// all initial tokens are reserved for the first burst.
+func NewLimiter(limit, burst int, emptyBucket bool) *rate.Limiter {
+	limiter := rate.NewLimiter(rate.Every(time.Second/time.Duration(limit)), burst)
+
+	if emptyBucket {
+		limiter.AllowN(time.Now(), burst)
+	}
+
+	return limiter
 }

@@ -22,10 +22,12 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"syscall"
 	"testing"
 
 	"github.com/GoogleCloudPlatform/k8s-cloud-provider/pkg/cloud/meta"
 	"github.com/google/go-cmp/cmp"
+	"github.com/googleapis/gax-go/v2/apierror"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -542,6 +544,235 @@ func TestConvertLabelsStringToMap(t *testing.T) {
 
 }
 
+func TestConvertTagsStringToMap(t *testing.T) {
+	t.Run("parsing tags string into slice", func(t *testing.T) {
+		testCases := []struct {
+			name           string
+			tags           string
+			expectedOutput map[string]string
+			expectedError  bool
+		}{
+			{
+				name:           "should return empty slice when tags string is empty",
+				tags:           "",
+				expectedOutput: nil,
+				expectedError:  false,
+			},
+			{
+				name:           "single tag string",
+				tags:           "parent/key/value",
+				expectedOutput: map[string]string{"parent/key": "value"},
+				expectedError:  false,
+			},
+			{
+				name:           "multiple tag string",
+				tags:           "parent1/key1/value1,parent2/key2/value2",
+				expectedOutput: map[string]string{"parent1/key1": "value1", "parent2/key2": "value2"},
+				expectedError:  false,
+			},
+			{
+				name:           "multiple tags string with whitespaces gets trimmed",
+				tags:           "parent1/key1/value1, parent2/key2/value2",
+				expectedOutput: map[string]string{"parent1/key1": "value1", "parent2/key2": "value2"},
+				expectedError:  false,
+			},
+			{
+				name:           "malformed tags string (no parent_ids, keys and values)",
+				tags:           ",,",
+				expectedOutput: nil,
+				expectedError:  true,
+			},
+			{
+				name:           "malformed tags string (incorrect format)",
+				tags:           "foo,bar",
+				expectedOutput: nil,
+				expectedError:  true,
+			},
+			{
+				name:           "malformed tags string (missing parent_id)",
+				tags:           "parent1/key1/value1,/key2/value2",
+				expectedOutput: nil,
+				expectedError:  true,
+			},
+			{
+				name:           "malformed tags string (missing key)",
+				tags:           "parent1//value1,parent2/key2/value2",
+				expectedOutput: nil,
+				expectedError:  true,
+			},
+			{
+				name:           "malformed tags string (missing value)",
+				tags:           "parent1/key1/value1,parent2/key2/",
+				expectedOutput: nil,
+				expectedError:  true,
+			},
+			{
+				name:           "same tag parent_id, key and value string used more than once",
+				tags:           "parent1/key1/value1,parent1/key1/value1",
+				expectedOutput: nil,
+				expectedError:  true,
+			},
+			{
+				name:           "same tag parent_id & key string used more than once",
+				tags:           "parent1/key1/value1,parent1/key1/value2",
+				expectedOutput: nil,
+				expectedError:  true,
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Logf("test case: %s", tc.name)
+			output, err := ConvertTagsStringToMap(tc.tags)
+			if tc.expectedError && err == nil {
+				t.Errorf("Expected error but got none")
+			}
+
+			if !tc.expectedError && err != nil {
+				t.Errorf("Did not expect error but got: %v", err)
+			}
+
+			if err == nil && !reflect.DeepEqual(output, tc.expectedOutput) {
+				t.Errorf("Got tags %v, but expected %v", output, tc.expectedOutput)
+			}
+		}
+	})
+
+	t.Run("checking google requirements", func(t *testing.T) {
+		testCases := []struct {
+			name          string
+			tags          string
+			expectedError bool
+		}{
+			{
+				name: "50 tags at most",
+				tags: `p1/k/v,p2/k/v,p3/k/v,p4/k/v,p5/k/v,p6/k/v,p7/k/v,p8/k/v,p9/k/v,p10/k/v,p11/k/v,p12/k/v,p13/k/v,p14/k/v,p15/k/v,p16/k/v,p17/k/v,
+						 p18/k/v,p19/k/v,p20/k/v,p21/k/v,p22/k/v,p23/k/v,p24/k/v,p25/k/v,p26/k/v,p27/k/v,p28/k/v,p29/k/v,p30/k/v,p31/k/v,p32/k/v,p33/k/v,
+						 p34/k/v,p35/k/v,p36/k/v,p37/k/v,p38/k/v,p39/k/v,p40/k/v,p41/k/v,p42/k/v,p43/k/v,p44/k/v,p45/k/v,p46/k/v,p47/k/v,p48/k/v,p49/k/v,
+						 p50/k/v,p51/k/v`,
+				expectedError: true,
+			},
+			{
+				name:          "tag parent_id must start with non-zero decimal when OrganizationID is used (leading zeroes case)",
+				tags:          "01/k/v",
+				expectedError: true,
+			},
+			{
+				name:          "tag parent_id may not have more than 32 characters when OrganizationID is used",
+				tags:          "123546789012345678901234567890123/k/v",
+				expectedError: true,
+			},
+			{
+				name:          "tag parent_id can have decimal characters when OrganizationID is used",
+				tags:          "1234567890/k/v",
+				expectedError: false,
+			},
+			{
+				name:          "tag parent_id may not have less than 6 characters when ProjectID is used",
+				tags:          "abcde/k/v",
+				expectedError: true,
+			},
+			{
+				name:          "tag parent_id must start with lowercase char when ProjectID is used (decimal case)",
+				tags:          "1parent/k/v",
+				expectedError: true,
+			},
+			{
+				name:          "tag parent_id must start with lowercase char when ProjectID is used (- case)",
+				tags:          "-parent/k/v",
+				expectedError: true,
+			},
+			{
+				name:          "tag parent_id must end with lowercase alphanumeric char when ProjectID is used (- case)",
+				tags:          "parent-/k/v",
+				expectedError: true,
+			},
+			{
+				name:          "tag parent_id may not have more than 30 characters when ProjectID is used",
+				tags:          "abcdefghijklmnopqrstuvwxyz12345/k/v",
+				expectedError: true,
+			},
+			{
+				name:          "tag parent_id can contain lowercase alphanumeric characters and hyphens when ProjectID is used",
+				tags:          "parent-id-100/k/v",
+				expectedError: false,
+			},
+			{
+				name:          "tag key must start with alphanumeric char (. case)",
+				tags:          "parent/.k/v",
+				expectedError: true,
+			},
+			{
+				name:          "tag key must start with alphanumeric char (_ case)",
+				tags:          "parent/_k/v",
+				expectedError: true,
+			},
+			{
+				name:          "tag key must start with alphanumeric char (- case)",
+				tags:          "parent/-k/v",
+				expectedError: true,
+			},
+			{
+				name:          "tag key can only contain uppercase, lowercase alphanumeric characters, and the following special characters '._-'",
+				tags:          "parent/k*/v",
+				expectedError: true,
+			},
+			{
+				name:          "tag key may not have over 63 characters",
+				tags:          "parent/abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij1234/v",
+				expectedError: true,
+			},
+			{
+				name:          "tag key can contain uppercase, lowercase alphanumeric characters, and the following special characters '._-'",
+				tags:          "parent/Type_of.cloud-platform/v",
+				expectedError: false,
+			},
+			{
+				name:          "tag value must start with alphanumeric char (. case)",
+				tags:          "parent/k/.v",
+				expectedError: true,
+			},
+			{
+				name:          "tag value must start with alphanumeric char (_ case)",
+				tags:          "parent/k/_v",
+				expectedError: true,
+			},
+			{
+				name:          "tag value must start with alphanumeric char (- case)",
+				tags:          "parent/k/-v",
+				expectedError: true,
+			},
+			{
+				name:          "tag value can only contain uppercase, lowercase alphanumeric characters, and the following special characters `_-.@%%=+:,*#&(){}[]` and spaces",
+				tags:          "parent/k/v*",
+				expectedError: true,
+			},
+			{
+				name:          "tag value may not have over 63 characters",
+				tags:          "parent/k/abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij1234",
+				expectedError: true,
+			},
+			{
+				name:          "tag key can contain uppercase, lowercase alphanumeric characters, and the following special characters `_-.@%%=+:,*#&(){}[]` and spaces",
+				tags:          "parent/k/Special@value[10]{20}(30)-example",
+				expectedError: false,
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Logf("test case: %s", tc.name)
+			_, err := ConvertTagsStringToMap(tc.tags)
+
+			if tc.expectedError && err == nil {
+				t.Errorf("Expected error but got none")
+			}
+
+			if !tc.expectedError && err != nil {
+				t.Errorf("Did not expect error but got: %v", err)
+			}
+		}
+	})
+}
+
 func TestSnapshotStorageLocations(t *testing.T) {
 	tests := []struct {
 		desc                        string
@@ -976,6 +1207,17 @@ func TestParseMachineType(t *testing.T) {
 }
 
 func TestCodeForError(t *testing.T) {
+	getGoogleAPIWrappedError := func(err error) *googleapi.Error {
+		apierr, _ := apierror.ParseError(err, false)
+		wrappedError := &googleapi.Error{}
+		wrappedError.Wrap(apierr)
+
+		return wrappedError
+	}
+	getAPIError := func(err error) *apierror.APIError {
+		apierror, _ := apierror.ParseError(err, true)
+		return apierror
+	}
 	testCases := []struct {
 		name     string
 		inputErr error
@@ -990,6 +1232,36 @@ func TestCodeForError(t *testing.T) {
 			name:     "User error",
 			inputErr: &googleapi.Error{Code: http.StatusBadRequest, Message: "User error with bad request"},
 			expCode:  codes.InvalidArgument,
+		},
+		{
+			name: "googleapi.Error that wraps apierror.APIError of http kind",
+			inputErr: getGoogleAPIWrappedError(&googleapi.Error{
+				Code:    404,
+				Message: "data requested not found error",
+			}),
+			expCode: codes.NotFound,
+		},
+		{
+			name: "googleapi.Error that wraps apierror.APIError of status kind",
+			inputErr: getGoogleAPIWrappedError(status.New(
+				codes.Internal, "Internal status error",
+			).Err()),
+			expCode: codes.Internal,
+		},
+		{
+			name: "apierror.APIError of http kind",
+			inputErr: getAPIError(&googleapi.Error{
+				Code:    404,
+				Message: "data requested not found error",
+			}),
+			expCode: codes.NotFound,
+		},
+		{
+			name: "apierror.APIError of status kind",
+			inputErr: getAPIError(status.New(
+				codes.Canceled, "Internal status error",
+			).Err()),
+			expCode: codes.Canceled,
 		},
 		{
 			name:     "googleapi.Error but not a user error",
@@ -1007,6 +1279,16 @@ func TestCodeForError(t *testing.T) {
 			expCode:  codes.DeadlineExceeded,
 		},
 		{
+			name:     "connection reset error",
+			inputErr: fmt.Errorf("failed to getDisk: connection reset by peer"),
+			expCode:  codes.Unavailable,
+		},
+		{
+			name:     "wrapped connection reset error",
+			inputErr: fmt.Errorf("received error: %v", syscall.ECONNRESET),
+			expCode:  codes.Unavailable,
+		},
+		{
 			name:     "status error with Aborted error code",
 			inputErr: status.Error(codes.Aborted, "aborted error"),
 			expCode:  codes.Aborted,
@@ -1020,6 +1302,26 @@ func TestCodeForError(t *testing.T) {
 			name:     "user multiattach error",
 			inputErr: fmt.Errorf("The disk resource 'projects/foo/disk/bar' is already being used by 'projects/foo/instances/1'"),
 			expCode:  codes.InvalidArgument,
+		},
+		{
+			name:     "TemporaryError that wraps googleapi error",
+			inputErr: &TemporaryError{code: codes.Unavailable, err: &googleapi.Error{Code: http.StatusBadRequest, Message: "User error with bad request"}},
+			expCode:  codes.Unavailable,
+		},
+		{
+			name:     "TemporaryError that wraps fmt.Errorf, which wraps googleapi error",
+			inputErr: &TemporaryError{code: codes.Aborted, err: fmt.Errorf("got error: %w", &googleapi.Error{Code: http.StatusBadRequest, Message: "User error with bad request"})},
+			expCode:  codes.Aborted,
+		},
+		{
+			name:     "TemporaryError that wraps status error",
+			inputErr: &TemporaryError{code: codes.Aborted, err: status.Error(codes.Aborted, "aborted error")},
+			expCode:  codes.Aborted,
+		},
+		{
+			name:     "TemporaryError that wraps context canceled error",
+			inputErr: &TemporaryError{code: codes.Aborted, err: context.Canceled},
+			expCode:  codes.Aborted,
 		},
 	}
 
@@ -1342,6 +1644,92 @@ func TestUnorderedSlicesEqual(t *testing.T) {
 			input := fmt.Sprintf("UnorderedSlicesEqual(%v, %v)", tc.slice1, tc.slice2)
 			if diff := cmp.Diff(tc.expectedSlicesEqual, slicesEqual); diff != "" {
 				t.Errorf("%s: -want, +got \n%s", input, diff)
+			}
+		})
+	}
+}
+
+func TestParseZoneFromURI(t *testing.T) {
+	testcases := []struct {
+		name      string
+		zoneURI   string
+		wantZone  string
+		expectErr bool
+	}{
+		{
+			name:     "ParseZoneFromURI_FullURI",
+			zoneURI:  "https://www.googleapis.com/compute/v1/projects/psch-gke-dev/zones/us-east4-a",
+			wantZone: "us-east4-a",
+		},
+		{
+			name:     "ParseZoneFromURI_ProjectZoneString",
+			zoneURI:  "projects/psch-gke-dev/zones/us-east4-a",
+			wantZone: "us-east4-a",
+		},
+		{
+			name:      "ParseZoneFromURI_Malformed",
+			zoneURI:   "projects/psch-gke-dev/regions/us-east4",
+			expectErr: true,
+		},
+	}
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotZone, err := ParseZoneFromURI(tc.zoneURI)
+			if err != nil && !tc.expectErr {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if err == nil && tc.expectErr {
+				t.Fatalf("Expected err, but none was returned. Zone result: %v", gotZone)
+			}
+			if gotZone != tc.wantZone {
+				t.Errorf("ParseZoneFromURI(%v): got %v, want %v", tc.zoneURI, gotZone, tc.wantZone)
+			}
+		})
+	}
+}
+
+func TestNewCombinedError(t *testing.T) {
+	testcases := []struct {
+		name     string
+		errors   []error
+		wantCode codes.Code
+	}{
+		{
+			name:     "single generic error",
+			errors:   []error{fmt.Errorf("my internal error")},
+			wantCode: codes.Internal,
+		},
+		{
+			name:     "single retryable error",
+			errors:   []error{&googleapi.Error{Code: http.StatusTooManyRequests, Message: "Resource Exhausted"}},
+			wantCode: codes.ResourceExhausted,
+		},
+		{
+			name:     "multi generic error",
+			errors:   []error{fmt.Errorf("my internal error"), fmt.Errorf("my other internal error")},
+			wantCode: codes.Internal,
+		},
+		{
+			name:     "multi retryable error",
+			errors:   []error{fmt.Errorf("my internal error"), &googleapi.Error{Code: http.StatusTooManyRequests, Message: "Resource Exhausted"}},
+			wantCode: codes.ResourceExhausted,
+		},
+		{
+			name:     "multi retryable error",
+			errors:   []error{fmt.Errorf("my internal error"), &googleapi.Error{Code: http.StatusGatewayTimeout, Message: "connection reset by peer"}, fmt.Errorf("my other internal error")},
+			wantCode: codes.Unavailable,
+		},
+		{
+			name:     "multi retryable error",
+			errors:   []error{fmt.Errorf("The disk resource is already being used"), &googleapi.Error{Code: http.StatusGatewayTimeout, Message: "connection reset by peer"}},
+			wantCode: codes.Unavailable,
+		},
+	}
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotCode := CodeForError(NewCombinedError("message", tc.errors))
+			if gotCode != tc.wantCode {
+				t.Errorf("NewCombinedError(%v): got %v, want %v", tc.errors, gotCode, tc.wantCode)
 			}
 		})
 	}

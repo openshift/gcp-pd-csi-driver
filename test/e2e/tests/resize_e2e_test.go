@@ -67,14 +67,14 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		}()
 
 		// Attach Disk
-		err = client.ControllerPublishVolume(volume.VolumeId, instance.GetNodeID(), false /* forceAttach */)
+		err = client.ControllerPublishVolumeReadWrite(volume.VolumeId, instance.GetNodeID(), false /* forceAttach */)
 		Expect(err).To(BeNil(), "Controller publish volume failed")
 
 		defer func() {
 			// Detach Disk
 			err = client.ControllerUnpublishVolume(volume.VolumeId, instance.GetNodeID())
 			if err != nil {
-				klog.Errorf("Failed to detach disk: %w", err)
+				klog.Errorf("Failed to detach disk: %v", err)
 			}
 		}()
 
@@ -87,12 +87,12 @@ var _ = Describe("GCE PD CSI Driver", func() {
 			// Unstage Disk
 			err = client.NodeUnstageVolume(volume.VolumeId, stageDir)
 			if err != nil {
-				klog.Errorf("Failed to unstage volume: %w", err)
+				klog.Errorf("Failed to unstage volume: %v", err)
 			}
 			fp := filepath.Join("/tmp/", volName)
 			err = testutils.RmAll(instance, fp)
 			if err != nil {
-				klog.Errorf("Failed to rm file path %s: %w", fp, err)
+				klog.Errorf("Failed to rm file path %s: %v", fp, err)
 			}
 		}()
 
@@ -105,7 +105,7 @@ var _ = Describe("GCE PD CSI Driver", func() {
 			// Unmount Disk
 			err = client.NodeUnpublishVolume(volume.VolumeId, publishDir)
 			if err != nil {
-				klog.Errorf("NodeUnpublishVolume failed with error: %w", err)
+				klog.Errorf("NodeUnpublishVolume failed with error: %v", err)
 			}
 		}()
 
@@ -189,14 +189,14 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		Expect(cloudDisk.SizeGb).To(Equal(newSizeGb))
 
 		// Attach and mount again
-		err = client.ControllerPublishVolume(volume.VolumeId, instance.GetNodeID(), false /* forceAttach */)
+		err = client.ControllerPublishVolumeReadWrite(volume.VolumeId, instance.GetNodeID(), false /* forceAttach */)
 		Expect(err).To(BeNil(), "Controller publish volume failed")
 
 		defer func() {
 			// Detach Disk
 			err = client.ControllerUnpublishVolume(volume.VolumeId, instance.GetNodeID())
 			if err != nil {
-				klog.Errorf("Failed to detach disk: %w", err)
+				klog.Errorf("Failed to detach disk: %v", err)
 			}
 
 		}()
@@ -210,12 +210,12 @@ var _ = Describe("GCE PD CSI Driver", func() {
 			// Unstage Disk
 			err = client.NodeUnstageVolume(volume.VolumeId, stageDir)
 			if err != nil {
-				klog.Errorf("Failed to unstage volume: %w", err)
+				klog.Errorf("Failed to unstage volume: %v", err)
 			}
 			fp := filepath.Join("/tmp/", volName)
 			err = testutils.RmAll(instance, fp)
 			if err != nil {
-				klog.Errorf("Failed to rm file path %s: %w", fp, err)
+				klog.Errorf("Failed to rm file path %s: %v", fp, err)
 			}
 		}()
 
@@ -228,7 +228,7 @@ var _ = Describe("GCE PD CSI Driver", func() {
 			// Unmount Disk
 			err = client.NodeUnpublishVolume(volume.VolumeId, publishDir)
 			if err != nil {
-				klog.Errorf("NodeUnpublishVolume failed with error: %w", err)
+				klog.Errorf("NodeUnpublishVolume failed with error: %v", err)
 			}
 		}()
 
@@ -281,14 +281,14 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		}()
 
 		// Attach Disk
-		err = client.ControllerPublishVolume(volume.VolumeId, instance.GetNodeID(), false /* forceAttach */)
+		err = client.ControllerPublishVolumeReadWrite(volume.VolumeId, instance.GetNodeID(), false /* forceAttach */)
 		Expect(err).To(BeNil(), "Controller publish volume failed")
 
 		defer func() {
 			// Detach Disk
 			err = client.ControllerUnpublishVolume(volume.VolumeId, instance.GetNodeID())
 			if err != nil {
-				klog.Errorf("Failed to detach disk: %w", err)
+				klog.Errorf("Failed to detach disk: %v", err)
 			}
 
 		}()
@@ -302,12 +302,12 @@ var _ = Describe("GCE PD CSI Driver", func() {
 			// Unstage Disk
 			err = client.NodeUnstageVolume(volume.VolumeId, stageDir)
 			if err != nil {
-				klog.Errorf("Failed to unstage volume: %w", err)
+				klog.Errorf("Failed to unstage volume: %v", err)
 			}
 			fp := filepath.Join("/tmp/", volName)
 			err = testutils.RmAll(instance, fp)
 			if err != nil {
-				klog.Errorf("Failed to rm file path %s: %w", fp, err)
+				klog.Errorf("Failed to rm file path %s: %v", fp, err)
 			}
 		}()
 
@@ -320,7 +320,7 @@ var _ = Describe("GCE PD CSI Driver", func() {
 			// Unmount Disk
 			err = client.NodeUnpublishVolume(volume.VolumeId, publishDir)
 			if err != nil {
-				klog.Errorf("NodeUnpublishVolume failed with error: %w", err)
+				klog.Errorf("NodeUnpublishVolume failed with error: %v", err)
 			}
 		}()
 

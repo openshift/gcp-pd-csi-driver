@@ -47,13 +47,17 @@ const (
 	defaultSizeGb                     int64 = 5
 	defaultExtremeSizeGb              int64 = 500
 	defaultHdTSizeGb                  int64 = 2048
+	defaultHdmlSizeGb                 int64 = 200
 	defaultRepdSizeGb                 int64 = 200
 	defaultMwSizeGb                   int64 = 200
 	defaultVolumeLimit                int64 = 127
+	invalidSizeGb                     int64 = 66000
 	readyState                              = "READY"
 	standardDiskType                        = "pd-standard"
+	ssdDiskType                             = "pd-ssd"
 	extremeDiskType                         = "pd-extreme"
 	hdtDiskType                             = "hyperdisk-throughput"
+	hdmlDiskType                            = "hyperdisk-ml"
 	provisionedIOPSOnCreate                 = "12345"
 	provisionedIOPSOnCreateInt              = int64(12345)
 	provisionedIOPSOnCreateDefaultInt       = int64(100000)
@@ -118,14 +122,14 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		}()
 
 		// Attach Disk
-		err := client.ControllerPublishVolume(volID, instance.GetNodeID(), false /* forceAttach */)
+		err := client.ControllerPublishVolumeReadWrite(volID, instance.GetNodeID(), false /* forceAttach */)
 		Expect(err).To(BeNil(), "ControllerPublishVolume failed with error for disk %v on node %v: %v", volID, instance.GetNodeID())
 
 		defer func() {
 			// Detach Disk
 			err = client.ControllerUnpublishVolume(volID, instance.GetNodeID())
 			if err != nil {
-				klog.Errorf("Failed to detach disk: %w", err)
+				klog.Errorf("Failed to detach disk: %v", err)
 			}
 
 		}()
@@ -159,12 +163,12 @@ var _ = Describe("GCE PD CSI Driver", func() {
 			// Unstage Disk
 			err = client.NodeUnstageVolume(volID, stageDir)
 			if err != nil {
-				klog.Errorf("Failed to unstage volume: %w", err)
+				klog.Errorf("Failed to unstage volume: %v", err)
 			}
 			fp := filepath.Join("/tmp/", volName)
 			err = testutils.RmAll(instance, fp)
 			if err != nil {
-				klog.Errorf("Failed to rm file path %s: %w", fp, err)
+				klog.Errorf("Failed to rm file path %s: %v", fp, err)
 			}
 		}()
 	})
@@ -190,14 +194,14 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		}()
 
 		// Attach Disk
-		err := client.ControllerPublishVolume(volID, instance.GetNodeID(), false /* forceAttach */)
+		err := client.ControllerPublishVolumeReadWrite(volID, instance.GetNodeID(), false /* forceAttach */)
 		Expect(err).To(BeNil(), "ControllerPublishVolume failed with error for disk %v on node %v: %v", volID, instance.GetNodeID())
 
 		defer func() {
 			// Detach Disk
 			err = client.ControllerUnpublishVolume(volID, instance.GetNodeID())
 			if err != nil {
-				klog.Errorf("Failed to detach disk: %w", err)
+				klog.Errorf("Failed to detach disk: %v", err)
 			}
 
 		}()
@@ -229,12 +233,12 @@ var _ = Describe("GCE PD CSI Driver", func() {
 			// Unstage Disk
 			err = client.NodeUnstageVolume(volID, stageDir)
 			if err != nil {
-				klog.Errorf("Failed to unstage volume: %w", err)
+				klog.Errorf("Failed to unstage volume: %v", err)
 			}
 			fp := filepath.Join("/tmp/", volName)
 			err = testutils.RmAll(instance, fp)
 			if err != nil {
-				klog.Errorf("Failed to rm file path %s: %w", fp, err)
+				klog.Errorf("Failed to rm file path %s: %v", fp, err)
 			}
 		}()
 	})
@@ -267,6 +271,33 @@ var _ = Describe("GCE PD CSI Driver", func() {
 			Expect(err).To(BeNil(), "Could not find disk in correct zone")
 		}
 	})
+	// TODO(hime): Enable this test once all release branches contain the fix from PR#1708.
+	// It("Should return InvalidArgument when disk size exceeds limit", func() {
+	// 	// If this returns a different error code (like Unknown), the error wrapping logic in #1708 has regressed.
+	// 	Expect(testContexts).ToNot(BeEmpty())
+	// 	testContext := getRandomTestContext()
+
+	// 	zones := []string{"us-central1-c", "us-central1-b", "us-central1-a"}
+
+	// 	for _, zone := range zones {
+	// 		volName := testNamePrefix + string(uuid.NewUUID())
+	// 		topReq := &csi.TopologyRequirement{
+	// 			Requisite: []*csi.Topology{
+	// 				{
+	// 					Segments: map[string]string{common.TopologyKeyZone: zone},
+	// 				},
+	// 			},
+	// 		}
+	// 		volume, err := testContext.Client.CreateVolume(volName, nil, invalidSizeGb, topReq, nil)
+	// 		Expect(err).ToNot(BeNil(), "Failed to fetch error from create volume.")
+	// 		Expect(err.Error()).To(ContainSubstring("InvalidArgument"), "Failed to verify error code matches InvalidArgument.")
+	// 		defer func() {
+	// 			if volume != nil {
+	// 				testContext.Client.DeleteVolume(volume.VolumeId)
+	// 			}
+	// 		}()
+	// 	}
+	// })
 
 	DescribeTable("Should complete entire disk lifecycle with underspecified volume ID",
 		func(diskType string) {
@@ -297,6 +328,7 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		Entry("on pd-standard", standardDiskType),
 		Entry("on pd-extreme", extremeDiskType),
 		Entry("on hyperdisk-throughput", hdtDiskType),
+		Entry("on pd-ssd", ssdDiskType),
 	)
 
 	DescribeTable("Should complete publish/unpublish lifecycle with underspecified volume ID and missing volume",
@@ -330,7 +362,7 @@ var _ = Describe("GCE PD CSI Driver", func() {
 			}()
 
 			// Attach Disk
-			err := client.ControllerPublishVolume(underSpecifiedID, instance.GetNodeID(), false /* forceAttach */)
+			err := client.ControllerPublishVolumeReadWrite(underSpecifiedID, instance.GetNodeID(), false /* forceAttach */)
 			Expect(err).To(BeNil(), "ControllerPublishVolume failed")
 		},
 		Entry("on pd-standard", standardDiskType),
@@ -699,7 +731,7 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		defer deleteVolumeOrError(client, secondVolID)
 
 		// Attach volID to current instance
-		err := client.ControllerPublishVolume(volID, nodeID, false /* forceAttach */)
+		err := client.ControllerPublishVolumeReadWrite(volID, nodeID, false /* forceAttach */)
 		Expect(err).To(BeNil(), "Failed ControllerPublishVolume")
 		defer client.ControllerUnpublishVolume(volID, nodeID)
 
@@ -1280,39 +1312,251 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		}()
 	})
 
-	It("Should pass/fail if valid/invalid compute endpoint is passed in", func() {
+	It("Should pass if valid compute endpoint is passed in", func() {
 		// gets instance set up w/o compute-endpoint set from test setup
 		_, err := getRandomTestContext().Client.ListVolumes()
 		Expect(err).To(BeNil(), "no error expected when passed valid compute url")
 
 		zone := "us-central1-c"
 		nodeID := fmt.Sprintf("gce-pd-csi-e2e-%s", zone)
-		i, err := remote.SetupInstance(*project, *architecture, zone, nodeID, *machineType, *serviceAccount, *imageURL, computeService)
+		i, err := remote.SetupInstance(getRemoteInstanceConfig(), zone, nodeID, computeService)
 
 		if err != nil {
-			klog.Fatalf("Failed to setup instance %v: %w", nodeID, err)
+			klog.Fatalf("Failed to setup instance %v: %v", nodeID, err)
 		}
 
 		klog.Infof("Creating new driver and client for node %s\n", i.GetName())
 
-		// Create new driver and client w/ invalid endpoint
-		tcInvalid, err := testutils.GCEClientAndDriverSetup(i, "invalid-string")
+		// Create new driver and client with valid, empty endpoint
+		klog.Infof("Setup driver with empty compute endpoint %s\n", i.GetName())
+		tcEmpty, err := testutils.GCEClientAndDriverSetup(i, getDriverConfig())
 		if err != nil {
-			klog.Fatalf("Failed to set up Test Context for instance %v: %w", i.GetName(), err)
+			klog.Fatalf("Failed to set up Test Context for instance %v: %v", i.GetName(), err)
 		}
+		_, err = tcEmpty.Client.ListVolumes()
 
-		_, err = tcInvalid.Client.ListVolumes()
-		Expect(err.Error()).To(ContainSubstring("no such host"), "expected error when passed invalid compute url")
+		Expect(err).To(BeNil(), "no error expected when passed empty compute url")
 
 		// Create new driver and client w/ valid, passed-in endpoint
-		tcValid, err := testutils.GCEClientAndDriverSetup(i, "https://compute.googleapis.com")
+		driverConfig := getDriverConfig()
+		driverConfig.ComputeEndpoint = "https://compute.googleapis.com"
+		tcValid, err := testutils.GCEClientAndDriverSetup(i, driverConfig)
 		if err != nil {
-			klog.Fatalf("Failed to set up Test Context for instance %v: %w", i.GetName(), err)
+			klog.Fatalf("Failed to set up Test Context for instance %v: %v", i.GetName(), err)
 		}
 		_, err = tcValid.Client.ListVolumes()
 
 		Expect(err).To(BeNil(), "no error expected when passed valid compute url")
 	})
+
+	It("Should update readahead if read_ahead_kb passed on mount", func() {
+		testContext := getRandomTestContext()
+
+		p, z, _ := testContext.Instance.GetIdentity()
+		client := testContext.Client
+		instance := testContext.Instance
+
+		// Create Disk
+		volName, volID := createAndValidateUniqueZonalDisk(client, p, z, standardDiskType)
+
+		defer func() {
+			// Delete Disk
+			err := client.DeleteVolume(volID)
+			Expect(err).To(BeNil(), "DeleteVolume failed")
+
+			// Validate Disk Deleted
+			_, err = computeService.Disks.Get(p, z, volName).Do()
+			Expect(gce.IsGCEError(err, "notFound")).To(BeTrue(), "Expected disk to not be found")
+		}()
+
+		// Attach Disk
+		err := client.ControllerPublishVolumeReadWrite(volID, instance.GetNodeID(), false /* forceAttach */)
+		Expect(err).To(BeNil(), "ControllerPublishVolume failed with error for disk %v on node %v: %v", volID, instance.GetNodeID(), err)
+
+		defer func() {
+			// Detach Disk
+			err = client.ControllerUnpublishVolume(volID, instance.GetNodeID())
+			if err != nil {
+				klog.Errorf("Failed to detach disk: %v", err)
+			}
+
+		}()
+
+		// Stage Disk
+		stageDir := filepath.Join("/tmp/", volName, "stage")
+		expectedReadAheadKB := "4096"
+		volCap := &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{
+				Mount: &csi.VolumeCapability_MountVolume{
+					MountFlags: []string{fmt.Sprintf("read_ahead_kb=%s", expectedReadAheadKB)},
+				},
+			},
+			AccessMode: &csi.VolumeCapability_AccessMode{
+				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+			},
+		}
+		err = client.NodeStageVolume(volID, stageDir, volCap)
+		Expect(err).To(BeNil(), "failed to stage volume: %v", err)
+
+		// Validate that the link is correct
+		var validated bool
+		var devName string
+		devicePaths := deviceutils.NewDeviceUtils().GetDiskByIdPaths(volName, "")
+		for _, devicePath := range devicePaths {
+			validated, err = testutils.ValidateLogicalLinkIsDisk(instance, devicePath, volName)
+			Expect(err).To(BeNil(), "failed to validate link %s is disk %s: %v", stageDir, volName, err)
+			if validated {
+				devFsPath, err := instance.SSH("find", devicePath, "-printf", "'%l'")
+				Expect(err).To(BeNil(), "Failed to symlink devicePath")
+				devFsPathPieces := strings.Split(devFsPath, "/")
+				devName = devFsPathPieces[len(devFsPathPieces)-1]
+
+			}
+		}
+		Expect(validated).To(BeTrue(), "could not find device in %v that links to volume %s", devicePaths, volName)
+		actualReadAheadKBStr, err := instance.SSH("cat", fmt.Sprintf("/sys/block/%s/queue/read_ahead_kb", devName))
+		actualReadAheadKB := strings.TrimSpace(actualReadAheadKBStr)
+		Expect(err).To(BeNil(), "Failed to read read_ahead_kb: %v", err)
+		Expect(actualReadAheadKB).To(Equal(expectedReadAheadKB), "unexpected read_ahead_kb")
+
+		defer func() {
+			// Unstage Disk
+			err = client.NodeUnstageVolume(volID, stageDir)
+			if err != nil {
+				klog.Errorf("Failed to unstage volume: %v", err)
+			}
+			fp := filepath.Join("/tmp/", volName)
+			err = testutils.RmAll(instance, fp)
+			if err != nil {
+				klog.Errorf("Failed to rm file path %s: %v", fp, err)
+			}
+		}()
+	})
+
+	It("Should block unstage if filesystem mounted", func() {
+		testContext := getRandomTestContext()
+
+		p, z, _ := testContext.Instance.GetIdentity()
+		client := testContext.Client
+		instance := testContext.Instance
+
+		// Create Disk
+		volName, volID := createAndValidateUniqueZonalDisk(client, p, z, standardDiskType)
+
+		defer func() {
+			// Delete Disk
+			err := client.DeleteVolume(volID)
+			Expect(err).To(BeNil(), "DeleteVolume failed")
+
+			// Validate Disk Deleted
+			_, err = computeService.Disks.Get(p, z, volName).Do()
+			Expect(gce.IsGCEError(err, "notFound")).To(BeTrue(), "Expected disk to not be found")
+		}()
+
+		// Attach Disk
+		err := client.ControllerPublishVolumeReadWrite(volID, instance.GetNodeID(), false /* forceAttach */)
+		Expect(err).To(BeNil(), "ControllerPublishVolume failed with error for disk %v on node %v: %v", volID, instance.GetNodeID(), err)
+
+		defer func() {
+			// Detach Disk
+			err = client.ControllerUnpublishVolume(volID, instance.GetNodeID())
+			if err != nil {
+				klog.Errorf("Failed to detach disk: %v", err)
+			}
+		}()
+
+		// Stage Disk
+		stageDir := filepath.Join("/tmp/", volName, "stage")
+		err = client.NodeStageExt4Volume(volID, stageDir)
+		Expect(err).To(BeNil(), "failed to stage volume: %v", err)
+
+		// Create private bind mount
+		boundMountStageDir := filepath.Join("/tmp/bindmount", volName, "bindmount")
+		boundMountStageMkdirOutput, err := instance.SSH("mkdir", "-p", boundMountStageDir)
+		Expect(err).To(BeNil(), "mkdir failed on instance %v: output: %v: %v", instance.GetNodeID(), boundMountStageMkdirOutput, err)
+		bindMountOutput, err := instance.SSH("mount", "--rbind", "--make-private", stageDir, boundMountStageDir)
+		Expect(err).To(BeNil(), "Bind mount failed on instance %v: output: %v: %v", instance.GetNodeID(), bindMountOutput, err)
+
+		privateBindMountRemoved := false
+		unmountAndRmPrivateBindMount := func() {
+			if !privateBindMountRemoved {
+				// Umount and delete private mount staging directory
+				bindUmountOutput, err := instance.SSH("umount", boundMountStageDir)
+				Expect(err).To(BeNil(), "Bind mount failed on instance %v: output: %v: %v", instance.GetNodeID(), bindUmountOutput, err)
+				err = testutils.RmAll(instance, boundMountStageDir)
+				Expect(err).To(BeNil(), "Failed to rm mount stage dir %s: %v", boundMountStageDir, err)
+			}
+			privateBindMountRemoved = true
+		}
+
+		defer func() {
+			unmountAndRmPrivateBindMount()
+		}()
+
+		// Unstage Disk
+		err = client.NodeUnstageVolume(volID, stageDir)
+		Expect(err).ToNot(BeNil(), "Expected failure during unstage")
+		Expect(err).To(MatchError(ContainSubstring(("is still in use"))))
+
+		// Unmount private bind mount and try again
+		unmountAndRmPrivateBindMount()
+
+		// Unstage Disk
+		err = client.NodeUnstageVolume(volID, stageDir)
+		Expect(err).To(BeNil(), "Failed to unstage volume: %v", err)
+		fp := filepath.Join("/tmp/", volName)
+		err = testutils.RmAll(instance, fp)
+		Expect(err).To(BeNil(), "Failed to rm file path %s: %v", fp, err)
+	})
+
+	type multiZoneTestConfig struct {
+		diskType          string
+		readOnly          bool
+		hasMultiZoneLabel bool
+		wantErrSubstring  string
+	}
+
+	DescribeTable("Unsupported 'multi-zone' PV ControllerPublish attempts",
+		func(cfg multiZoneTestConfig) {
+			Expect(testContexts).ToNot(BeEmpty())
+			testContext := getRandomTestContext()
+
+			controllerInstance := testContext.Instance
+			controllerClient := testContext.Client
+
+			p, z, _ := controllerInstance.GetIdentity()
+
+			volName := testNamePrefix + string(uuid.NewUUID())
+			_, diskVolumeId := createAndValidateZonalDisk(controllerClient, p, z, cfg.diskType, volName)
+			defer deleteDisk(controllerClient, p, z, diskVolumeId, volName)
+
+			if cfg.hasMultiZoneLabel {
+				labelsMap := map[string]string{
+					common.MultiZoneLabel: "true",
+				}
+				disk, err := computeService.Disks.Get(p, z, volName).Do()
+				Expect(err).To(BeNil(), "Could not get disk")
+				diskOp, err := computeService.Disks.SetLabels(p, z, volName, &compute.ZoneSetLabelsRequest{
+					LabelFingerprint: disk.LabelFingerprint,
+					Labels:           labelsMap,
+				}).Do()
+				Expect(err).To(BeNil(), "Could not set disk labels")
+				_, err = computeService.ZoneOperations.Wait(p, z, diskOp.Name).Do()
+				Expect(err).To(BeNil(), "Could not set disk labels")
+			}
+
+			// Attach Disk
+			volID := fmt.Sprintf("projects/%s/zones/multi-zone/disks/%s", p, volName)
+			nodeID := testContext.Instance.GetNodeID()
+
+			err := controllerClient.ControllerPublishVolume(volID, nodeID, false /* forceAttach */, cfg.readOnly)
+			Expect(err).ToNot(BeNil(), "Unexpected success attaching disk")
+			Expect(err.Error()).To(ContainSubstring(cfg.wantErrSubstring), "Expected err")
+		},
+		Entry("with unsupported ROX mode", multiZoneTestConfig{diskType: standardDiskType, readOnly: false, hasMultiZoneLabel: true, wantErrSubstring: "'multi-zone' volume only supports 'readOnly'"}),
+		Entry("with missing multi-zone label", multiZoneTestConfig{diskType: standardDiskType, readOnly: true, hasMultiZoneLabel: false, wantErrSubstring: "points to disk that is missing label \"goog-gke-multi-zone\""}),
+		Entry("with unsupported disk-type pd-extreme", multiZoneTestConfig{diskType: extremeDiskType, readOnly: true, hasMultiZoneLabel: true, wantErrSubstring: "points to disk with unsupported disk type"}),
+	)
 })
 
 func equalWithinEpsilon(a, b, epsiolon int64) bool {
@@ -1323,9 +1567,13 @@ func equalWithinEpsilon(a, b, epsiolon int64) bool {
 }
 
 func createAndValidateUniqueZonalDisk(client *remote.CsiClient, project, zone string, diskType string) (string, string) {
+	volName := testNamePrefix + string(uuid.NewUUID())
+	return createAndValidateZonalDisk(client, project, zone, diskType, volName)
+}
+
+func createAndValidateZonalDisk(client *remote.CsiClient, project, zone string, diskType string, volName string) (string, string) {
 	// Create Disk
 	disk := typeToDisk[diskType]
-	volName := testNamePrefix + string(uuid.NewUUID())
 
 	diskSize := defaultSizeGb
 	switch diskType {
@@ -1333,6 +1581,8 @@ func createAndValidateUniqueZonalDisk(client *remote.CsiClient, project, zone st
 		diskSize = defaultExtremeSizeGb
 	case hdtDiskType:
 		diskSize = defaultHdTSizeGb
+	case hdmlDiskType:
+		diskSize = defaultHdmlSizeGb
 	}
 	volume, err := client.CreateVolume(volName, disk.params, diskSize,
 		&csi.TopologyRequirement{
@@ -1503,6 +1753,22 @@ var typeToDisk = map[string]*disk{
 		validate: func(disk *compute.Disk) {
 			Expect(disk.Type).To(ContainSubstring(hdtDiskType))
 			Expect(disk.ProvisionedThroughput).To(Equal(provisionedThroughputOnCreateInt))
+		},
+	},
+	ssdDiskType: {
+		params: map[string]string{
+			common.ParameterKeyType: ssdDiskType,
+		},
+		validate: func(disk *compute.Disk) {
+			Expect(disk.Type).To(ContainSubstring(ssdDiskType))
+		},
+	},
+	"hyperdisk-ml": {
+		params: map[string]string{
+			common.ParameterKeyType: "hyperdisk-ml",
+		},
+		validate: func(disk *compute.Disk) {
+			Expect(disk.Type).To(ContainSubstring("hyperdisk-ml"))
 		},
 	},
 }

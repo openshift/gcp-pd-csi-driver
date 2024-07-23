@@ -19,23 +19,29 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"time"
 
 	"golang.org/x/oauth2/google"
+	"golang.org/x/time/rate"
 	"google.golang.org/api/option"
 	"gopkg.in/gcfg.v1"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
 
 	"cloud.google.com/go/compute/metadata"
+	rscmgr "cloud.google.com/go/resourcemanager/apiv3"
 	"golang.org/x/oauth2"
-	computealpha "google.golang.org/api/compute/v0.alpha"
 	computebeta "google.golang.org/api/compute/v0.beta"
 	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/strings/slices"
 )
+
+type Environment string
 
 const (
 	TokenURL                        = "https://accounts.google.com/o/oauth2/token"
@@ -46,23 +52,76 @@ const (
 
 	regionURITemplate = "projects/%s/regions/%s"
 
-	replicaZoneURITemplateSingleZone = "projects/%s/zones/%s" // {gce.projectID}/zones/{disk.Zone}
+	replicaZoneURITemplateSingleZone             = "projects/%s/zones/%s" // {gce.projectID}/zones/{disk.Zone}
+	EnvironmentStaging               Environment = "staging"
+	EnvironmentProduction            Environment = "production"
+
+	// resourceManagerHostSubPath is the endpoint for tag requests.
+	resourceManagerHostSubPath = "cloudresourcemanager.googleapis.com"
+
+	// zonalOrRegionalComputeParentPathFmt is the string format for the full path of compute resource.
+	// belonging to a zone or a region
+	zonalOrRegionalComputeParentPathFmt = "//compute.googleapis.com/projects/%s/%s/%s/%s/%d"
+
+	// globalComputeParentPathFmt is the string format for the full path of global compute resource.
+	globalComputeParentPathFmt = "//compute.googleapis.com/projects/%s/global/%s/%d"
+
+	// gcpTagsRequestRateLimit is the tag request rate limit per second.
+	gcpTagsRequestRateLimit = 8
+
+	// gcpTagsRequestTokenBucketSize is the burst/token bucket size used
+	// for limiting API requests.
+	gcpTagsRequestTokenBucketSize = 8
 )
 
+// ResourceType indicates the type of a compute resource.
+type ResourceType string
+
+var (
+	// snapshotsType is the resource type of compute snapshots.
+	snapshotsType ResourceType = "snapshots"
+	// imagesType is the resource type of compute images.
+	imagesType ResourceType = "images"
+)
+
+// CloudProvider only supports GCE v1/beta Disk APIs. See
+// https://github.com/kubernetes-sigs/gcp-compute-persistent-disk-csi-driver/pull/1524
+// for how to add GCE alpha Disk support.
 type CloudProvider struct {
-	service      *compute.Service
-	betaService  *computebeta.Service
-	alphaService *computealpha.Service
-	project      string
-	zone         string
+	service     *compute.Service
+	betaService *computebeta.Service
+	tokenSource oauth2.TokenSource
+	project     string
+	zone        string
 
 	zonesCache map[string][]string
+
+	waitForAttachConfig WaitForAttachConfig
+
+	tagsRateLimiter *rate.Limiter
+
+	listInstancesConfig ListInstancesConfig
 }
 
 var _ GCECompute = &CloudProvider{}
 
 type ConfigFile struct {
 	Global ConfigGlobal `gcfg:"global"`
+}
+
+type ListInstancesConfig struct {
+	Filters []string
+}
+
+type WaitForAttachConfig struct {
+	// A set of disk types that should use the compute instances.get API instead of the
+	// disks.get API. For certain disk types, using the instances.get API is preferred
+	// based on the response characteristics of the API.
+	UseInstancesAPIForDiskTypes []string
+}
+
+func (cfg WaitForAttachConfig) ShouldUseGetInstanceAPI(diskType string) bool {
+	return slices.Contains(cfg.UseInstancesAPIForDiskTypes, diskType)
 }
 
 type ConfigGlobal struct {
@@ -72,7 +131,7 @@ type ConfigGlobal struct {
 	Zone      string `gcfg:"zone"`
 }
 
-func CreateCloudProvider(ctx context.Context, vendorVersion string, configPath string, computeEndpoint string) (*CloudProvider, error) {
+func CreateCloudProvider(ctx context.Context, vendorVersion string, configPath string, computeEndpoint *url.URL, computeEnvironment Environment, waitForAttachConfig WaitForAttachConfig, listInstancesConfig ListInstancesConfig) (*CloudProvider, error) {
 	configFile, err := readConfig(configPath)
 	if err != nil {
 		return nil, err
@@ -87,20 +146,17 @@ func CreateCloudProvider(ctx context.Context, vendorVersion string, configPath s
 		return nil, err
 	}
 
-	svc, err := createCloudService(ctx, vendorVersion, tokenSource, computeEndpoint)
+	svc, err := createCloudService(ctx, vendorVersion, tokenSource, computeEndpoint, computeEnvironment)
 	if err != nil {
 		return nil, err
 	}
+	klog.Infof("Compute endpoint for V1 version: %s", svc.BasePath)
 
-	betasvc, err := createBetaCloudService(ctx, vendorVersion, tokenSource, computeEndpoint)
+	betasvc, err := createBetaCloudService(ctx, vendorVersion, tokenSource, computeEndpoint, computeEnvironment)
 	if err != nil {
 		return nil, err
 	}
-
-	alphasvc, err := createAlphaCloudService(ctx, vendorVersion, tokenSource, computeEndpoint)
-	if err != nil {
-		return nil, err
-	}
+	klog.Infof("Compute endpoint for Beta version: %s", betasvc.BasePath)
 
 	project, zone, err := getProjectAndZone(configFile)
 	if err != nil {
@@ -108,12 +164,17 @@ func CreateCloudProvider(ctx context.Context, vendorVersion string, configPath s
 	}
 
 	return &CloudProvider{
-		service:      svc,
-		betaService:  betasvc,
-		alphaService: alphasvc,
-		project:      project,
-		zone:         zone,
-		zonesCache:   make(map[string]([]string)),
+		service:             svc,
+		betaService:         betasvc,
+		tokenSource:         tokenSource,
+		project:             project,
+		zone:                zone,
+		zonesCache:          make(map[string]([]string)),
+		waitForAttachConfig: waitForAttachConfig,
+		listInstancesConfig: listInstancesConfig,
+		// GCP has a rate limit of 600 requests per minute, restricting
+		// here to 8 requests per second.
+		tagsRateLimiter: common.NewLimiter(gcpTagsRequestRateLimit, gcpTagsRequestTokenBucketSize, true),
 	}, nil
 
 }
@@ -164,16 +225,10 @@ func readConfig(configPath string) (*ConfigFile, error) {
 	return cfg, nil
 }
 
-func createBetaCloudService(ctx context.Context, vendorVersion string, tokenSource oauth2.TokenSource, computeEndpoint string) (*computebeta.Service, error) {
-	client, err := newOauthClient(ctx, tokenSource)
+func createBetaCloudService(ctx context.Context, vendorVersion string, tokenSource oauth2.TokenSource, computeEndpoint *url.URL, computeEnvironment Environment) (*computebeta.Service, error) {
+	computeOpts, err := getComputeVersion(ctx, tokenSource, computeEndpoint, computeEnvironment, GCEAPIVersionBeta)
 	if err != nil {
-		return nil, err
-	}
-
-	computeOpts := []option.ClientOption{option.WithHTTPClient(client)}
-	if computeEndpoint != "" {
-		betaEndpoint := fmt.Sprintf("%s/compute/beta/", computeEndpoint)
-		computeOpts = append(computeOpts, option.WithEndpoint(betaEndpoint))
+		klog.Errorf("Failed to get compute endpoint: %s", err)
 	}
 	service, err := computebeta.NewService(ctx, computeOpts...)
 	if err != nil {
@@ -183,40 +238,10 @@ func createBetaCloudService(ctx context.Context, vendorVersion string, tokenSour
 	return service, nil
 }
 
-func createAlphaCloudService(ctx context.Context, vendorVersion string, tokenSource oauth2.TokenSource, computeEndpoint string) (*computealpha.Service, error) {
-	client, err := newOauthClient(ctx, tokenSource)
+func createCloudService(ctx context.Context, vendorVersion string, tokenSource oauth2.TokenSource, computeEndpoint *url.URL, computeEnvironment Environment) (*compute.Service, error) {
+	computeOpts, err := getComputeVersion(ctx, tokenSource, computeEndpoint, computeEnvironment, GCEAPIVersionV1)
 	if err != nil {
-		return nil, err
-	}
-
-	computeOpts := []option.ClientOption{option.WithHTTPClient(client)}
-	if computeEndpoint != "" {
-		alphaEndpoint := fmt.Sprintf("%s/compute/alpha/", computeEndpoint)
-		computeOpts = append(computeOpts, option.WithEndpoint(alphaEndpoint))
-	}
-	service, err := computealpha.NewService(ctx, computeOpts...)
-	if err != nil {
-		return nil, err
-	}
-	service.UserAgent = fmt.Sprintf("GCE CSI Driver/%s (%s %s)", vendorVersion, runtime.GOOS, runtime.GOARCH)
-	return service, nil
-}
-
-func createCloudService(ctx context.Context, vendorVersion string, tokenSource oauth2.TokenSource, computeEndpoint string) (*compute.Service, error) {
-	svc, err := createCloudServiceWithDefaultServiceAccount(ctx, vendorVersion, tokenSource, computeEndpoint)
-	return svc, err
-}
-
-func createCloudServiceWithDefaultServiceAccount(ctx context.Context, vendorVersion string, tokenSource oauth2.TokenSource, computeEndpoint string) (*compute.Service, error) {
-	client, err := newOauthClient(ctx, tokenSource)
-	if err != nil {
-		return nil, err
-	}
-
-	computeOpts := []option.ClientOption{option.WithHTTPClient(client)}
-	if computeEndpoint != "" {
-		v1Endpoint := fmt.Sprintf("%s/compute/v1/", computeEndpoint)
-		computeOpts = append(computeOpts, option.WithEndpoint(v1Endpoint))
+		klog.Errorf("Failed to get compute endpoint: %s", err)
 	}
 	service, err := compute.NewService(ctx, computeOpts...)
 	if err != nil {
@@ -224,6 +249,63 @@ func createCloudServiceWithDefaultServiceAccount(ctx context.Context, vendorVers
 	}
 	service.UserAgent = fmt.Sprintf("GCE CSI Driver/%s (%s %s)", vendorVersion, runtime.GOOS, runtime.GOARCH)
 	return service, nil
+}
+
+func getComputeVersion(ctx context.Context, tokenSource oauth2.TokenSource, computeEndpoint *url.URL, computeEnvironment Environment, computeVersion GCEAPIVersion) ([]option.ClientOption, error) {
+	client, err := newOauthClient(ctx, tokenSource)
+	if err != nil {
+		return nil, err
+	}
+	computeOpts := []option.ClientOption{option.WithHTTPClient(client)}
+
+	if computeEndpoint != nil {
+		computeEnvironmentSuffix := constructComputeEndpointPath(computeEnvironment, computeVersion)
+		computeEndpoint.Path = computeEnvironmentSuffix
+		endpoint := computeEndpoint.String()
+		computeOpts = append(computeOpts, option.WithEndpoint(endpoint))
+	}
+	return computeOpts, nil
+}
+
+func constructComputeEndpointPath(env Environment, version GCEAPIVersion) string {
+	prefix := ""
+	if env == EnvironmentStaging {
+		prefix = fmt.Sprintf("%s_", env)
+	}
+	return fmt.Sprintf("compute/%s%s/", prefix, version)
+}
+
+func createTagValuesClient(ctx context.Context, tokenSource oauth2.TokenSource, resourceManagerHostSubPath string) (*rscmgr.TagValuesClient, error) {
+	client, err := newOauthClient(ctx, tokenSource)
+	if err != nil {
+		return nil, err
+	}
+
+	endpoint := fmt.Sprintf("https://%s", resourceManagerHostSubPath)
+	opts := []option.ClientOption{
+		option.WithHTTPClient(client),
+		option.WithEndpoint(endpoint),
+	}
+	return rscmgr.NewTagValuesRESTClient(ctx, opts...)
+}
+
+func createTagBindingsClient(ctx context.Context, tokenSource oauth2.TokenSource, location string, resourceManagerHostSubPath string) (*rscmgr.TagBindingsClient, error) {
+	client, err := newOauthClient(ctx, tokenSource)
+	if err != nil {
+		return nil, err
+	}
+
+	var endpoint string
+	if location != "" {
+		endpoint = fmt.Sprintf("https://%s-%s", location, resourceManagerHostSubPath)
+	} else {
+		endpoint = fmt.Sprintf("https://%s", resourceManagerHostSubPath)
+	}
+	opts := []option.ClientOption{
+		option.WithHTTPClient(client),
+		option.WithEndpoint(endpoint),
+	}
+	return rscmgr.NewTagBindingsRESTClient(ctx, opts...)
 }
 
 func newOauthClient(ctx context.Context, tokenSource oauth2.TokenSource) (*http.Client, error) {

@@ -43,7 +43,13 @@ var (
 	boskos, _ = boskosclient.NewClient(os.Getenv("JOB_NAME"), "http://boskos", "", "")
 )
 
-func GCEClientAndDriverSetup(instance *remote.InstanceInfo, computeEndpoint string) (*remote.TestContext, error) {
+type DriverConfig struct {
+	ComputeEndpoint string
+	ExtraFlags      []string
+	Zones           []string
+}
+
+func GCEClientAndDriverSetup(instance *remote.InstanceInfo, driverConfig DriverConfig) (*remote.TestContext, error) {
 	port := fmt.Sprintf("%v", 1024+rand.Intn(10000))
 	goPath, ok := os.LookupEnv("GOPATH")
 	if !ok {
@@ -56,16 +62,20 @@ func GCEClientAndDriverSetup(instance *remote.InstanceInfo, computeEndpoint stri
 	extra_flags := []string{
 		fmt.Sprintf("--extra-labels=%s=%s", DiskLabelKey, DiskLabelValue),
 		"--max-concurrent-format-and-mount=20", // otherwise the serialization times out the e2e test.
+		"--multi-zone-volume-handle-enable",
+		"--multi-zone-volume-handle-disk-types=pd-standard,hyperdisk-ml",
+		"--use-instance-api-to-poll-attachment-disk-types=pd-ssd",
+		"--use-instance-api-to-list-volumes-published-nodes",
+		fmt.Sprintf("--fallback-requisite-zones=%s", strings.Join(driverConfig.Zones, ",")),
 	}
-	if computeEndpoint != "" {
-		extra_flags = append(extra_flags, fmt.Sprintf("--compute-endpoint %s", computeEndpoint))
-	}
+	extra_flags = append(extra_flags, fmt.Sprintf("--compute-endpoint=%s", driverConfig.ComputeEndpoint))
+	extra_flags = append(extra_flags, driverConfig.ExtraFlags...)
+
 	workspace := remote.NewWorkspaceDir("gce-pd-e2e-")
 	// Log at V(6) as the compute API calls are emitted at that level and it's
 	// useful to see what's happening when debugging tests.
 	driverRunCmd := fmt.Sprintf("sh -c '/usr/bin/nohup %s/gce-pd-csi-driver -v=6 --endpoint=%s %s 2> %s/prog.out < /dev/null > /dev/null &'",
 		workspace, endpoint, strings.Join(extra_flags, " "), workspace)
-
 	config := &remote.ClientConfig{
 		PkgPath:      pkgPath,
 		BinPath:      binPath,
@@ -96,7 +106,7 @@ func getBoskosProject(resourceType string) *common.Resource {
 		case <-ticker.C:
 			p, err := boskos.Acquire(resourceType, "free", "busy")
 			if err != nil {
-				klog.Warningf("boskos failed to acquire project: %w", err)
+				klog.Warningf("boskos failed to acquire project: %v", err)
 			} else if p == nil {
 				klog.Warningf("boskos does not have a free %s at the moment", resourceType)
 			} else {
@@ -128,17 +138,17 @@ func SetupProwConfig(resourceType string) (project, serviceAccount string) {
 
 	c, err := google.DefaultClient(context.Background(), cloudresourcemanager.CloudPlatformScope)
 	if err != nil {
-		klog.Fatalf("Failed to get Google Default Client: %w", err)
+		klog.Fatalf("Failed to get Google Default Client: %v", err)
 	}
 
 	cloudresourcemanagerService, err := cloudresourcemanager.New(c)
 	if err != nil {
-		klog.Fatalf("Failed to create new cloudresourcemanager: %w", err)
+		klog.Fatalf("Failed to create new cloudresourcemanager: %v", err)
 	}
 
 	resp, err := cloudresourcemanagerService.Projects.Get(project).Do()
 	if err != nil {
-		klog.Fatalf("Failed to get project %v from Cloud Resource Manager: %w", project, err)
+		klog.Fatalf("Failed to get project %v from Cloud Resource Manager: %v", project, err)
 	}
 
 	// Default Compute Engine service account
@@ -148,7 +158,7 @@ func SetupProwConfig(resourceType string) (project, serviceAccount string) {
 	return project, serviceAccount
 }
 
-func ForceChmod(instance *remote.InstanceInfo, filePath string, perms string) error {
+func ForceChmod(instance *remote.InstanceInfo, filePath string, perms string, recursive bool) error {
 	originalumask, err := instance.SSHNoSudo("umask")
 	if err != nil {
 		return fmt.Errorf("failed to umask. Output: %v, errror: %v", originalumask, err.Error())
@@ -157,7 +167,13 @@ func ForceChmod(instance *remote.InstanceInfo, filePath string, perms string) er
 	if err != nil {
 		return fmt.Errorf("failed to umask. Output: %v, errror: %v", output, err.Error())
 	}
-	output, err = instance.SSH("chmod", "-R", perms, filePath)
+	chmodOptions := []string{}
+	if recursive {
+		chmodOptions = []string{"-R"}
+	}
+	chmodOptions = append(chmodOptions, perms, filePath)
+	chmodCmd := append([]string{"chmod"}, chmodOptions...)
+	output, err = instance.SSH(chmodCmd...)
 	if err != nil {
 		return fmt.Errorf("failed to chmod file %s. Output: %v, errror: %v", filePath, output, err.Error())
 	}
