@@ -44,26 +44,37 @@ import (
 const (
 	testNamePrefix = "gcepd-csi-e2e-"
 
-	defaultSizeGb                     int64 = 5
-	defaultExtremeSizeGb              int64 = 500
-	defaultHdTSizeGb                  int64 = 2048
-	defaultHdmlSizeGb                 int64 = 200
-	defaultRepdSizeGb                 int64 = 200
-	defaultMwSizeGb                   int64 = 200
-	defaultVolumeLimit                int64 = 127
-	invalidSizeGb                     int64 = 66000
-	readyState                              = "READY"
-	standardDiskType                        = "pd-standard"
-	ssdDiskType                             = "pd-ssd"
-	extremeDiskType                         = "pd-extreme"
-	hdtDiskType                             = "hyperdisk-throughput"
-	hdmlDiskType                            = "hyperdisk-ml"
-	provisionedIOPSOnCreate                 = "12345"
-	provisionedIOPSOnCreateInt              = int64(12345)
-	provisionedIOPSOnCreateDefaultInt       = int64(100000)
-	provisionedThroughputOnCreate           = "66Mi"
-	provisionedThroughputOnCreateInt        = int64(66)
-	defaultEpsilon                          = 500000000 // 500M
+	defaultSizeGb                       int64 = 5
+	defaultExtremeSizeGb                int64 = 500
+	defaultHdBSizeGb                    int64 = 100
+	defaultHdXSizeGb                    int64 = 100
+	defaultHdTSizeGb                    int64 = 2048
+	defaultHdmlSizeGb                   int64 = 200
+	defaultRepdSizeGb                   int64 = 200
+	defaultMwSizeGb                     int64 = 200
+	defaultVolumeLimit                  int64 = 127
+	invalidSizeGb                       int64 = 66000
+	readyState                                = "READY"
+	standardDiskType                          = "pd-standard"
+	ssdDiskType                               = "pd-ssd"
+	extremeDiskType                           = "pd-extreme"
+	hdbDiskType                               = "hyperdisk-balanced"
+	hdxDiskType                               = "hyperdisk-extreme"
+	hdtDiskType                               = "hyperdisk-throughput"
+	hdmlDiskType                              = "hyperdisk-ml"
+	hdhaDiskType                              = "hyperdisk-balanced-high-availability"
+	provisionedIOPSOnCreate                   = "12345"
+	provisionedIOPSOnCreateInt                = int64(12345)
+	provisionedIOPSOnCreateDefaultInt         = int64(100000)
+	provisionedIOPSOnCreateHdb                = "3000"
+	provisionedIOPSOnCreateHdbInt             = int64(3000)
+	provisionedIOPSOnCreateHdx                = "200"
+	provisionedIOPSOnCreateHdxInt             = int64(200)
+	provisionedThroughputOnCreate             = "66Mi"
+	provisionedThroughputOnCreateInt          = int64(66)
+	provisionedThroughputOnCreateHdb          = "150Mi"
+	provisionedThroughputOnCreateHdbInt       = int64(150)
+	defaultEpsilon                            = 500000000 // 500M
 )
 
 var _ = Describe("GCE PD CSI Driver", func() {
