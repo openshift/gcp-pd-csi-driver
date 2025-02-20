@@ -1063,7 +1063,7 @@ var _ = Describe("GCE PD CSI Driver Multi-Zone", func() {
 		// Create Disk
 		volName := testNamePrefix + string(uuid.NewUUID())
 		volume, err := controllerClient.CreateVolume(volName, map[string]string{
-			common.ParameterKeyType: common.ParameterHdHADiskType,
+			common.ParameterKeyType: common.DiskTypeHdHA,
 		}, defaultRepdSizeGb, &csi.TopologyRequirement{
 			Requisite: []*csi.Topology{
 				{
@@ -1142,7 +1142,7 @@ var _ = Describe("GCE PD CSI Driver Multi-Zone", func() {
 		// Create Disk
 		volName := testNamePrefix + string(uuid.NewUUID())
 		volume, err := controllerClient.CreateVolume(volName, map[string]string{
-			common.ParameterKeyType:           common.ParameterHdHADiskType,
+			common.ParameterKeyType:           common.DiskTypeHdHA,
 			common.ParameterAvailabilityClass: common.ParameterRegionalHardFailoverClass,
 		}, defaultRepdSizeGb, &csi.TopologyRequirement{
 			Requisite: []*csi.Topology{
