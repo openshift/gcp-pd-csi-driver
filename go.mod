@@ -1,8 +1,8 @@
 module sigs.k8s.io/gcp-compute-persistent-disk-csi-driver
 
-go 1.22.0
+go 1.23.0
 
-toolchain go1.22.2
+toolchain go1.23.7
 
 require (
 	cloud.google.com/go/compute/metadata v0.3.0
@@ -22,7 +22,7 @@ require (
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.21.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.21.0
 	go.opentelemetry.io/otel/sdk v1.24.0
-	golang.org/x/oauth2 v0.21.0
+	golang.org/x/oauth2 v0.27.0
 	golang.org/x/sys v0.23.0
 	golang.org/x/time v0.5.0
 	google.golang.org/api v0.183.0
