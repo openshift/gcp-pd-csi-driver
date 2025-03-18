@@ -25,14 +25,17 @@ import (
 
 func TestExtractAndDefaultParameters(t *testing.T) {
 	tests := []struct {
-		name               string
-		parameters         map[string]string
-		labels             map[string]string
-		enableStoragePools bool
-		enableMultiZone    bool
-		extraTags          map[string]string
-		expectParams       DiskParameters
-		expectErr          bool
+		name                  string
+		parameters            map[string]string
+		labels                map[string]string
+		enableStoragePools    bool
+		enableDataCache       bool
+		enableMultiZone       bool
+		enableHdHA            bool
+		extraTags             map[string]string
+		expectParams          DiskParameters
+		expectDataCacheParams DataCacheParameters
+		expectErr             bool
 	}{
 		{
 			name:       "defaults",
@@ -345,11 +348,67 @@ func TestExtractAndDefaultParameters(t *testing.T) {
 			expectErr:          true,
 		},
 		{
+			name:               "invalid storage pool parameters, negative ProvisionedThroughputOnCreate",
+			enableStoragePools: true,
+			parameters:         map[string]string{ParameterKeyType: "hyperdisk-throughput", ParameterKeyReplicationType: "none", ParameterKeyDiskEncryptionKmsKey: "foo/key", ParameterKeyLabels: "key1=value1,key2=value2", ParameterKeyResourceTags: "parent1/key1/value1,parent2/key2/value2", ParameterKeyProvisionedThroughputOnCreate: "-50Mi"},
+			labels:             map[string]string{},
+			expectErr:          true,
+		},
+		{
 			name:               "storage pool parameters, enableStoragePools is false",
 			enableStoragePools: false,
 			parameters:         map[string]string{ParameterKeyType: "hyperdisk-balanced", ParameterKeyStoragePools: "projects/my-project/zones/us-central1-a/storagePools/storagePool-1,projects/my-project/zones/us-central1-b/storagePools/storagePool-2"},
 			labels:             map[string]string{},
 			expectErr:          true,
+		},
+		{
+			name:            "data cache parameters - set default cache mode",
+			enableDataCache: true,
+			parameters:      map[string]string{ParameterKeyType: "pd-balanced", ParameterKeyReplicationType: "none", ParameterKeyDiskEncryptionKmsKey: "foo/key", ParameterKeyLabels: "key1=value1,key2=value2", ParameterKeyDataCacheSize: "1234Gi"},
+			labels:          map[string]string{},
+			expectParams: DiskParameters{
+				DiskType:             "pd-balanced",
+				ReplicationType:      "none",
+				DiskEncryptionKMSKey: "foo/key",
+				Tags:                 map[string]string{},
+				Labels: map[string]string{
+					"key1": "value1",
+					"key2": "value2",
+				},
+				ResourceTags: map[string]string{},
+			},
+			expectDataCacheParams: DataCacheParameters{
+				DataCacheMode: DataCacheModeWriteThrough,
+				DataCacheSize: "1234",
+			},
+		},
+		{
+			name:            "data cache parameters",
+			enableDataCache: true,
+			parameters:      map[string]string{ParameterKeyType: "pd-balanced", ParameterKeyReplicationType: "none", ParameterKeyDiskEncryptionKmsKey: "foo/key", ParameterKeyLabels: "key1=value1,key2=value2", ParameterKeyDataCacheSize: "1234Gi", ParameterKeyDataCacheMode: DataCacheModeWriteBack},
+			labels:          map[string]string{},
+			expectParams: DiskParameters{
+				DiskType:             "pd-balanced",
+				ReplicationType:      "none",
+				DiskEncryptionKMSKey: "foo/key",
+				Tags:                 map[string]string{},
+				Labels: map[string]string{
+					"key1": "value1",
+					"key2": "value2",
+				},
+				ResourceTags: map[string]string{},
+			},
+			expectDataCacheParams: DataCacheParameters{
+				DataCacheMode: DataCacheModeWriteBack,
+				DataCacheSize: "1234",
+			},
+		},
+		{
+			name:            "data cache parameters - enableDataCache is false",
+			enableDataCache: false,
+			parameters:      map[string]string{ParameterKeyType: "pd-balanced", ParameterKeyReplicationType: "none", ParameterKeyDiskEncryptionKmsKey: "foo/key", ParameterKeyLabels: "key1=value1,key2=value2", ParameterKeyDataCacheSize: "1234Gi", ParameterKeyDataCacheMode: DataCacheModeWriteBack},
+			labels:          map[string]string{},
+			expectErr:       true,
 		},
 		{
 			name:            "multi-zone-enable parameters, multi-zone label is set, multi-zone feature enabled",
@@ -388,6 +447,23 @@ func TestExtractAndDefaultParameters(t *testing.T) {
 			parameters: map[string]string{ParameterKeyType: "hyperdisk-ml", ParameterKeyEnableMultiZoneProvisioning: "true"},
 			expectErr:  true,
 		},
+		{
+			name:       "disk parameters, hdha disabled",
+			parameters: map[string]string{ParameterKeyType: "hyperdisk-balanced-high-availability"},
+			expectErr:  true,
+		},
+		{
+			name:       "disk parameters, hdha enabled",
+			parameters: map[string]string{ParameterKeyType: "hyperdisk-balanced-high-availability"},
+			enableHdHA: true,
+			expectParams: DiskParameters{
+				DiskType:        "hyperdisk-balanced-high-availability",
+				ReplicationType: "none",
+				Tags:            map[string]string{},
+				ResourceTags:    map[string]string{},
+				Labels:          map[string]string{},
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -396,8 +472,9 @@ func TestExtractAndDefaultParameters(t *testing.T) {
 				DriverName:         "testDriver",
 				EnableStoragePools: tc.enableStoragePools,
 				EnableMultiZone:    tc.enableMultiZone,
+				EnableHdHA:         tc.enableHdHA,
 			}
-			p, err := pp.ExtractAndDefaultParameters(tc.parameters, tc.labels, tc.extraTags)
+			p, d, err := pp.ExtractAndDefaultParameters(tc.parameters, tc.labels, tc.enableDataCache, tc.extraTags)
 			if gotErr := err != nil; gotErr != tc.expectErr {
 				t.Fatalf("ExtractAndDefaultParameters(%+v) = %v; expectedErr: %v", tc.parameters, err, tc.expectErr)
 			}
@@ -407,6 +484,10 @@ func TestExtractAndDefaultParameters(t *testing.T) {
 
 			if diff := cmp.Diff(tc.expectParams, p); diff != "" {
 				t.Errorf("ExtractAndDefaultParameters(%+v): -want, +got \n%s", tc.parameters, diff)
+			}
+
+			if diff := cmp.Diff(tc.expectDataCacheParams, d); diff != "" {
+				t.Errorf("ExtractAndDefaultParameters(%+v) for data cache params: -want, +got \n%s", tc.parameters, diff)
 			}
 		})
 	}
@@ -485,7 +566,7 @@ func TestSnapshotParameters(t *testing.T) {
 func TestExtractModifyVolumeParameters(t *testing.T) {
 	parameters := map[string]string{
 		"iops":       "1000",
-		"throughput": "500",
+		"throughput": "500Mi",
 	}
 
 	iops := int64(1000)
