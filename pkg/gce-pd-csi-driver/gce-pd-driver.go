@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/deviceutils"
 	gce "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/compute"
 	metadataservice "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/metadata"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/metrics"
 	mountmanager "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/mount-manager"
 )
 
@@ -144,18 +145,22 @@ func NewIdentityServer(gceDriver *GCEDriver) *GCEIdentityServer {
 	}
 }
 
-func NewNodeServer(gceDriver *GCEDriver, mounter *mount.SafeFormatAndMount, deviceUtils deviceutils.DeviceUtils, meta metadataservice.MetadataService, statter mountmanager.Statter) *GCENodeServer {
+func NewNodeServer(gceDriver *GCEDriver, mounter *mount.SafeFormatAndMount, deviceUtils deviceutils.DeviceUtils, meta metadataservice.MetadataService, statter mountmanager.Statter, args NodeServerArgs) *GCENodeServer {
 	return &GCENodeServer{
-		Driver:          gceDriver,
-		Mounter:         mounter,
-		DeviceUtils:     deviceUtils,
-		MetadataService: meta,
-		volumeLocks:     common.NewVolumeLocks(),
-		VolumeStatter:   statter,
+		Driver:                   gceDriver,
+		Mounter:                  mounter,
+		DeviceUtils:              deviceUtils,
+		MetadataService:          meta,
+		volumeLocks:              common.NewVolumeLocks(),
+		VolumeStatter:            statter,
+		enableDeviceInUseCheck:   args.EnableDeviceInUseCheck,
+		deviceInUseErrors:        newDeviceErrMap(args.DeviceInUseTimeout),
+		EnableDataCache:          args.EnableDataCache,
+		DataCacheEnabledNodePool: args.DataCacheEnabledNodePool,
 	}
 }
 
-func NewControllerServer(gceDriver *GCEDriver, cloudProvider gce.GCECompute, errorBackoffInitialDuration, errorBackoffMaxDuration time.Duration, fallbackRequisiteZones []string, enableStoragePools bool, multiZoneVolumeHandleConfig MultiZoneVolumeHandleConfig, listVolumesConfig ListVolumesConfig, provisionableDisksConfig ProvisionableDisksConfig) *GCEControllerServer {
+func NewControllerServer(gceDriver *GCEDriver, cloudProvider gce.GCECompute, errorBackoffInitialDuration, errorBackoffMaxDuration time.Duration, fallbackRequisiteZones []string, enableStoragePools bool, enableDataCache bool, multiZoneVolumeHandleConfig MultiZoneVolumeHandleConfig, listVolumesConfig ListVolumesConfig, provisionableDisksConfig ProvisionableDisksConfig, enableHdHA bool) *GCEControllerServer {
 	return &GCEControllerServer{
 		Driver:                      gceDriver,
 		CloudProvider:               cloudProvider,
@@ -164,18 +169,20 @@ func NewControllerServer(gceDriver *GCEDriver, cloudProvider gce.GCECompute, err
 		errorBackoff:                newCsiErrorBackoff(errorBackoffInitialDuration, errorBackoffMaxDuration),
 		fallbackRequisiteZones:      fallbackRequisiteZones,
 		enableStoragePools:          enableStoragePools,
+		enableDataCache:             enableDataCache,
 		multiZoneVolumeHandleConfig: multiZoneVolumeHandleConfig,
 		listVolumesConfig:           listVolumesConfig,
 		provisionableDisksConfig:    provisionableDisksConfig,
+		enableHdHA:                  enableHdHA,
 	}
 }
 
-func (gceDriver *GCEDriver) Run(endpoint string, grpcLogCharCap int, enableOtelTracing bool) {
+func (gceDriver *GCEDriver) Run(endpoint string, grpcLogCharCap int, enableOtelTracing bool, metricsManager *metrics.MetricsManager) {
 	maxLogChar = grpcLogCharCap
 
 	klog.V(4).Infof("Driver: %v", gceDriver.name)
 	//Start the nonblocking GRPC
-	s := NewNonBlockingGRPCServer(enableOtelTracing)
+	s := NewNonBlockingGRPCServer(enableOtelTracing, metricsManager)
 	// TODO(#34): Only start specific servers based on a flag.
 	// In the future have this only run specific combinations of servers depending on which version this is.
 	// The schema for that was in util. basically it was just s.start but with some nil servers.

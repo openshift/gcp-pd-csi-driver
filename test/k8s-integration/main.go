@@ -62,6 +62,7 @@ var (
 	storageClassFiles  = flag.String("storageclass-files", "", "name of storageclass yaml file to use for test relative to test/k8s-integration/config. This may be a comma-separated list to test multiple storage classes")
 	snapshotClassFiles = flag.String("snapshotclass-files", "", "name of snapshotclass yaml file to use for test relative to test/k8s-integration/config. This may be a comma-separated list to test multiple storage classes")
 	vacFiles           = flag.String("volumeattributesclass-files", "", "name of volumeattributesclass yaml file to use for test relative to test/k8s-integration/config. This may be a comma-separated list to test multiple volumeattributesclasses.")
+	scVacFile          = flag.String("storageclass-for-vac-file", "", "name of storageclass yaml file to use for test relative to test/k8s-integraion/config against the volumeattributesclass-files.")
 	inProw             = flag.Bool("run-in-prow", false, "is the test running in PROW")
 
 	// Driver flags
@@ -158,6 +159,10 @@ func main() {
 		ensureVariable(storageClassFiles, false, "storage-class-file and migration-test cannot both be set")
 	} else {
 		ensureVariable(storageClassFiles, true, "One of storageclass-file and migration-test must be set")
+	}
+
+	if len(*vacFiles) != 0 {
+		ensureVariable(scVacFile, true, "storageclass-for-vac-file must be set when volumeattributesclass-files is set")
 	}
 
 	if !*bringupCluster && *platform != "windows" {
@@ -563,6 +568,13 @@ func handle() error {
 				applicableVacFiles = append(applicableVacFiles, vacFile)
 			}
 		}
+		scForVac := ""
+		if len(*scVacFile) > 0 {
+			storageClassFile := strings.TrimSpace(*scVacFile)
+			if len(storageClassFile) != 0 {
+				scForVac = storageClassFile
+			}
+		}
 		var ginkgoErrors []string
 		var testOutputDirs []string
 
@@ -577,8 +589,8 @@ func handle() error {
 			}
 		}
 		// Run volume modify tests
-		if len(applicableStorageClassFiles) > 0 {
-			testParams.storageClassFile = applicableStorageClassFiles[0]
+		if len(scForVac) > 0 {
+			testParams.storageClassFile = scForVac
 			for _, vacFile := range applicableVacFiles {
 				outputDir := strings.TrimSuffix(vacFile, ".yaml")
 				testOutputDirs = append(testOutputDirs, outputDir)
@@ -587,6 +599,8 @@ func handle() error {
 					ginkgoErrors = append(ginkgoErrors, err.Error())
 				}
 			}
+			// Unset the VAC file for future tests
+			testParams.volumeAttributesClassFile = ""
 		}
 		// Run snapshot tests, if there are applicable files, using the first storage class.
 		if len(applicableStorageClassFiles) > 0 {
@@ -621,6 +635,9 @@ func handle() error {
 
 func generateGCETestSkip(testParams *testParameters) string {
 	skipString := "\\[Disruptive\\]|\\[Serial\\]"
+	// Skip mount options test until we fix the invalid mount options for xfs.
+	skipString = skipString + "|csi-gcepd-sc-xfs.*provisioning.should.provision.storage.with.mount.options"
+
 	v := apimachineryversion.MustParseSemantic(testParams.clusterVersion)
 
 	// "volumeMode should not mount / map unused volumes in a pod" tests a
@@ -671,8 +688,8 @@ func generateGKETestSkip(testParams *testParameters) string {
 		skipString = skipString + "|should.provision.correct.filesystem.size.when.restoring.snapshot.to.larger.size.pvc"
 	}
 
-	// VolumeAttributesClasses were promoted to beta in 1.31
-	if curVer.lessThan(mustParseVersion("1.31.0")) {
+	// VolumeAttributesClasses were promoted to beta in 1.31, but is not supported on managed driver.
+	if curVer.lessThan(mustParseVersion("1.31.0")) || testParams.useGKEManagedDriver {
 		skipString = skipString + "|VolumeAttributesClass"
 	}
 
@@ -797,13 +814,9 @@ func runTestsWithConfig(testParams *testParameters, testConfigArg, reportPrefix 
 		focuses = append(focuses, "VolumeSnapshotDataSource")
 	}
 
-	// If testParams.volumeAttributesClassFile is empty, then VAC tests will be automatically skipped. Otherwise confirm
-	// the right tests are run.
-	if testParams.volumeAttributesClassFile != "" && strings.Contains(skip, "VolumeAttributesClass") {
-		return fmt.Errorf("VolumeAttributesClass file %s specified, but VolumeAttributesClass tests are skipped: %s", testParams.volumeAttributesClassFile, skip)
-	}
-	if testParams.volumeAttributesClassFile != "" {
-		// If there is a VolumeAttributesClass file, run VAC tests
+	// testParams.volumeAttributesClassFile is always set, so rely on test skip to determine if VAC tests should
+	// be run.
+	if testParams.volumeAttributesClassFile != "" && !strings.Contains(skip, "VolumeAttributesClass") {
 		focuses = append(focuses, "VolumeAttributesClass")
 	}
 
@@ -854,16 +867,11 @@ func runTestsWithConfig(testParams *testParameters, testConfigArg, reportPrefix 
 			// path sent to kubetest2 through its --artifacts path
 
 			// pkg/_artifacts is the default value that kubetests uses for --artifacts
-			kubernetesTestBinariesPath := filepath.Join(testParams.pkgDir, "_artifacts")
-			if kubetestDumpDir != "" {
-				// a custom artifacts dir was set
-				kubernetesTestBinariesPath = kubetestDumpDir
-			}
+			kubernetesTestBinariesPath := filepath.Join(testParams.pkgDir, "_rundir")
 			kubernetesTestBinariesPath = filepath.Join(kubernetesTestBinariesPath, runID)
 
 			klog.Infof("Copying kubernetes binaries to path=%s to run the tests", kubernetesTestBinariesPath)
-			err := copyKubernetesTestBinaries(testParams.k8sSourceDir, kubernetesTestBinariesPath)
-			if err != nil {
+			if err := copyKubernetesTestBinaries(testParams.k8sSourceDir, kubernetesTestBinariesPath); err != nil {
 				return fmt.Errorf("failed to copy the kubernetes test binaries, err=%v", err.Error())
 			}
 			kubeTest2Args = append(kubeTest2Args, "--use-built-binaries")
