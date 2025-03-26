@@ -53,7 +53,6 @@ const (
 	pdDiskTypeUnsupportedPattern = `\[([a-z-]+)\] features are not compatible for creating instance`
 )
 
-var hyperdiskTypes = []string{"hyperdisk-extreme", "hyperdisk-throughput", "hyperdisk-balanced"}
 var pdDiskTypeUnsupportedRegex = regexp.MustCompile(pdDiskTypeUnsupportedPattern)
 
 type GCEAPIVersion string
@@ -99,9 +98,8 @@ type GCECompute interface {
 	GetDefaultProject() string
 	GetDefaultZone() string
 	// Disk Methods
-	GetDisk(ctx context.Context, project string, volumeKey *meta.Key, gceAPIVersion GCEAPIVersion) (*CloudDisk, error)
+	GetDisk(ctx context.Context, project string, volumeKey *meta.Key) (*CloudDisk, error)
 	RepairUnderspecifiedVolumeKey(ctx context.Context, project string, volumeKey *meta.Key) (string, *meta.Key, error)
-	ValidateExistingDisk(ctx context.Context, disk *CloudDisk, params common.DiskParameters, reqBytes, limBytes int64, multiWriter bool) error
 	InsertDisk(ctx context.Context, project string, volKey *meta.Key, params common.DiskParameters, capBytes int64, capacityRange *csi.CapacityRange, replicaZones []string, snapshotID string, volumeContentSourceVolumeID string, multiWriter bool, accessMode string) error
 	DeleteDisk(ctx context.Context, project string, volumeKey *meta.Key) error
 	UpdateDisk(ctx context.Context, project string, volKey *meta.Key, existingDisk *CloudDisk, params common.ModifyVolumeParameters) error
@@ -321,28 +319,16 @@ func (cloud *CloudProvider) ListSnapshots(ctx context.Context, filter string) ([
 	return items, "", nil
 }
 
-func (cloud *CloudProvider) GetDisk(ctx context.Context, project string, key *meta.Key, gceAPIVersion GCEAPIVersion) (*CloudDisk, error) {
+func (cloud *CloudProvider) GetDisk(ctx context.Context, project string, key *meta.Key) (*CloudDisk, error) {
 	klog.V(5).Infof("Getting disk %v", key)
 
-	// Override GCEAPIVersion as hyperdisk is only available in beta and we cannot get the disk-type with get disk call.
-	gceAPIVersion = GCEAPIVersionBeta
 	switch key.Type() {
 	case meta.Zonal:
-		if gceAPIVersion == GCEAPIVersionBeta {
-			disk, err := cloud.getZonalBetaDiskOrError(ctx, project, key.Zone, key.Name)
-			return CloudDiskFromBeta(disk), err
-		} else {
-			disk, err := cloud.getZonalDiskOrError(ctx, project, key.Zone, key.Name)
-			return CloudDiskFromV1(disk), err
-		}
+		disk, err := cloud.getZonalBetaDiskOrError(ctx, project, key.Zone, key.Name)
+		return CloudDiskFromBeta(disk), err
 	case meta.Regional:
-		if gceAPIVersion == GCEAPIVersionBeta {
-			disk, err := cloud.getRegionalBetaDiskOrError(ctx, project, key.Region, key.Name)
-			return CloudDiskFromBeta(disk), err
-		} else {
-			disk, err := cloud.getRegionalDiskOrError(ctx, project, key.Region, key.Name)
-			return CloudDiskFromV1(disk), err
-		}
+		disk, err := cloud.getRegionalBetaDiskOrError(ctx, project, key.Region, key.Name)
+		return CloudDiskFromBeta(disk), err
 	default:
 		return nil, fmt.Errorf("key was neither zonal nor regional, got: %v", key.String())
 	}
@@ -394,7 +380,7 @@ func (cloud *CloudProvider) getRegionURI(project, region string) string {
 		region)
 }
 
-func (cloud *CloudProvider) ValidateExistingDisk(ctx context.Context, resp *CloudDisk, params common.DiskParameters, reqBytes, limBytes int64, multiWriter bool) error {
+func ValidateExistingDisk(ctx context.Context, resp *CloudDisk, params common.DiskParameters, reqBytes, limBytes int64, multiWriter bool, accessMode string) error {
 	klog.V(5).Infof("Validating existing disk %v with diskType: %s, reqested bytes: %v, limit bytes: %v", resp, params.DiskType, reqBytes, limBytes)
 	if resp == nil {
 		return fmt.Errorf("disk does not exist")
@@ -407,12 +393,29 @@ func (cloud *CloudProvider) ValidateExistingDisk(ctx context.Context, resp *Clou
 			reqBytes, common.GbToBytes(resp.GetSizeGb()), limBytes)
 	}
 
-	// We are assuming here that a multiWriter disk could be used as non-multiWriter
-	if multiWriter && !resp.GetMultiWriter() {
+	if common.IsHyperdisk(params.DiskType) {
+		if !validAccessMode(accessMode, resp.GetAccessMode()) {
+			return fmt.Errorf("disk already exists with incompatible capability. Need %s. Got %s", accessMode, resp.GetAccessMode())
+		}
+	} else if multiWriter && !resp.GetMultiWriter() {
+		// We are assuming here that a multiWriter PD could be used as non-multiWriter
 		return fmt.Errorf("disk already exists with incompatible capability. Need MultiWriter. Got non-MultiWriter")
 	}
 
 	return ValidateDiskParameters(resp, params)
+}
+
+func validAccessMode(want, got string) bool {
+	if want == got {
+		return true
+	}
+	switch want {
+	case common.GCEReadOnlyManyAccessMode, common.GCEReadWriteOnceAccessMode:
+		return got == common.GCEReadWriteManyAccessMode
+	// For RWX, no other access mode is valid.
+	default:
+		return false
+	}
 }
 
 // ValidateDiskParameters takes a CloudDisk and returns true if the parameters
@@ -423,8 +426,8 @@ func ValidateDiskParameters(disk *CloudDisk, params common.DiskParameters) error
 	}
 
 	locationType := disk.LocationType()
-	if (params.ReplicationType == "none" && locationType != meta.Zonal) || (params.ReplicationType == "regional-pd" && locationType != meta.Regional) {
-		return fmt.Errorf("actual disk replication type %v did not match expected param %s", locationType, params.ReplicationType)
+	if (params.ReplicationType == "none" && locationType != meta.Zonal) || (params.IsRegional() && locationType != meta.Regional) {
+		return fmt.Errorf("actual replication type %v did not match expected param %s and %s", locationType, params.ReplicationType, params.DiskType)
 	}
 
 	if !KmsKeyEqual(
@@ -454,7 +457,7 @@ func (cloud *CloudProvider) InsertDisk(ctx context.Context, project string, volK
 		if description == "" {
 			description = "Regional disk created by GCE-PD CSI Driver"
 		}
-		return cloud.insertRegionalDisk(ctx, project, volKey, params, capBytes, capacityRange, replicaZones, snapshotID, volumeContentSourceVolumeID, description, multiWriter)
+		return cloud.insertRegionalDisk(ctx, project, volKey, params, capBytes, capacityRange, replicaZones, snapshotID, volumeContentSourceVolumeID, description, multiWriter, accessMode)
 	default:
 		return fmt.Errorf("could not insert disk, key was neither zonal nor regional, instead got: %v", volKey.String())
 	}
@@ -553,9 +556,6 @@ func convertV1DiskToBetaDisk(v1Disk *computev1.Disk) *computebeta.Disk {
 		AccessMode:        v1Disk.AccessMode,
 	}
 
-	// Hyperdisk doesn't currently support multiWriter (https://cloud.google.com/compute/docs/disks/hyperdisks#limitations),
-	// but if multiWriter + hyperdisk is supported in the future, we want the PDCSI driver to support this feature without
-	// any additional code change.
 	if v1Disk.ProvisionedIops > 0 {
 		betaDisk.ProvisionedIops = v1Disk.ProvisionedIops
 	}
@@ -619,9 +619,6 @@ func convertBetaDiskToV1Disk(betaDisk *computebeta.Disk) *computev1.Disk {
 		AccessMode:        betaDisk.AccessMode,
 	}
 
-	// Hyperdisk doesn't currently support multiWriter (https://cloud.google.com/compute/docs/disks/hyperdisks#limitations),
-	// but if multiWriter + hyperdisk is supported in the future, we want the PDCSI driver to support this feature without
-	// any additional code change.
 	if betaDisk.ProvisionedIops > 0 {
 		v1Disk.ProvisionedIops = betaDisk.ProvisionedIops
 	}
@@ -644,18 +641,14 @@ func (cloud *CloudProvider) insertRegionalDisk(
 	snapshotID string,
 	volumeContentSourceVolumeID string,
 	description string,
-	multiWriter bool) error {
+	multiWriter bool,
+	accessMode string) error {
 	var (
-		err           error
-		opName        string
-		gceAPIVersion = GCEAPIVersionV1
+		err    error
+		opName string
 	)
 
-	if multiWriter {
-		gceAPIVersion = GCEAPIVersionBeta
-	}
-
-	diskToCreate := &computev1.Disk{
+	diskToCreate := &computebeta.Disk{
 		Name:        volKey.Name,
 		SizeGb:      common.BytesToGbRoundUp(capBytes),
 		Description: description,
@@ -684,7 +677,7 @@ func (cloud *CloudProvider) insertRegionalDisk(
 		diskToCreate.ReplicaZones = replicaZones
 	}
 	if params.DiskEncryptionKMSKey != "" {
-		diskToCreate.DiskEncryptionKey = &computev1.CustomerEncryptionKey{
+		diskToCreate.DiskEncryptionKey = &computebeta.CustomerEncryptionKey{
 			KmsKeyName: params.DiskEncryptionKMSKey,
 		}
 	}
@@ -694,38 +687,35 @@ func (cloud *CloudProvider) insertRegionalDisk(
 	}
 
 	if len(resourceTags) > 0 {
-		diskToCreate.Params = &computev1.DiskParams{
+		diskToCreate.Params = &computebeta.DiskParams{
 			ResourceManagerTags: resourceTags,
 		}
 	}
 
-	if gceAPIVersion == GCEAPIVersionBeta {
-		var insertOp *computebeta.Operation
-		betaDiskToCreate := convertV1DiskToBetaDisk(diskToCreate)
-		betaDiskToCreate.MultiWriter = multiWriter
-		insertOp, err = cloud.betaService.RegionDisks.Insert(project, volKey.Region, betaDiskToCreate).Context(ctx).Do()
-		if insertOp != nil {
-			opName = insertOp.Name
-		}
+	if common.IsHyperdisk(params.DiskType) {
+		diskToCreate.AccessMode = accessMode
 	} else {
-		var insertOp *computev1.Operation
-		insertOp, err = cloud.service.RegionDisks.Insert(project, volKey.Region, diskToCreate).Context(ctx).Do()
-		if insertOp != nil {
-			opName = insertOp.Name
-		}
+		diskToCreate.MultiWriter = multiWriter
 	}
+
+	var insertOp *computebeta.Operation
+	insertOp, err = cloud.betaService.RegionDisks.Insert(project, volKey.Region, diskToCreate).Context(ctx).Do()
+	if insertOp != nil {
+		opName = insertOp.Name
+	}
+
 	if err != nil {
 		if IsGCEError(err, "alreadyExists") {
-			disk, err := cloud.GetDisk(ctx, project, volKey, gceAPIVersion)
+			disk, err := cloud.GetDisk(ctx, project, volKey)
 			if err != nil {
 				// failed to GetDisk, however the Disk may already exist
 				// the error code should be non-Final
 				return common.NewTemporaryError(codes.Unavailable, fmt.Errorf("error when getting disk: %w", err))
 			}
-			err = cloud.ValidateExistingDisk(ctx, disk, params,
+			err = ValidateExistingDisk(ctx, disk, params,
 				int64(capacityRange.GetRequiredBytes()),
 				int64(capacityRange.GetLimitBytes()),
-				multiWriter)
+				multiWriter, accessMode)
 			if err != nil {
 				return err
 			}
@@ -742,14 +732,14 @@ func (cloud *CloudProvider) insertRegionalDisk(
 	// the error code returned should be non-final
 	if err != nil {
 		if IsGCEError(err, "alreadyExists") {
-			disk, err := cloud.GetDisk(ctx, project, volKey, gceAPIVersion)
+			disk, err := cloud.GetDisk(ctx, project, volKey)
 			if err != nil {
 				return common.NewTemporaryError(codes.Unavailable, fmt.Errorf("error when getting disk: %w", err))
 			}
-			err = cloud.ValidateExistingDisk(ctx, disk, params,
+			err = ValidateExistingDisk(ctx, disk, params,
 				int64(capacityRange.GetRequiredBytes()),
 				int64(capacityRange.GetLimitBytes()),
-				multiWriter)
+				multiWriter, accessMode)
 			if err != nil {
 				return err
 			}
@@ -774,15 +764,11 @@ func (cloud *CloudProvider) insertZonalDisk(
 	multiWriter bool,
 	accessMode string) error {
 	var (
-		err           error
-		opName        string
-		gceAPIVersion = GCEAPIVersionV1
+		err    error
+		opName string
 	)
-	if multiWriter {
-		gceAPIVersion = GCEAPIVersionBeta
-	}
 
-	diskToCreate := &computev1.Disk{
+	diskToCreate := &computebeta.Disk{
 		Name:        volKey.Name,
 		SizeGb:      common.BytesToGbRoundUp(capBytes),
 		Description: description,
@@ -824,7 +810,7 @@ func (cloud *CloudProvider) insertZonalDisk(
 	}
 
 	if params.DiskEncryptionKMSKey != "" {
-		diskToCreate.DiskEncryptionKey = &computev1.CustomerEncryptionKey{
+		diskToCreate.DiskEncryptionKey = &computebeta.CustomerEncryptionKey{
 			KmsKeyName: params.DiskEncryptionKMSKey,
 		}
 	}
@@ -836,40 +822,35 @@ func (cloud *CloudProvider) insertZonalDisk(
 	}
 
 	if len(resourceTags) > 0 {
-		diskToCreate.Params = &computev1.DiskParams{
+		diskToCreate.Params = &computebeta.DiskParams{
 			ResourceManagerTags: resourceTags,
 		}
 	}
-	diskToCreate.AccessMode = accessMode
 
-	if gceAPIVersion == GCEAPIVersionBeta {
-		var insertOp *computebeta.Operation
-		betaDiskToCreate := convertV1DiskToBetaDisk(diskToCreate)
-		betaDiskToCreate.MultiWriter = multiWriter
-		insertOp, err = cloud.betaService.Disks.Insert(project, volKey.Zone, betaDiskToCreate).Context(ctx).Do()
-		if insertOp != nil {
-			opName = insertOp.Name
-		}
+	if common.IsHyperdisk(params.DiskType) {
+		diskToCreate.AccessMode = accessMode
 	} else {
-		var insertOp *computev1.Operation
-		insertOp, err = cloud.service.Disks.Insert(project, volKey.Zone, diskToCreate).Context(ctx).Do()
-		if insertOp != nil {
-			opName = insertOp.Name
-		}
+		diskToCreate.MultiWriter = multiWriter
+	}
+
+	var insertOp *computebeta.Operation
+	insertOp, err = cloud.betaService.Disks.Insert(project, volKey.Zone, diskToCreate).Context(ctx).Do()
+	if insertOp != nil {
+		opName = insertOp.Name
 	}
 
 	if err != nil {
 		if IsGCEError(err, "alreadyExists") {
-			disk, err := cloud.GetDisk(ctx, project, volKey, gceAPIVersion)
+			disk, err := cloud.GetDisk(ctx, project, volKey)
 			if err != nil {
 				// failed to GetDisk, however the Disk may already exist
 				// the error code should be non-Final
 				return common.NewTemporaryError(codes.Unavailable, fmt.Errorf("error when getting disk: %w", err))
 			}
-			err = cloud.ValidateExistingDisk(ctx, disk, params,
+			err = ValidateExistingDisk(ctx, disk, params,
 				int64(capacityRange.GetRequiredBytes()),
 				int64(capacityRange.GetLimitBytes()),
-				multiWriter)
+				multiWriter, accessMode)
 			if err != nil {
 				return err
 			}
@@ -887,14 +868,14 @@ func (cloud *CloudProvider) insertZonalDisk(
 		// failed to wait for Op to finish, however, the Op possibly is still running as expected
 		// the error code returned should be non-final
 		if IsGCEError(err, "alreadyExists") {
-			disk, err := cloud.GetDisk(ctx, project, volKey, gceAPIVersion)
+			disk, err := cloud.GetDisk(ctx, project, volKey)
 			if err != nil {
 				return common.NewTemporaryError(codes.Unavailable, fmt.Errorf("error when getting disk: %w", err))
 			}
-			err = cloud.ValidateExistingDisk(ctx, disk, params,
+			err = ValidateExistingDisk(ctx, disk, params,
 				int64(capacityRange.GetRequiredBytes()),
 				int64(capacityRange.GetLimitBytes()),
-				multiWriter)
+				multiWriter, accessMode)
 			if err != nil {
 				return err
 			}
@@ -1186,7 +1167,7 @@ func (cloud *CloudProvider) waitForAttachOnDisk(ctx context.Context, project str
 	start := time.Now()
 	return wait.ExponentialBackoff(AttachDiskBackoff, func() (bool, error) {
 		klog.V(6).Infof("Polling disks.get for attach of disk %v to instance %v to complete for %v", volKey.Name, instanceName, time.Since(start))
-		disk, err := cloud.GetDisk(ctx, project, volKey, GCEAPIVersionV1)
+		disk, err := cloud.GetDisk(ctx, project, volKey)
 		if err != nil {
 			return false, fmt.Errorf("GetDisk failed to get disk: %w", err)
 		}
@@ -1436,7 +1417,7 @@ func (cloud *CloudProvider) DeleteImage(ctx context.Context, project, imageName 
 // k8s.io/apimachinery/quantity package for better size handling
 func (cloud *CloudProvider) ResizeDisk(ctx context.Context, project string, volKey *meta.Key, requestBytes int64) (int64, error) {
 	klog.V(5).Infof("Resizing disk %v to size %v", volKey, requestBytes)
-	cloudDisk, err := cloud.GetDisk(ctx, project, volKey, GCEAPIVersionV1)
+	cloudDisk, err := cloud.GetDisk(ctx, project, volKey)
 	if err != nil {
 		return -1, fmt.Errorf("failed to get disk: %w", err)
 	}
@@ -1759,14 +1740,4 @@ func encodeTags(tags map[string]string) (string, error) {
 		return "", fmt.Errorf("failed to encodeTags %v: %w", tags, err)
 	}
 	return string(enc), nil
-}
-
-func containsBetaDiskType(betaDiskTypes []string, diskType string) bool {
-	for _, betaDiskType := range betaDiskTypes {
-		if betaDiskType == diskType {
-			return true
-		}
-	}
-
-	return false
 }

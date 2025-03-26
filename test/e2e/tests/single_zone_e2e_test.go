@@ -44,30 +44,40 @@ import (
 const (
 	testNamePrefix = "gcepd-csi-e2e-"
 
-	defaultSizeGb                     int64 = 5
-	defaultExtremeSizeGb              int64 = 500
-	defaultHdTSizeGb                  int64 = 2048
-	defaultHdmlSizeGb                 int64 = 200
-	defaultRepdSizeGb                 int64 = 200
-	defaultMwSizeGb                   int64 = 200
-	defaultVolumeLimit                int64 = 127
-	invalidSizeGb                     int64 = 66000
-	readyState                              = "READY"
-	standardDiskType                        = "pd-standard"
-	ssdDiskType                             = "pd-ssd"
-	extremeDiskType                         = "pd-extreme"
-	hdtDiskType                             = "hyperdisk-throughput"
-	hdmlDiskType                            = "hyperdisk-ml"
-	provisionedIOPSOnCreate                 = "12345"
-	provisionedIOPSOnCreateInt              = int64(12345)
-	provisionedIOPSOnCreateDefaultInt       = int64(100000)
-	provisionedThroughputOnCreate           = "66Mi"
-	provisionedThroughputOnCreateInt        = int64(66)
-	defaultEpsilon                          = 500000000 // 500M
+	defaultSizeGb                       int64 = 5
+	defaultExtremeSizeGb                int64 = 500
+	defaultHdBSizeGb                    int64 = 100
+	defaultHdXSizeGb                    int64 = 100
+	defaultHdTSizeGb                    int64 = 2048
+	defaultHdmlSizeGb                   int64 = 200
+	defaultRepdSizeGb                   int64 = 200
+	defaultMwSizeGb                     int64 = 200
+	defaultVolumeLimit                  int64 = 127
+	invalidSizeGb                       int64 = 66000
+	readyState                                = "READY"
+	standardDiskType                          = "pd-standard"
+	ssdDiskType                               = "pd-ssd"
+	extremeDiskType                           = "pd-extreme"
+	hdbDiskType                               = "hyperdisk-balanced"
+	hdxDiskType                               = "hyperdisk-extreme"
+	hdtDiskType                               = "hyperdisk-throughput"
+	hdmlDiskType                              = "hyperdisk-ml"
+	hdhaDiskType                              = "hyperdisk-balanced-high-availability"
+	provisionedIOPSOnCreate                   = "12345"
+	provisionedIOPSOnCreateInt                = int64(12345)
+	provisionedIOPSOnCreateDefaultInt         = int64(100000)
+	provisionedIOPSOnCreateHdb                = "3000"
+	provisionedIOPSOnCreateHdbInt             = int64(3000)
+	provisionedIOPSOnCreateHdx                = "200"
+	provisionedIOPSOnCreateHdxInt             = int64(200)
+	provisionedThroughputOnCreate             = "66Mi"
+	provisionedThroughputOnCreateInt          = int64(66)
+	provisionedThroughputOnCreateHdb          = "150Mi"
+	provisionedThroughputOnCreateHdbInt       = int64(150)
+	defaultEpsilon                            = 500000000 // 500M
 )
 
 var _ = Describe("GCE PD CSI Driver", func() {
-
 	It("Should get reasonable volume limits from nodes with NodeGetInfo", func() {
 		testContext := getRandomTestContext()
 		resp, err := testContext.Client.NodeGetInfo()
@@ -892,19 +902,14 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		Expect(err).To(BeNil(), "Failed to go through volume lifecycle")
 	})
 
-	// Pending while multi-writer feature is in Alpha
-	PIt("Should create and delete multi-writer disk", func() {
+	It("Should create and delete multi-writer disk", func() {
 		Expect(testContexts).ToNot(BeEmpty())
-		testContext := getRandomTestContext()
+		testContext := getRandomMwTestContext()
 
-		p, _, _ := testContext.Instance.GetIdentity()
+		p, z, _ := testContext.Instance.GetIdentity()
 		client := testContext.Client
-
-		// Hardcode to us-east1-a while feature is in alpha
-		zone := "us-east1-a"
-
 		// Create and Validate Disk
-		volName, volID := createAndValidateUniqueZonalMultiWriterDisk(client, p, zone, standardDiskType)
+		volName, volID := createAndValidateUniqueZonalMultiWriterDisk(client, p, z, hdbDiskType)
 
 		defer func() {
 			// Delete Disk
@@ -912,21 +917,20 @@ var _ = Describe("GCE PD CSI Driver", func() {
 			Expect(err).To(BeNil(), "DeleteVolume failed")
 
 			// Validate Disk Deleted
-			_, err = computeAlphaService.Disks.Get(p, zone, volName).Do()
+			_, err = computeService.Disks.Get(p, z, volName).Do()
 			Expect(gce.IsGCEError(err, "notFound")).To(BeTrue(), "Expected disk to not be found")
 		}()
 	})
 
-	// Pending while multi-writer feature is in Alpha
-	PIt("Should complete entire disk lifecycle with multi-writer disk", func() {
-		testContext := getRandomTestContext()
+	It("Should complete entire disk lifecycle with multi-writer disk", func() {
+		testContext := getRandomMwTestContext()
 
 		p, z, _ := testContext.Instance.GetIdentity()
 		client := testContext.Client
 		instance := testContext.Instance
 
 		// Create and Validate Disk
-		volName, volID := createAndValidateUniqueZonalMultiWriterDisk(client, p, z, standardDiskType)
+		volName, volID := createAndValidateUniqueZonalMultiWriterDisk(client, p, z, hdbDiskType)
 
 		defer func() {
 			// Delete Disk
@@ -1612,6 +1616,8 @@ func deleteVolumeOrError(client *remote.CsiClient, volID string) {
 func createAndValidateUniqueZonalMultiWriterDisk(client *remote.CsiClient, project, zone string, diskType string) (string, string) {
 	// Create Disk
 	disk := typeToDisk[diskType]
+
+	disk.params[common.ParameterAccessMode] = "READ_WRITE_MANY"
 	volName := testNamePrefix + string(uuid.NewUUID())
 	volume, err := client.CreateVolumeWithCaps(volName, disk.params, defaultMwSizeGb,
 		&csi.TopologyRequirement{
@@ -1639,11 +1645,8 @@ func createAndValidateUniqueZonalMultiWriterDisk(client *remote.CsiClient, proje
 	Expect(cloudDisk.Status).To(Equal(readyState))
 	Expect(cloudDisk.SizeGb).To(Equal(defaultMwSizeGb))
 	Expect(cloudDisk.Name).To(Equal(volName))
+	Expect(cloudDisk.AccessMode).To(Equal("READ_WRITE_MANY"))
 	disk.validate(cloudDisk)
-
-	alphaDisk, err := computeAlphaService.Disks.Get(project, zone, volName).Do()
-	Expect(err).To(BeNil(), "Failed to get cloud disk using alpha API")
-	Expect(alphaDisk.MultiWriter).To(Equal(true))
 
 	return volName, volume.VolumeId
 }
