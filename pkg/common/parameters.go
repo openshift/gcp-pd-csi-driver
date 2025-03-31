@@ -22,6 +22,9 @@ import (
 )
 
 const (
+	// Disk Params
+	ParameterAccessMode = "access-mode"
+
 	// Parameters for StorageClass
 	ParameterKeyType                          = "type"
 	ParameterKeyReplicationType               = "replication-type"
@@ -32,8 +35,9 @@ const (
 	ParameterAvailabilityClass                = "availability-class"
 	ParameterKeyEnableConfidentialCompute     = "enable-confidential-storage"
 	ParameterKeyStoragePools                  = "storage-pools"
-	ParameterKeyResourceTags                  = "resource-tags"
-	ParameterKeyEnableMultiZoneProvisioning   = "enable-multi-zone-provisioning"
+
+	ParameterKeyResourceTags                = "resource-tags"
+	ParameterKeyEnableMultiZoneProvisioning = "enable-multi-zone-provisioning"
 
 	// Parameters for VolumeSnapshotClass
 	ParameterKeyStorageLocations = "storage-locations"
@@ -67,6 +71,11 @@ const (
 	tagKeyCreatedForSnapshotName        = "kubernetes.io/created-for/volumesnapshot/name"
 	tagKeyCreatedForSnapshotNamespace   = "kubernetes.io/created-for/volumesnapshot/namespace"
 	tagKeyCreatedForSnapshotContentName = "kubernetes.io/created-for/volumesnapshotcontent/name"
+
+	// Hyperdisk disk types
+	DiskTypeHdHA = "hyperdisk-balanced-high-availability"
+	DiskTypeHdT  = "hyperdisk-throughput"
+	DiskTypeHdE  = "hyperdisk-extreme"
 )
 
 // DiskParameters contains normalized and defaulted disk parameters
@@ -106,6 +115,13 @@ type DiskParameters struct {
 	// Values: {bool}
 	// Default: false
 	MultiZoneProvisioning bool
+	// Values: READ_WRITE_SINGLE, READ_ONLY_MANY, READ_WRITE_MANY
+	// Default: READ_WRITE_SINGLE
+	AccessMode string
+}
+
+func (dp *DiskParameters) IsRegional() bool {
+	return dp.ReplicationType == "regional-pd" || dp.DiskType == DiskTypeHdHA
 }
 
 // SnapshotParameters contains normalized and defaulted parameters for snapshots
@@ -129,6 +145,7 @@ type ParameterProcessor struct {
 	DriverName         string
 	EnableStoragePools bool
 	EnableMultiZone    bool
+	EnableHdHA         bool
 }
 
 type ModifyVolumeParameters struct {
@@ -167,6 +184,9 @@ func (pp *ParameterProcessor) ExtractAndDefaultParameters(parameters map[string]
 		case ParameterKeyType:
 			if v != "" {
 				p.DiskType = strings.ToLower(v)
+				if !pp.EnableHdHA && p.DiskType == DiskTypeHdHA {
+					return p, fmt.Errorf("parameters contain invalid disk type %s", DiskTypeHdHA)
+				}
 			}
 		case ParameterKeyReplicationType:
 			if v != "" {
@@ -249,6 +269,10 @@ func (pp *ParameterProcessor) ExtractAndDefaultParameters(parameters map[string]
 			p.MultiZoneProvisioning = paramEnableMultiZoneProvisioning
 			if paramEnableMultiZoneProvisioning {
 				p.Labels[MultiZoneLabel] = "true"
+			}
+		case ParameterAccessMode:
+			if v != "" {
+				p.AccessMode = v
 			}
 		default:
 			return p, fmt.Errorf("parameters contains invalid option %q", k)
