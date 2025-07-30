@@ -51,7 +51,7 @@ var (
 	numNodes             = flag.Int("num-nodes", 0, "the number of nodes in the test cluster")
 	numWindowsNodes      = flag.Int("num-windows-nodes", 0, "the number of Windows nodes in the test cluster")
 	imageType            = flag.String("image-type", "cos_containerd", "the image type to use for the cluster")
-	gkeReleaseChannel    = flag.String("gke-release-channel", "", "GKE release channel to be used for cluster deploy. One of 'rapid', 'stable' or 'regular'")
+	gkeReleaseChannel    = flag.String("gke-release-channel", "", "GKE release channel to be used for cluster deploy. One of 'rapid', 'stable', 'regular' or 'extended'")
 	gkeTestClusterPrefix = flag.String("gke-cluster-prefix", "pdcsi", "Prefix of GKE cluster names. A random suffix will be appended to form the full name.")
 	gkeTestClusterName   = flag.String("gke-cluster-name", "", "Name of existing cluster")
 	gkeNodeVersion       = flag.String("gke-node-version", "", "GKE cluster worker node version")
@@ -176,8 +176,10 @@ func main() {
 
 	if *deploymentStrat == "gke" {
 		ensureVariable(kubeVersion, false, "Cannot set kube-version when using deployment strategy 'gke'. Use gke-cluster-version.")
-		ensureExactlyOneVariableSet([]*string{gkeClusterVer, gkeReleaseChannel},
-			"For GKE cluster deployment, exactly one of 'gke-cluster-version' or 'gke-release-channel' must be set")
+		if *gkeReleaseChannel != "extended" {
+			ensureExactlyOneVariableSet([]*string{gkeClusterVer, gkeReleaseChannel},
+				"For GKE cluster deployment, exactly one of 'gke-cluster-version' or 'gke-release-channel' must be set")
+		}
 		ensureVariable(kubeFeatureGates, false, "Cannot set feature gates when using deployment strategy 'gke'.")
 		if len(*localK8sDir) == 0 {
 			ensureVariable(testVersion, true, "Must set either test-version or local k8s dir when using deployment strategy 'gke'.")
@@ -300,7 +302,7 @@ func handle() error {
 	// Build and push the driver, if required. Defer the driver image deletion.
 	if *doDriverBuild {
 		klog.Infof("Building GCE PD CSI Driver")
-		err := pushImage(testParams.pkgDir, *stagingImage, testParams.stagingVersion, testParams.platform)
+		err := pushImage(testParams.pkgDir, *stagingImage, testParams.stagingVersion, testParams.platform, *imageType)
 		if err != nil {
 			return fmt.Errorf("failed pushing image: %v", err.Error())
 		}
@@ -743,6 +745,13 @@ func generateGKETestSkip(testParams *testParameters) string {
 
 	// Skip mount options test until we fix the invalid mount options for xfs.
 	skipString = skipString + "|csi-gcepd-sc-xfs.*provisioning.should.provision.storage.with.mount.options"
+
+	// Skip rwop test when node version is less than 1.32.  Test was added only
+	// in 1.32 and above, see tags in
+	// https://github.com/kubernetes/kubernetes/pull/128244.
+	if nodeVer != nil && nodeVer.lessThan(mustParseVersion("1.32.0")) {
+		skipString = skipString + "|rwop.pod.created.with.an.initial.fsgroup..new.pod.fsgroup.applied.to.volume.contents"
+	}
 
 	return skipString
 }

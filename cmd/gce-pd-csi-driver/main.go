@@ -76,6 +76,7 @@ var (
 	enableStoragePoolsFlag      = flag.Bool("enable-storage-pools", false, "If set to true, the CSI Driver will allow volumes to be provisioned in Storage Pools")
 	enableHdHAFlag              = flag.Bool("allow-hdha-provisioning", false, "If set to true, will allow the driver to provision Hyperdisk-balanced High Availability disks")
 	enableDataCacheFlag         = flag.Bool("enable-data-cache", false, "If set to true, the CSI Driver will allow volumes to be provisioned with Data Cache configuration")
+	enableMultitenancyFlag      = flag.Bool("enable-multitenancy", false, "If set to true, the CSI Driver will support running on multitenant GKE clusters")
 	nodeName                    = flag.String("node-name", "", "The node this driver is running on")
 
 	multiZoneVolumeHandleDiskTypesFlag = flag.String("multi-zone-volume-handle-disk-types", "", "Comma separated list of allowed disk types that can use the multi-zone volumeHandle. Used only if --multi-zone-volume-handle-enable")
@@ -93,6 +94,8 @@ var (
 	diskSupportsThroughputChangeFlag = flag.String("supports-dynamic-throughput-provisioning", "", "Comma separated list of disk types that support dynamic throughput provisioning")
 
 	extraTagsStr = flag.String("extra-tags", "", "Extra tags to attach to each Compute Disk, Image, Snapshot created. It is a comma separated list of parent id, key and value like '<parent_id1>/<tag_key1>/<tag_value1>,...,<parent_idN>/<tag_keyN>/<tag_valueN>'. parent_id is the Organization or the Project ID or Project name where the tag key and the tag value resources exist. A maximum of 50 tags bindings is allowed for a resource. See https://cloud.google.com/resource-manager/docs/tags/tags-overview, https://cloud.google.com/resource-manager/docs/tags/tags-creating-and-managing for details")
+
+	diskTopology = flag.Bool("disk-topology", false, "If set to true, the driver will add a disk-type.gke.io/[disk-type] topology label when the StorageClass has the use-allowed-disk-topology parameter set to true. That topology label is included in the Topologies returned in CreateVolumeResponse. This flag is disabled by default.")
 
 	version string
 )
@@ -149,13 +152,22 @@ func handle() {
 	}
 
 	var metricsManager *metrics.MetricsManager = nil
-	if *runControllerService && *httpEndpoint != "" {
+	runServiceWithMetrics := *runControllerService || *runNodeService
+	if runServiceWithMetrics && *httpEndpoint != "" {
 		mm := metrics.NewMetricsManager()
 		mm.InitializeHttpHandler(*httpEndpoint, *metricsPath)
-		mm.RegisterPDCSIMetric()
 
-		if metrics.IsGKEComponentVersionAvailable() {
-			mm.EmitGKEComponentVersion()
+		switch {
+		case *runControllerService:
+			mm.RegisterPDCSIMetric()
+			if metrics.IsGKEComponentVersionAvailable() {
+				mm.EmitGKEComponentVersion()
+			}
+		case *runNodeService:
+			if err := mm.EmmitProcessStartTime(); err != nil {
+				klog.Errorf("Failed to emit process start time: %v", err.Error())
+			}
+			mm.RegisterMountMetric()
 		}
 		metricsManager = &mm
 	}
@@ -221,13 +233,25 @@ func handle() {
 	// Initialize requirements for the controller service
 	var controllerServer *driver.GCEControllerServer
 	if *runControllerService {
-		cloudProvider, err := gce.CreateCloudProvider(ctx, version, *cloudConfigFilePath, computeEndpoint, computeEnvironment, waitForAttachConfig, listInstancesConfig)
+		cloudProvider, err := gce.CreateCloudProvider(ctx, version, *cloudConfigFilePath, computeEndpoint, computeEnvironment, waitForAttachConfig, listInstancesConfig, *enableMultitenancyFlag)
 		if err != nil {
 			klog.Fatalf("Failed to get cloud provider: %v", err.Error())
 		}
+
+		if *enableMultitenancyFlag {
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			go cloudProvider.TenantInformer.Run(ctx.Done())
+		}
+
 		initialBackoffDuration := time.Duration(*errorBackoffInitialDurationMs) * time.Millisecond
 		maxBackoffDuration := time.Duration(*errorBackoffMaxDurationMs) * time.Millisecond
-		controllerServer = driver.NewControllerServer(gceDriver, cloudProvider, initialBackoffDuration, maxBackoffDuration, fallbackRequisiteZones, *enableStoragePoolsFlag, *enableDataCacheFlag, multiZoneVolumeHandleConfig, listVolumesConfig, provisionableDisksConfig, *enableHdHAFlag)
+		// TODO(2042): Move more of the constructor args into this struct
+		args := &driver.GCEControllerServerArgs{
+			EnableDiskTopology: *diskTopology,
+		}
+
+		controllerServer = driver.NewControllerServer(gceDriver, cloudProvider, initialBackoffDuration, maxBackoffDuration, fallbackRequisiteZones, *enableStoragePoolsFlag, *enableDataCacheFlag, multiZoneVolumeHandleConfig, listVolumesConfig, provisionableDisksConfig, *enableHdHAFlag, args)
 	} else if *cloudConfigFilePath != "" {
 		klog.Warningf("controller service is disabled but cloud config given - it has no effect")
 	}
@@ -239,6 +263,7 @@ func handle() {
 		if err != nil {
 			klog.Fatalf("Failed to get safe mounter: %v", err.Error())
 		}
+
 		deviceUtils := deviceutils.NewDeviceUtils()
 		statter := mountmanager.NewStatter(mounter)
 		meta, err := metadataservice.NewMetadataService()
@@ -249,13 +274,18 @@ func handle() {
 		if err != nil {
 			klog.Fatalf("Failed to get node info from API server: %v", err.Error())
 		}
-		nsArgs := driver.NodeServerArgs{
+
+		// TODO(2042): Move more of the constructor args into this struct
+		nsArgs := &driver.NodeServerArgs{
 			EnableDeviceInUseCheck:   *enableDeviceInUseCheck,
 			DeviceInUseTimeout:       *deviceInUseTimeout,
 			EnableDataCache:          *enableDataCacheFlag,
 			DataCacheEnabledNodePool: isDataCacheEnabledNodePool,
+			SysfsPath:                "/sys",
+			MetricsManager:           metricsManager,
 		}
 		nodeServer = driver.NewNodeServer(gceDriver, mounter, deviceUtils, meta, statter, nsArgs)
+
 		if *maxConcurrentFormatAndMount > 0 {
 			nodeServer = nodeServer.WithSerializedFormatAndMount(*formatAndMountTimeout, *maxConcurrentFormatAndMount)
 		}

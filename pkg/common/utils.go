@@ -30,6 +30,7 @@ import (
 	"github.com/GoogleCloudPlatform/k8s-cloud-provider/pkg/cloud/meta"
 	"github.com/googleapis/gax-go/v2/apierror"
 	"golang.org/x/time/rate"
+	computev1 "google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -80,6 +81,12 @@ const (
 	//   projects/{project}/zones/{zone}
 	zoneURIPattern = "projects/[^/]+/zones/([^/]+)$"
 	alphanums      = "bcdfghjklmnpqrstvwxz2456789"
+
+	HyperdiskBalancedIopsPerGB         = 500
+	HyperdiskBalancedMinIops           = 3000
+	HyperdiskExtremeIopsPerGB          = 2
+	HyperdiskThroughputThroughputPerGB = 10
+	BytesInGB                          = 1024
 )
 
 var (
@@ -184,17 +191,22 @@ func NodeIDToZoneAndName(id string) (string, string, error) {
 }
 
 func GetRegionFromZones(zones []string) (string, error) {
+	const tpcPrefix = "u"
 	regions := sets.String{}
 	if len(zones) < 1 {
 		return "", fmt.Errorf("no zones specified")
 	}
 	for _, zone := range zones {
 		// Zone expected format {locale}-{region}-{zone}
+		// TPC zone expected format is u-{}-{}-{}, e.g. u-europe-central2-a. See go/tpc-region-naming.
 		splitZone := strings.Split(zone, "-")
-		if len(splitZone) != 3 {
-			return "", fmt.Errorf("zone in unexpected format, expected: {locale}-{region}-{zone}, got: %v", zone)
+		if len(splitZone) == 3 {
+			regions.Insert(strings.Join(splitZone[0:2], "-"))
+		} else if len(splitZone) == 4 && splitZone[0] == tpcPrefix {
+			regions.Insert(strings.Join(splitZone[0:3], "-"))
+		} else {
+			return "", fmt.Errorf("zone in unexpected format, expected: {locale}-{region}-{zone} or u-{locale}-{region}-{zone}, got: %v", zone)
 		}
-		regions.Insert(strings.Join(splitZone[0:2], "-"))
 	}
 	if regions.Len() != 1 {
 		return "", fmt.Errorf("multiple or no regions gotten from zones, got: %v", regions)
@@ -758,4 +770,80 @@ func MapNumber(num int64) int64 {
 		}
 	}
 	return 0
+}
+
+func DiskTypeLabelKey(diskType string) string {
+	return fmt.Sprintf("%s/%s", DiskTypeKeyPrefix, diskType)
+}
+
+// IsUpdateIopsThroughputValuesAllowed checks if a disk type is hyperdisk,
+// which implies that IOPS and throughput values can be updated.
+func IsUpdateIopsThroughputValuesAllowed(disk *computev1.Disk) bool {
+	// Sample formats:
+	// https://www.googleapis.com/compute/v1/{gce.projectID}/zones/{disk.Zone}/diskTypes/{disk.Type}"
+	// https://www.googleapis.com/compute/v1/{gce.projectID}/regions/{disk.Region}/diskTypes/{disk.Type}"
+	return strings.Contains(disk.Type, "hyperdisk")
+}
+
+// GetMinIopsThroughput calculates and returns the minimum required IOPS and throughput
+// based on the existing disk configuration and the requested new GiB.
+// The `needed` return value indicates whether either IOPS or throughput need to be updated.
+// https://cloud.google.com/compute/docs/disks/hyperdisks#limits-disk
+func GetMinIopsThroughput(disk *computev1.Disk, requestGb int64) (needed bool, minIops int64, minThroughput int64) {
+	switch {
+	case strings.Contains(disk.Type, "hyperdisk-balanced"):
+		// This includes types "hyperdisk-balanced" and "hyperdisk-balanced-high-availability"
+		return minIopsForBalanced(disk, requestGb)
+	case strings.Contains(disk.Type, "hyperdisk-extreme"):
+		return minIopsForExtreme(disk, requestGb)
+	case strings.Contains(disk.Type, "hyperdisk-ml"):
+		return minThroughputForML(disk, requestGb)
+	case strings.Contains(disk.Type, "hyperdisk-throughput"):
+		return minThroughputForThroughput(disk, requestGb)
+	default:
+		return false, 0, 0
+	}
+}
+
+// minIopsForBalanced calculates and returns the minimum required IOPS and throughput
+// for hyperdisk-balanced and hyperdisk-balanced-high-availability disks
+func minIopsForBalanced(disk *computev1.Disk, requestGb int64) (needed bool, minIops int64, minThroughput int64) {
+	minRequiredIops := requestGb * HyperdiskBalancedIopsPerGB
+	if minRequiredIops > HyperdiskBalancedMinIops {
+		minRequiredIops = HyperdiskBalancedMinIops
+	}
+	if disk.ProvisionedIops < minRequiredIops {
+		return true, minRequiredIops, 0
+	}
+	return false, 0, 0
+}
+
+// minIopsForExtreme calculates and returns the minimum required IOPS and throughput
+// for hyperdisk-extreme disks
+func minIopsForExtreme(disk *computev1.Disk, requestGb int64) (needed bool, minIops int64, minThroughput int64) {
+	minRequiredIops := requestGb * HyperdiskExtremeIopsPerGB
+	if disk.ProvisionedIops < minRequiredIops {
+		return true, minRequiredIops, 0
+	}
+	return false, 0, 0
+}
+
+// minThroughputForML calculates and returns the minimum required IOPS and throughput
+// for hyperdisk-ml disks
+func minThroughputForML(disk *computev1.Disk, requestGb int64) (needed bool, minIops int64, minThroughput int64) {
+	minRequiredThroughput := int64(float64(requestGb) * 0.12)
+	if disk.ProvisionedThroughput < minRequiredThroughput {
+		return true, 0, minRequiredThroughput
+	}
+	return false, 0, 0
+}
+
+// minThroughputForThroughput calculates and returns the minimum required IOPS and throughput
+// for hyperdisk-throughput disks
+func minThroughputForThroughput(disk *computev1.Disk, requestGb int64) (needed bool, minIops int64, minThroughput int64) {
+	minRequiredThroughput := requestGb * HyperdiskThroughputThroughputPerGB / BytesInGB
+	if disk.ProvisionedThroughput < minRequiredThroughput {
+		return true, 0, minRequiredThroughput
+	}
+	return false, 0, 0
 }

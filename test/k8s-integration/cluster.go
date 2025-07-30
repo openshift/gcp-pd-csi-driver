@@ -155,6 +155,9 @@ func setImageTypeEnvs(imageType string) error {
 	case "cos":
 	case "cos_containerd":
 	case "gci": // GCI/COS is default type and does not need env vars set
+	case "win2019", "win2022":
+		// These are handled by the WINDOWS_NODE_OS_DISTRIBUTION env var and
+		// ingested in https://github.com/kubernetes/kubernetes/blob/ded2956c832502da8a0678f5392c24af1cc9dfc0/cluster/gce/util.sh#L112.
 	case "ubuntu", "ubuntu_containerd":
 		return errors.New("setting environment vars for bringing up *ubuntu* cluster on GCE is unimplemented")
 		/* TODO(dyzz) figure out how to bring up a Ubuntu cluster on GCE. The below doesn't work.
@@ -198,16 +201,43 @@ func clusterUpGKE(gceZone, gceRegion string, numNodes int, numWindowsNodes int, 
 		}
 	}
 
-	var cmd *exec.Cmd
+	// Assemble parameters from passed in arguments.
 	cmdParams := []string{"container", "clusters", "create", *gkeTestClusterName,
 		locationArg, locationVal, "--num-nodes", strconv.Itoa(numNodes),
-		"--quiet", "--machine-type", "n1-standard-2", "--image-type", imageType, "--no-enable-autoupgrade"}
-	if isVariableSet(gkeClusterVer) {
+		"--quiet", "--machine-type", "n1-standard-2", "--no-enable-autoupgrade"}
+
+	if imageType == "win2019" || imageType == "win2022" {
+		cmdParams = append(cmdParams, "--image-type", "WINDOWS_LTSC_CONTAINERD")
+		if imageType == "win2019" {
+			cmdParams = append(cmdParams, "--windows-os-version", "ltsc2019")
+		} else {
+			cmdParams = append(cmdParams, "--windows-os-version", "ltsc2022")
+		}
+	} else {
+		cmdParams = append(cmdParams, "--image-type", imageType)
+	}
+
+	if isVariableSet(gkeReleaseChannel) {
+		cmdParams = append(cmdParams, "--release-channel", *gkeReleaseChannel)
+
+		// Release channel based GKE clusters require autorepair to be enabled.
+		cmdParams = append(cmdParams, "--enable-autorepair")
+
+		if *gkeReleaseChannel == "extended" {
+			// Extended channel clusters require autoupgrade to be enabled.
+			cmdParams = append(cmdParams, "--enable-autoupgrade")
+
+			// We often leverage the extended channel to test the oldest
+			// versions.  In that case, we specify both a release channel *and* a
+			// cluster version.
+			if isVariableSet(gkeClusterVer) {
+				cmdParams = append(cmdParams, "--cluster-version", *gkeClusterVer)
+			}
+		}
+	} else if isVariableSet(gkeClusterVer) {
 		cmdParams = append(cmdParams, "--cluster-version", *gkeClusterVer)
 	} else {
-		cmdParams = append(cmdParams, "--release-channel", *gkeReleaseChannel)
-		// release channel based GKE clusters require autorepair to be enabled.
-		cmdParams = append(cmdParams, "--enable-autorepair")
+		return fmt.Errorf("must specify either release channel or cluster version")
 	}
 
 	if isVariableSet(gkeNodeVersion) {
@@ -218,7 +248,7 @@ func clusterUpGKE(gceZone, gceRegion string, numNodes int, numWindowsNodes int, 
 		cmdParams = append(cmdParams, "--addons", "GcePersistentDiskCsiDriver")
 	}
 
-	cmd = exec.Command("gcloud", cmdParams...)
+	cmd := exec.Command("gcloud", cmdParams...)
 	err = runCommand("Starting E2E Cluster on GKE", cmd)
 	if err != nil {
 		return fmt.Errorf("failed to bring up kubernetes e2e cluster on gke: %v", err.Error())

@@ -20,6 +20,10 @@ const (
 	// Keys for Topology. This key will be shared amongst drivers from GCP
 	TopologyKeyZone = "topology.gke.io/zone"
 
+	// DiskTypeKeyPrefix is the prefix for the disk type label key used as part
+	// of the Disk Topology feature.
+	DiskTypeKeyPrefix = "disk-type.gke.io"
+
 	// VolumeAttributes for Partition
 	VolumeAttributePartition = "partition"
 
@@ -56,6 +60,9 @@ const (
 	// Node label for Data Cache (only applicable to GKE nodes)
 	NodeLabelPrefix         = "cloud.google.com/%s"
 	DataCacheLssdCountLabel = "gke-data-cache-disk"
+	// Node label for attach limit override
+	NodeRestrictionLabelPrefix = "node-restriction.kubernetes.io/%s"
+	AttachLimitOverrideLabel   = "gke-volume-attach-limit-override"
 )
 
 // doc https://cloud.google.com/compute/docs/disks/hyperdisks#max-total-disks-per-vm

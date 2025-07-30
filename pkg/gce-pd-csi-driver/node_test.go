@@ -37,22 +37,23 @@ import (
 	mountmanager "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/mount-manager"
 )
 
-const defaultVolumeID = "project/test001/zones/c1/disks/testDisk"
-const defaultTargetPath = "/mnt/test"
-const defaultStagingPath = "/staging"
+const (
+	defaultVolumeID    = "project/test001/zones/c1/disks/testDisk"
+	defaultTargetPath  = "/mnt/test"
+	defaultStagingPath = "/staging"
+)
 
 func getTestGCEDriver(t *testing.T) *GCEDriver {
-	return getCustomTestGCEDriver(t, mountmanager.NewFakeSafeMounter(), deviceutils.NewFakeDeviceUtils(false), metadataservice.NewFakeService())
+	return getCustomTestGCEDriver(t, mountmanager.NewFakeSafeMounter(), deviceutils.NewFakeDeviceUtils(false), metadataservice.NewFakeService(), &NodeServerArgs{})
 }
 
 func getTestGCEDriverWithCustomMounter(t *testing.T, mounter *mount.SafeFormatAndMount) *GCEDriver {
-	return getCustomTestGCEDriver(t, mounter, deviceutils.NewFakeDeviceUtils(false), metadataservice.NewFakeService())
+	return getCustomTestGCEDriver(t, mounter, deviceutils.NewFakeDeviceUtils(false), metadataservice.NewFakeService(), &NodeServerArgs{})
 }
 
-func getCustomTestGCEDriver(t *testing.T, mounter *mount.SafeFormatAndMount, deviceUtils deviceutils.DeviceUtils, metaService metadataservice.MetadataService) *GCEDriver {
+func getCustomTestGCEDriver(t *testing.T, mounter *mount.SafeFormatAndMount, deviceUtils deviceutils.DeviceUtils, metaService metadataservice.MetadataService, args *NodeServerArgs) *GCEDriver {
 	gceDriver := GetGCEDriver()
-	enableDataCache := false
-	nodeServer := NewNodeServer(gceDriver, mounter, deviceUtils, metaService, mountmanager.NewFakeStatter(mounter), NodeServerArgs{true, 0, enableDataCache, false /*dataCacheEnableNodePool */})
+	nodeServer := NewNodeServer(gceDriver, mounter, deviceUtils, metaService, mountmanager.NewFakeStatter(mounter), args)
 	err := gceDriver.SetupGCEDriver(driver, "test-vendor", nil, nil, nil, nil, nodeServer)
 	if err != nil {
 		t.Fatalf("Failed to setup GCE Driver: %v", err)
@@ -63,7 +64,13 @@ func getCustomTestGCEDriver(t *testing.T, mounter *mount.SafeFormatAndMount, dev
 func getTestBlockingMountGCEDriver(t *testing.T, readyToExecute chan chan struct{}) *GCEDriver {
 	gceDriver := GetGCEDriver()
 	mounter := mountmanager.NewFakeSafeBlockingMounter(readyToExecute)
-	nodeServer := NewNodeServer(gceDriver, mounter, deviceutils.NewFakeDeviceUtils(false), metadataservice.NewFakeService(), mountmanager.NewFakeStatter(mounter), NodeServerArgs{true, 0, true, false /*dataCacheEnableNodePool */})
+	args := &NodeServerArgs{
+		EnableDeviceInUseCheck:   true,
+		DeviceInUseTimeout:       0,
+		EnableDataCache:          true,
+		DataCacheEnabledNodePool: false,
+	}
+	nodeServer := NewNodeServer(gceDriver, mounter, deviceutils.NewFakeDeviceUtils(false), metadataservice.NewFakeService(), mountmanager.NewFakeStatter(mounter), args)
 	err := gceDriver.SetupGCEDriver(driver, "test-vendor", nil, nil, nil, nil, nodeServer)
 	if err != nil {
 		t.Fatalf("Failed to setup GCE Driver: %v", err)
@@ -75,7 +82,13 @@ func getTestBlockingFormatAndMountGCEDriver(t *testing.T, readyToExecute chan ch
 	gceDriver := GetGCEDriver()
 	enableDataCache := true
 	mounter := mountmanager.NewFakeSafeBlockingMounter(readyToExecute)
-	nodeServer := NewNodeServer(gceDriver, mounter, deviceutils.NewFakeDeviceUtils(false), metadataservice.NewFakeService(), mountmanager.NewFakeStatter(mounter), NodeServerArgs{true, 0, enableDataCache, false /*dataCacheEnableNodePool */}).WithSerializedFormatAndMount(5*time.Second, 1)
+	args := &NodeServerArgs{
+		EnableDeviceInUseCheck:   true,
+		DeviceInUseTimeout:       0,
+		EnableDataCache:          enableDataCache,
+		DataCacheEnabledNodePool: false,
+	}
+	nodeServer := NewNodeServer(gceDriver, mounter, deviceutils.NewFakeDeviceUtils(false), metadataservice.NewFakeService(), mountmanager.NewFakeStatter(mounter), args).WithSerializedFormatAndMount(5*time.Second, 1)
 
 	err := gceDriver.SetupGCEDriver(driver, "test-vendor", nil, nil, nil, nil, nodeServer)
 	if err != nil {
@@ -215,7 +228,6 @@ func TestNodeGetVolumeStats(t *testing.T) {
 }
 
 func TestNodeGetVolumeLimits(t *testing.T) {
-
 	gceDriver := getTestGCEDriver(t)
 	ns := gceDriver.ns
 	req := &csi.NodeGetInfoRequest{}
@@ -277,14 +289,30 @@ func TestNodeGetVolumeLimits(t *testing.T) {
 			expVolumeLimit: 31,
 		},
 		{
+			name:           "n4-micro", // This type does not exist, but testing edge cases
+			machineType:    "n4-micro",
+			expVolumeLimit: volumeLimitBig,
+			expectError:    true,
+		},
+		{
 			name:           "n4-highcpu-4",
 			machineType:    "n4-highcpu-4",
 			expVolumeLimit: 15,
 		},
 		{
+			name:           "n4-custom-8-12345-ext",
+			machineType:    "n4-custom-8-12345-ext",
+			expVolumeLimit: 23,
+		},
+		{
+			name:           "n4-custom-16-12345",
+			machineType:    "n4-custom-16-12345",
+			expVolumeLimit: 31,
+		},
+		{
 			name:           "invalid gen4 machine type",
 			machineType:    "n4-highcpu-4xyz",
-			expVolumeLimit: volumeLimitSmall,
+			expVolumeLimit: volumeLimitBig,
 			expectError:    true,
 		},
 		{
@@ -297,22 +325,39 @@ func TestNodeGetVolumeLimits(t *testing.T) {
 			machineType:    "a4-highgpu-8g",
 			expVolumeLimit: a4HyperdiskLimit,
 		},
+		{
+			name:           "c3-standard-4",
+			machineType:    "c3-standard-4",
+			expVolumeLimit: volumeLimitBig,
+		},
+		{
+			name:           "c3d-highmem-8-lssd",
+			machineType:    "c3d-highmem-8-lssd",
+			expVolumeLimit: volumeLimitBig,
+		},
+		{
+			name:           "c4a-standard-32-lssd",
+			machineType:    "c4a-standard-32-lssd",
+			expVolumeLimit: 49,
+		},
 	}
 
 	for _, tc := range testCases {
 		t.Logf("Test case: %s", tc.name)
+
 		metadataservice.SetMachineType(tc.machineType)
 		res, err := ns.NodeGetInfo(context.Background(), req)
 		if err != nil && !tc.expectError {
 			t.Fatalf("Failed to get node info: %v", err)
-		} else {
-			volumeLimit := res.GetMaxVolumesPerNode()
-			if volumeLimit != tc.expVolumeLimit {
-				t.Fatalf("Expected volume limit: %v, got %v, for machine-type: %v",
-					tc.expVolumeLimit, volumeLimit, tc.machineType)
-			}
-			t.Logf("Get node info: %v", res)
 		}
+
+		volumeLimit := res.GetMaxVolumesPerNode()
+		if volumeLimit != tc.expVolumeLimit {
+			t.Fatalf("Expected volume limit: %v, got %v, for machine-type: %v",
+				tc.expVolumeLimit, volumeLimit, tc.machineType)
+		}
+
+		t.Logf("Get node info: %v", res)
 	}
 }
 
@@ -472,6 +517,13 @@ func TestNodeUnpublishVolume(t *testing.T) {
 	}
 }
 
+type fakeCmd struct {
+	cmd    string
+	args   string
+	stdout string
+	err    error
+}
+
 func TestNodeStageVolume(t *testing.T) {
 	volumeID := "project/test001/zones/c1/disks/testDisk"
 	blockCap := &csi.VolumeCapability_Block{
@@ -488,21 +540,39 @@ func TestNodeStageVolume(t *testing.T) {
 	defer os.RemoveAll(tempDir)
 	stagingPath := filepath.Join(tempDir, defaultStagingPath)
 
+	btrfsUUID := "00000000-0000-0000-0000-000000000001"
+	btrfsPrefix := fmt.Sprintf("%s/sys/fs/btrfs/%s/allocation", tempDir, btrfsUUID)
+
+	for _, suffix := range []string{"data", "metadata"} {
+		dir := btrfsPrefix + "/" + suffix
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("Failed to set up fake sysfs dir %q: %v", dir, err)
+		}
+		fname := dir + "/bg_reclaim_threshold"
+		if err := os.WriteFile(fname, []byte("0\n"), 0644); err != nil {
+			t.Fatalf("write %q: %v", fname, err)
+		}
+	}
+
 	testCases := []struct {
-		name               string
-		req                *csi.NodeStageVolumeRequest
-		deviceSize         int
-		blockExtSize       int
-		readonlyBit        string
-		expResize          bool
-		expReadAheadUpdate bool
-		expReadAheadKB     string
-		readAheadSectors   string
-		sectorSizeInBytes  int
-		expErrCode         codes.Code
+		name                 string
+		req                  *csi.NodeStageVolumeRequest
+		deviceSize           int
+		blockExtSize         int
+		readonlyBit          string
+		expResize            bool
+		expReadAheadUpdate   bool
+		expReadAheadKB       string
+		expReadOnlyRemount   bool
+		expCommandList       []fakeCmd
+		readAheadSectors     string
+		btrfsReclaimData     string
+		btrfsReclaimMetadata string
+		sectorSizeInBytes    int
+		expErrCode           codes.Code
 	}{
 		{
-			name: "Valid request, no resize because block and filesystem sizes match",
+			name: "Valid request, resize even though block and filesystem sizes match",
 			req: &csi.NodeStageVolumeRequest{
 				VolumeId:          volumeID,
 				StagingTargetPath: stagingPath,
@@ -511,7 +581,39 @@ func TestNodeStageVolume(t *testing.T) {
 			deviceSize:   1,
 			blockExtSize: 1,
 			readonlyBit:  "0",
-			expResize:    false,
+			expResize:    true,
+			expCommandList: []fakeCmd{
+				{
+					cmd:    "blkid",
+					args:   "-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path",
+					stdout: "DEVNAME=/dev/sdb\nTYPE=%v",
+				},
+				{
+					cmd:    "fsck",
+					args:   "-a /dev/disk/fake-path",
+					stdout: "",
+				},
+				{
+					cmd:    "blockdev",
+					args:   "--getro /dev/disk/fake-path",
+					stdout: "%v",
+				},
+				{
+					cmd:    "blkid",
+					args:   "-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path",
+					stdout: "DEVNAME=/dev/sdb\nTYPE=%v",
+				},
+				{
+					cmd:    "blkid",
+					args:   "-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path",
+					stdout: "DEVNAME=/dev/sdb\nTYPE=%v",
+				},
+				{
+					cmd:    "resize2fs",
+					args:   "/dev/disk/fake-path",
+					stdout: "",
+				},
+			},
 		},
 		{
 			name: "Valid request, no resize bc readonly",
@@ -524,6 +626,23 @@ func TestNodeStageVolume(t *testing.T) {
 			blockExtSize: 1,
 			readonlyBit:  "1",
 			expResize:    false,
+			expCommandList: []fakeCmd{
+				{
+					cmd:    "blkid",
+					args:   "-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path",
+					stdout: "DEVNAME=/dev/sdb\nTYPE=%v",
+				},
+				{
+					cmd:    "fsck",
+					args:   "-a /dev/disk/fake-path",
+					stdout: "",
+				},
+				{
+					cmd:    "blockdev",
+					args:   "--getro /dev/disk/fake-path",
+					stdout: "%v",
+				},
+			},
 		},
 		{
 			name: "Valid request, resize bc size",
@@ -536,6 +655,38 @@ func TestNodeStageVolume(t *testing.T) {
 			blockExtSize: 1,
 			readonlyBit:  "0",
 			expResize:    true,
+			expCommandList: []fakeCmd{
+				{
+					cmd:    "blkid",
+					args:   "-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path",
+					stdout: "DEVNAME=/dev/sdb\nTYPE=%v",
+				},
+				{
+					cmd:    "fsck",
+					args:   "-a /dev/disk/fake-path",
+					stdout: "",
+				},
+				{
+					cmd:    "blockdev",
+					args:   "--getro /dev/disk/fake-path",
+					stdout: "%v",
+				},
+				{
+					cmd:    "blkid",
+					args:   "-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path",
+					stdout: "DEVNAME=/dev/sdb\nTYPE=%v",
+				},
+				{
+					cmd:    "blkid",
+					args:   "-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path",
+					stdout: "DEVNAME=/dev/sdb\nTYPE=%v",
+				},
+				{
+					cmd:    "resize2fs",
+					args:   "/dev/disk/fake-path",
+					stdout: "",
+				},
+			},
 		},
 		{
 			name: "Valid request, no resize bc readonly capability",
@@ -548,6 +699,190 @@ func TestNodeStageVolume(t *testing.T) {
 			blockExtSize: 1,
 			readonlyBit:  "0",
 			expResize:    false,
+			expCommandList: []fakeCmd{
+				{
+					cmd:    "blkid",
+					args:   "-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path",
+					stdout: "DEVNAME=/dev/sdb\nTYPE=%v",
+				},
+			},
+		},
+		{
+			name: "btrfs-allocation-data-bg_reclaim_threshold is ignored on non-btrfs",
+			req: &csi.NodeStageVolumeRequest{
+				VolumeId:          volumeID,
+				StagingTargetPath: stagingPath,
+				VolumeCapability: &csi.VolumeCapability{
+					AccessType: &csi.VolumeCapability_Mount{
+						Mount: &csi.VolumeCapability_MountVolume{
+							FsType:     "ext4",
+							MountFlags: []string{"btrfs-allocation-data-bg_reclaim_threshold=90"},
+						},
+					},
+					AccessMode: &csi.VolumeCapability_AccessMode{
+						Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+					},
+				},
+			},
+			deviceSize:       1,
+			blockExtSize:     1,
+			readonlyBit:      "0",
+			btrfsReclaimData: "0",
+			expResize:        true,
+			expCommandList: []fakeCmd{
+				{
+					cmd:    "blkid",
+					args:   "-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path",
+					stdout: "DEVNAME=/dev/sdb\nTYPE=%v",
+				},
+				{
+					cmd:    "fsck",
+					args:   "-a /dev/disk/fake-path",
+					stdout: "",
+				},
+				{
+					cmd:    "blockdev",
+					args:   "--getro /dev/disk/fake-path",
+					stdout: "%v",
+				},
+				{
+					cmd:    "blkid",
+					args:   "-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path",
+					stdout: "DEVNAME=/dev/sdb\nTYPE=%v",
+				},
+				{
+					cmd:    "blkid",
+					args:   "-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path",
+					stdout: "DEVNAME=/dev/sdb\nTYPE=%v",
+				},
+				{
+					cmd:    "resize2fs",
+					args:   "/dev/disk/fake-path",
+					stdout: "",
+				},
+			},
+		},
+		{
+			name: "Valid request, set btrfs-allocation-data-bg_reclaim_threshold=90",
+			req: &csi.NodeStageVolumeRequest{
+				VolumeId:          volumeID,
+				StagingTargetPath: stagingPath,
+				VolumeCapability: &csi.VolumeCapability{
+					AccessType: &csi.VolumeCapability_Mount{
+						Mount: &csi.VolumeCapability_MountVolume{
+							FsType:     "btrfs",
+							MountFlags: []string{"btrfs-allocation-data-bg_reclaim_threshold=90"},
+						},
+					},
+					AccessMode: &csi.VolumeCapability_AccessMode{
+						Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+					},
+				},
+			},
+			deviceSize:       1,
+			blockExtSize:     1,
+			readonlyBit:      "0",
+			btrfsReclaimData: "90",
+			expCommandList: []fakeCmd{
+				{
+					cmd:    "blkid",
+					args:   "-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path",
+					stdout: "DEVNAME=/dev/sdb\nTYPE=%v",
+				},
+				{
+					cmd:    "fsck",
+					args:   "-a /dev/disk/fake-path",
+					stdout: "",
+				},
+				{
+					cmd:    "blockdev",
+					args:   "--getro /dev/disk/fake-path",
+					stdout: "%v",
+				},
+				{
+					cmd:    "blkid",
+					args:   "-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path",
+					stdout: "DEVNAME=/dev/sdb\nTYPE=%v",
+				},
+				{
+					cmd:    "blockdev",
+					args:   "--getsize64 /dev/disk/fake-path",
+					stdout: "%d",
+				},
+				{
+					cmd:    "btrfs",
+					args:   "inspect-internal dump-super -f /dev/disk/fake-path",
+					stdout: "sectorsize %d\ntotal_bytes %d",
+				},
+				{
+					cmd:    "blkid",
+					args:   fmt.Sprintf("--match-tag UUID --output value %v", stagingPath),
+					stdout: btrfsUUID + "\n",
+				},
+			},
+		},
+		{
+			name: "Valid request, set btrfs-allocation-{,meta}data-bg_reclaim_threshold",
+			req: &csi.NodeStageVolumeRequest{
+				VolumeId:          volumeID,
+				StagingTargetPath: stagingPath,
+				VolumeCapability: &csi.VolumeCapability{
+					AccessType: &csi.VolumeCapability_Mount{
+						Mount: &csi.VolumeCapability_MountVolume{
+							FsType: "btrfs",
+							MountFlags: []string{
+								"btrfs-allocation-data-bg_reclaim_threshold=90",
+								"btrfs-allocation-metadata-bg_reclaim_threshold=91",
+							},
+						},
+					},
+					AccessMode: &csi.VolumeCapability_AccessMode{
+						Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+					},
+				},
+			},
+			deviceSize:           1,
+			blockExtSize:         1,
+			readonlyBit:          "0",
+			btrfsReclaimData:     "90",
+			btrfsReclaimMetadata: "91",
+			expCommandList: []fakeCmd{
+				{
+					cmd:    "blkid",
+					args:   "-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path",
+					stdout: "DEVNAME=/dev/sdb\nTYPE=%v",
+				},
+				{
+					cmd:    "fsck",
+					args:   "-a /dev/disk/fake-path",
+					stdout: "",
+				},
+				{
+					cmd:    "blockdev",
+					args:   "--getro /dev/disk/fake-path",
+					stdout: "%v",
+				},
+				{
+					cmd:    "blkid",
+					args:   "-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path",
+					stdout: "DEVNAME=/dev/sdb\nTYPE=%v",
+				},
+				{
+					cmd:    "blockdev",
+					args:   "--getsize64 /dev/disk/fake-path",
+					stdout: "%d",
+				},
+				{
+					cmd:    "btrfs",
+					args:   "inspect-internal dump-super -f /dev/disk/fake-path",
+					stdout: "sectorsize %d\ntotal_bytes %d",
+				},
+				{
+					cmd:    "blkid",
+					args:   fmt.Sprintf("--match-tag UUID --output value %v", stagingPath),
+					stdout: btrfsUUID + "\n",
+				},
+			},
 		},
 		{
 			name: "Valid request, update readahead",
@@ -572,6 +907,47 @@ func TestNodeStageVolume(t *testing.T) {
 			expReadAheadUpdate: true,
 			readAheadSectors:   "8192",
 			sectorSizeInBytes:  512,
+			expCommandList: []fakeCmd{
+				{
+					cmd:    "blkid",
+					args:   "-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path",
+					stdout: "DEVNAME=/dev/sdb\nTYPE=%v",
+				},
+				{
+					cmd:    "fsck",
+					args:   "-a /dev/disk/fake-path",
+					stdout: "",
+				},
+				{
+					cmd:    "blockdev",
+					args:   "--getro /dev/disk/fake-path",
+					stdout: "%v",
+				},
+				{
+					cmd:    "blkid",
+					args:   "-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path",
+					stdout: "DEVNAME=/dev/sdb\nTYPE=%v",
+				},
+				{
+					cmd:    "blkid",
+					args:   "-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path",
+					stdout: "DEVNAME=/dev/sdb\nTYPE=%v",
+				},
+				{
+					cmd:    "resize2fs",
+					args:   "/dev/disk/fake-path",
+					stdout: "",
+				},
+				{
+					cmd:    "blockdev",
+					args:   "--getss /dev/disk/fake-path",
+					stdout: "%d",
+				},
+				{
+					cmd:  "blockdev",
+					args: "--setra %v /dev/disk/fake-path",
+				},
+			},
 		},
 		{
 			name: "Valid request, update readahead (different sectorsize)",
@@ -596,6 +972,47 @@ func TestNodeStageVolume(t *testing.T) {
 			expReadAheadUpdate: true,
 			readAheadSectors:   "4194304",
 			sectorSizeInBytes:  1,
+			expCommandList: []fakeCmd{
+				{
+					cmd:    "blkid",
+					args:   "-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path",
+					stdout: "DEVNAME=/dev/sdb\nTYPE=%v",
+				},
+				{
+					cmd:    "fsck",
+					args:   "-a /dev/disk/fake-path",
+					stdout: "",
+				},
+				{
+					cmd:    "blockdev",
+					args:   "--getro /dev/disk/fake-path",
+					stdout: "%v",
+				},
+				{
+					cmd:    "blkid",
+					args:   "-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path",
+					stdout: "DEVNAME=/dev/sdb\nTYPE=%v",
+				},
+				{
+					cmd:    "blkid",
+					args:   "-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path",
+					stdout: "DEVNAME=/dev/sdb\nTYPE=%v",
+				},
+				{
+					cmd:    "resize2fs",
+					args:   "/dev/disk/fake-path",
+					stdout: "",
+				},
+				{
+					cmd:    "blockdev",
+					args:   "--getss /dev/disk/fake-path",
+					stdout: "%d",
+				},
+				{
+					cmd:  "blockdev",
+					args: "--setra %v /dev/disk/fake-path",
+				},
+			},
 		},
 		{
 			name: "Invalid request (Bad Access Mode)",
@@ -678,161 +1095,107 @@ func TestNodeStageVolume(t *testing.T) {
 		},
 	}
 	for _, tc := range testCases {
-		t.Logf("Test case: %s", tc.name)
-		resizeCalled := false
-		readAheadUpdateCalled := false
-		actionList := []testingexec.FakeCommandAction{
-			makeFakeCmd(
-				&testingexec.FakeCmd{
-					CombinedOutputScript: []testingexec.FakeAction{
-						func() ([]byte, []byte, error) {
-							return []byte(fmt.Sprintf("DEVNAME=/dev/sdb\nTYPE=ext4")), nil, nil
-						},
+		t.Run(tc.name, func(t *testing.T) {
+			resizeCalled := false
+			readAheadUpdateCalled := false
+			blkidCalled := false
+			fsType := tc.req.GetVolumeCapability().GetMount().GetFsType()
+			if fsType == "" {
+				fsType = "ext4"
+			}
+			actionList := []testingexec.FakeCommandAction{}
+			for _, cmd := range tc.expCommandList {
+				t.Logf("cmd: %+v", cmd)
+				switch cmd.cmd {
+				case "resize2fs":
+					resizeCalled = true
+				case "blockdev":
+					if strings.Contains(cmd.args, "--getro") {
+						cmd.stdout = fmt.Sprintf(cmd.stdout, tc.readonlyBit)
+					} else if strings.Contains(cmd.args, "--getsize64") {
+						cmd.stdout = fmt.Sprintf(cmd.stdout, tc.deviceSize)
+					} else if strings.Contains(cmd.args, "--getss") {
+						cmd.stdout = fmt.Sprintf(cmd.stdout, tc.sectorSizeInBytes)
+					} else if strings.Contains(cmd.args, "--setra") {
+						readAheadUpdateCalled = true
+						cmd.args = fmt.Sprintf(cmd.args, tc.readAheadSectors)
+					}
+				case "blkid":
+					if strings.Contains(cmd.args, "TYPE") {
+						cmd.stdout = fmt.Sprintf(cmd.stdout, fsType)
+					}
+				case "btrfs":
+					cmd.stdout = fmt.Sprintf(cmd.stdout, tc.blockExtSize, tc.deviceSize)
+				}
+				action := []testingexec.FakeAction{
+					func() ([]byte, []byte, error) {
+						return []byte(cmd.stdout), nil, cmd.err
 					},
-				},
-				"blkid",
-				strings.Split("-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path", " ")...,
-			),
-			makeFakeCmd(
-				&testingexec.FakeCmd{
-					CombinedOutputScript: []testingexec.FakeAction{
-						func() ([]byte, []byte, error) {
-							return []byte(""), nil, nil
-						},
+				}
+				actionList = append(actionList, makeFakeCmd(
+					&testingexec.FakeCmd{
+						CombinedOutputScript: action,
+						OutputScript:         action,
 					},
-				},
-				"fsck",
-				strings.Split("-a /dev/disk/fake-path", " ")...,
-			),
-			makeFakeCmd(
-				&testingexec.FakeCmd{
-					CombinedOutputScript: []testingexec.FakeAction{
-						func() ([]byte, []byte, error) {
-							return []byte(tc.readonlyBit), nil, nil
-						},
-					},
-				},
-				"blockdev",
-				strings.Split("--getro /dev/disk/fake-path", " ")...,
-			),
-			makeFakeCmd(
-				&testingexec.FakeCmd{
-					CombinedOutputScript: []testingexec.FakeAction{
-						func() ([]byte, []byte, error) {
-							return []byte(fmt.Sprintf("%d", tc.deviceSize)), nil, nil
-						},
-					},
-				},
-				"blockdev",
-				strings.Split("--getsize64 /dev/disk/fake-path", " ")...,
-			),
-			makeFakeCmd(
-				&testingexec.FakeCmd{
-					CombinedOutputScript: []testingexec.FakeAction{
-						func() ([]byte, []byte, error) {
-							return []byte(fmt.Sprintf("DEVNAME=/dev/sdb\nTYPE=ext4")), nil, nil
-						},
-					},
-				},
-				"blkid",
-				strings.Split("-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path", " ")...,
-			),
-			makeFakeCmd(
-				&testingexec.FakeCmd{
-					CombinedOutputScript: []testingexec.FakeAction{
-						func() ([]byte, []byte, error) {
-							return []byte(fmt.Sprintf("block size: %d\nblock count: 1", tc.blockExtSize)), nil, nil
-						},
-					},
-				},
-				"dumpe2fs",
-				strings.Split("-h /dev/disk/fake-path", " ")...,
-			),
-		}
+					cmd.cmd,
+					strings.Split(cmd.args, " ")...,
+				))
+			}
+			mounter := mountmanager.NewFakeSafeMounterWithCustomExec(&testingexec.FakeExec{CommandScript: actionList, ExactOrder: true})
+			gceDriver := getTestGCEDriverWithCustomMounter(t, mounter)
+			ns := gceDriver.ns
+			ns.SysfsPath = tempDir + "/sys"
+			_, err := ns.NodeStageVolume(context.Background(), tc.req)
+			if err != nil {
+				serverError, ok := status.FromError(err)
+				if !ok {
+					t.Fatalf("Could not get error status code from err: %v", err)
+				}
+				if serverError.Code() != tc.expErrCode {
+					t.Fatalf("Expected error code: %v, got: %v. err : %v", tc.expErrCode, serverError.Code(), err)
+				}
+				return
+			}
+			if tc.expErrCode != codes.OK {
+				t.Fatalf("Expected error: %v, got no error", tc.expErrCode)
+			}
+			if tc.expResize == true && resizeCalled == false {
+				t.Fatalf("Test did not call resize, but it was expected.")
+			}
+			if tc.expResize == false && resizeCalled == true {
+				t.Fatalf("Test called resize, but it was not expected.")
+			}
+			if tc.expReadAheadUpdate == true && readAheadUpdateCalled == false {
+				t.Fatalf("Test did not update read ahead, but it was expected.")
+			}
+			if tc.expReadAheadUpdate == false && readAheadUpdateCalled == true {
+				t.Fatalf("Test updated read ahead, but it was not expected.")
+			}
+			if tc.btrfsReclaimData == "" && tc.btrfsReclaimMetadata == "" && blkidCalled {
+				t.Fatalf("blkid was called, but was not expected.")
+			}
 
-		if tc.expResize {
-			actionList = append(actionList, []testingexec.FakeCommandAction{
-				makeFakeCmd(
-					&testingexec.FakeCmd{
-						CombinedOutputScript: []testingexec.FakeAction{
-							func() ([]byte, []byte, error) {
-								return []byte(fmt.Sprintf("DEVNAME=/dev/sdb\nTYPE=ext4")), nil, nil
-							},
-						},
-					},
-					"blkid",
-					strings.Split("-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path", " ")...,
-				),
-				makeFakeCmd(
-					&testingexec.FakeCmd{
-						CombinedOutputScript: []testingexec.FakeAction{
-							func() ([]byte, []byte, error) {
-								resizeCalled = true
-								return []byte(fmt.Sprintf("DEVNAME=/dev/sdb\nTYPE=ext4")), nil, nil
-							},
-						},
-					},
-					"resize2fs",
-					strings.Split("/dev/disk/fake-path", " ")...,
-				),
-			}...)
-		}
-		if tc.expReadAheadUpdate {
-			actionList = append(actionList, []testingexec.FakeCommandAction{
-				makeFakeCmd(
-					&testingexec.FakeCmd{
-						CombinedOutputScript: []testingexec.FakeAction{
-							func() ([]byte, []byte, error) {
-								return []byte(fmt.Sprintf("%d", tc.sectorSizeInBytes)), nil, nil
-							},
-						},
-					},
-					"blockdev",
-					[]string{"--getss", "/dev/disk/fake-path"}...,
-				),
-				makeFakeCmd(
-					&testingexec.FakeCmd{
-						CombinedOutputScript: []testingexec.FakeAction{
-							func() (_ []byte, args []byte, _ error) {
-								readAheadUpdateCalled = true
-								return []byte{}, nil, nil
-							},
-						},
-					},
-					"blockdev",
-					[]string{"--setra", tc.readAheadSectors, "/dev/disk/fake-path"}...,
-				),
-			}...)
-		}
-		mounter := mountmanager.NewFakeSafeMounterWithCustomExec(&testingexec.FakeExec{CommandScript: actionList})
-		gceDriver := getTestGCEDriverWithCustomMounter(t, mounter)
-		ns := gceDriver.ns
-		_, err := ns.NodeStageVolume(context.Background(), tc.req)
-		if err != nil {
-			serverError, ok := status.FromError(err)
-			if !ok {
-				t.Fatalf("Could not get error status code from err: %v", err)
+			if tc.btrfsReclaimData != "" {
+				fname := btrfsPrefix + "/data/bg_reclaim_threshold"
+				got, err := os.ReadFile(fname)
+				if err != nil {
+					t.Fatalf("read %q: %v", fname, err)
+				}
+				if s := strings.TrimSpace(string(got)); s != tc.btrfsReclaimData {
+					t.Fatalf("%q: expected %q, got %q", fname, tc.btrfsReclaimData, s)
+				}
 			}
-			if serverError.Code() != tc.expErrCode {
-				t.Fatalf("Expected error code: %v, got: %v. err : %v", tc.expErrCode, serverError.Code(), err)
+			if tc.btrfsReclaimMetadata != "" {
+				fname := btrfsPrefix + "/metadata/bg_reclaim_threshold"
+				got, err := os.ReadFile(fname)
+				if err != nil {
+					t.Fatalf("read %q: %v", fname, err)
+				}
+				if s := strings.TrimSpace(string(got)); s != tc.btrfsReclaimMetadata {
+					t.Fatalf("%q: expected %q, got %q", fname, tc.btrfsReclaimMetadata, s)
+				}
 			}
-			continue
-		}
-		if tc.expErrCode != codes.OK {
-			t.Fatalf("Expected error: %v, got no error", tc.expErrCode)
-		}
-		if tc.expResize == true && resizeCalled == false {
-			t.Fatalf("Test did not call resize, but it was expected.")
-		}
-		if tc.expResize == false && resizeCalled == true {
-			t.Fatalf("Test called resize, but it was not expected.")
-		}
-		if tc.expReadAheadUpdate == true && readAheadUpdateCalled == false {
-			t.Fatalf("Test did not update read ahead, but it was expected.")
-		}
-		if tc.expReadAheadUpdate == false && readAheadUpdateCalled == true {
-			t.Fatalf("Test updated read ahead, but it was not expected.")
-		}
+		})
 	}
 }
 

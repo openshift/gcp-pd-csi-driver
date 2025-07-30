@@ -11,6 +11,8 @@ import (
 
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
 	fsnotify "github.com/fsnotify/fsnotify"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -45,7 +47,7 @@ func fetchRAIDedLocalSsdPath() (string, error) {
 		return "", fmt.Errorf("Error getting RAIDed device path for Data Cache %v, output:%v", err, string(info))
 	}
 	infoString := strings.TrimSpace(string(info))
-	infoSlice := strings.Split(infoString, " ")
+	infoSlice := strings.Fields(infoString)
 
 	// We want to get the second element in the array (sample: ARRAY /dev/md126 metadata=1.2 name=csi-driver-data-cache UUID=*),
 	//  which is the path to the RAIDed device
@@ -165,7 +167,7 @@ func setupCaching(devicePath string, req *csi.NodeStageVolumeRequest, nodeId str
 	}
 	err, isCached := isCachingSetup(mainLvName)
 	if err != nil {
-		klog.Errorf("faild to check if caching ius setup for LV, continuing to setup caching.")
+		klog.Errorf("failed to check if caching is setup for LV, continuing to setup caching.")
 	}
 	cacheLvName := getLvName(cacheSuffix, volumeId)
 	if isCached {
@@ -173,10 +175,18 @@ func setupCaching(devicePath string, req *csi.NodeStageVolumeRequest, nodeId str
 		klog.V(4).Infof("Assuming valid data cache size and mode, resizing cache is not supported")
 	} else {
 		cacheSize := req.GetPublishContext()[common.ContextDataCacheSize]
-		chunkSize, err := fetchChunkSizeKiB(cacheSize)
+		maxChunkSizeStr := strconv.FormatInt(int64(maxChunkSize/KiB), 10)
+		var chunkSize string
+		cachePvSize, err := fetchPvSizeGiB()
 		if err != nil {
-			klog.Errorf("Errored to fetch cache size, verify the data-cache-size is valid: got %v, error: %q", cacheSize, err)
-			return mainDevicePath, err
+			klog.Errorf("Errored while fetching PV size, got %v, falling back to default chunkSize of %v", err, maxChunkSize)
+			chunkSize = maxChunkSizeStr
+		} else {
+			chunkSize, err = fetchChunkSizeKiB(cachePvSize)
+			if err != nil {
+				klog.Errorf("Errored to fetch cache size, verify the data-cache-size is valid: got %v, error: %q", chunkSize, err)
+				chunkSize = maxChunkSizeStr
+			}
 		}
 		// Check if LV exists
 		info, err = common.RunCommand("" /* pipedCmd */, nil /* pipedCmdArg */, "lvs", args...)
@@ -194,6 +204,9 @@ func setupCaching(devicePath string, req *csi.NodeStageVolumeRequest, nodeId str
 			}
 			info, err = common.RunCommand("" /* pipedCmd */, nil /* pipedCmdArg */, "lvcreate", args...)
 			if err != nil {
+				if strings.Contains(err.Error(), "insufficient free space") {
+					return mainDevicePath, status.Error(codes.InvalidArgument, fmt.Sprintf("Error setting up cache: %v", err.Error()))
+				}
 				return mainDevicePath, fmt.Errorf("Errored while creating cache %w: %s", err, info)
 			}
 		}
@@ -210,7 +223,7 @@ func setupCaching(devicePath string, req *csi.NodeStageVolumeRequest, nodeId str
 			req.GetPublishContext()[common.ContextDataCacheMode],
 			volumeGroupName + "/" + mainLvName,
 			"--chunksize",
-			chunkSize, // default unit is KiB
+			chunkSize,
 			"--force",
 			"-y",
 		}
@@ -274,7 +287,7 @@ func getNodeWithRetry(ctx context.Context, kubeClient *kubernetes.Clientset, nod
 		Factor:   2.0,
 		Steps:    5,
 	}
-	err := wait.ExponentialBackoffWithContext(ctx, backoff, func() (bool, error) {
+	err := wait.ExponentialBackoffWithContext(ctx, backoff, func(_ context.Context) (bool, error) {
 		node, err := kubeClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 		if err != nil {
 			klog.Warningf("Error getting node %s: %v, retrying...\n", nodeName, err)
@@ -357,7 +370,7 @@ func FetchAllLssds() ([]string, error) {
 	for _, ssd := range infoList {
 		ssd = strings.TrimSpace(ssd)
 		if strings.HasPrefix(ssd, "/dev/nvme") {
-			ssdDetails := strings.Split(ssd, " ")
+			ssdDetails := strings.Fields(ssd)
 			lssd := re.MatchString(ssdDetails[1])
 			if lssd {
 				diskList = append(diskList, strings.TrimSpace(ssdDetails[0]))
@@ -391,6 +404,7 @@ func checkVgExists(volumeGroupName string) bool {
 		return false
 	}
 	// Check if the required volume group already exists
+	klog.Infof("check vg exists output: %v, volumeGroupName: %v", string(info), volumeGroupName)
 	return strings.Contains(string(info), volumeGroupName)
 }
 
@@ -477,7 +491,6 @@ func createVg(volumeGroupName string, raidedLocalSsds string) error {
 
 func reduceVolumeGroup(volumeGroupName string, force bool) {
 	if !checkVgExists(volumeGroupName) {
-		klog.V(2).Infof("Volume group %v not found, no further action needed", volumeGroupName)
 		return
 	}
 	args := []string{
@@ -563,7 +576,7 @@ func isCachingSetup(mainLvName string) (error, bool) {
 func fetchChunkSizeKiB(cacheSize string) (string, error) {
 	var chunkSize float64
 
-	cacheSizeInt, err := common.ConvertGiStringToInt64(cacheSize)
+	cacheSizeInt, err := strconv.ParseInt(cacheSize, 10, 64)
 	if err != nil {
 		return "0", err
 	}
@@ -632,11 +645,18 @@ func watchDiskDetaches(watcher *fsnotify.Watcher, nodeName string, errorCh chan 
 		case err := <-watcher.Errors:
 			errorCh <- fmt.Errorf("disk update event errored: %v", err)
 		// watch for events
-		case event := <-watcher.Events:
+		case <-watcher.Events:
 			// In case of an event i.e. creation or deletion of any new PV, we update the VG metadata.
 			// This might include some non-LVM changes, no harm in updating metadata multiple times.
+			args := []string{
+				"--updatemetadata",
+				getVolumeGroupName(nodeName),
+			}
+			_, err := common.RunCommand("" /* pipedCmd */, nil /* pipedCmdArg */, "vgck", args...)
+			if err != nil {
+				klog.Errorf("Error updating volume group's metadata: %v", err)
+			}
 			reduceVolumeGroup(getVolumeGroupName(nodeName), true)
-			klog.V(2).Infof("disk attach/detach event %#v\n", event)
 		}
 	}
 }
@@ -667,4 +687,49 @@ func addRaidedLSSDToVg(vgName, lssdPath string) error {
 		return fmt.Errorf("errored while extending VGs %v: %s", err, info)
 	}
 	return nil
+}
+
+func fetchPvSizeGiB() (string, error) {
+	args := []string{
+		"--select",
+		"-o",
+		"--noheadings",
+		"pv_size",
+		"--units=b",
+	}
+	// RAIDed device is always registered with its /dev/md127 equivalent in VG so cannot check it directly based on the RAIDed LSSD path which could be /dev/md/csi-driver-data-cache
+	info, err := common.RunCommand("grep" /* pipedCmd */, []string{"/dev/md"} /* pipedCmdArg */, "pvs", args...)
+	if err != nil {
+		return "", fmt.Errorf("errored while fetching PV size %v: %s", err, info)
+	}
+	infoString := strings.TrimSpace(string(info))
+	infoSlice := strings.Fields(infoString)
+	pvSize, err := fetchNumberGiB(infoSlice)
+	if err != nil {
+		return "", fmt.Errorf("Error fetching PV size for cache %v", err)
+	}
+	return pvSize, nil
+
+}
+
+func fetchNumberGiB(infoSlice []string) (string, error) {
+	re, err := regexp.Compile("^[0-9]+B$")
+	if err != nil {
+		return "", fmt.Errorf("Failed to compile regex match %v", err)
+	}
+	var pvSize string
+	for _, i := range infoSlice {
+		if re.MatchString(i) {
+			pvSize, err = strings.TrimSuffix(i, "B"), nil
+			if err != nil {
+				return "", fmt.Errorf("Failed to extract PV size %v", err)
+			}
+			break
+		}
+	}
+	pvSizeInt, err := strconv.ParseFloat(pvSize, 64)
+	if err != nil {
+		return "", fmt.Errorf("Error while fetching PV size for cache %v", err)
+	}
+	return strconv.FormatInt(int64(math.Ceil(pvSizeInt/GiB)), 10) + "GiB", nil
 }

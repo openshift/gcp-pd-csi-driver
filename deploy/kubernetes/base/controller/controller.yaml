@@ -126,6 +126,7 @@ spec:
             - "--leader-election"
             - "--leader-election-namespace=$(PDCSI_NAMESPACE)"
             - "--timeout=300s"
+            - "--retry-interval-max=60s"
           env:
             - name: PDCSI_NAMESPACE
               valueFrom:
@@ -144,6 +145,9 @@ spec:
             - "--supports-dynamic-iops-provisioning=hyperdisk-balanced,hyperdisk-extreme"
             - "--supports-dynamic-throughput-provisioning=hyperdisk-balanced,hyperdisk-throughput,hyperdisk-ml"
             - --enable-data-cache
+            - --enable-multitenancy
+          command:
+            - /gce-pd-csi-driver
           env:
             - name: GOOGLE_APPLICATION_CREDENTIALS
               value: "/etc/cloud-sa/cloud-sa.json"

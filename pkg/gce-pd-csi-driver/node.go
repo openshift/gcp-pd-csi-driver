@@ -15,6 +15,7 @@ limitations under the License.
 package gceGCEDriver
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -31,12 +32,15 @@ import (
 
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
 
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 	"k8s.io/mount-utils"
 
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/deviceutils"
 	metadataservice "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/metadata"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/metrics"
 	mountmanager "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/mount-manager"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/resizefs"
 )
@@ -49,12 +53,13 @@ type GCENodeServer struct {
 	MetadataService          metadataservice.MetadataService
 	EnableDataCache          bool
 	DataCacheEnabledNodePool bool
+	SysfsPath                string
 
 	// A map storing all volumes with ongoing operations so that additional operations
 	// for that same volume (as defined by VolumeID) return an Aborted error
 	volumeLocks *common.VolumeLocks
 
-	// enableDeviceInUseCheck, if true, will block NodeUnstageVolume requests if the specified
+	// enableDeviceInUseCheck, if true, will block NodeUnstageVolume request if the specified
 	// device is still in use (or until --device-in-use-timeout is reached, if specified)
 	enableDeviceInUseCheck bool
 	// deviceInUseErrors keeps tracks of device names and a timestamp for when an error is
@@ -73,6 +78,8 @@ type GCENodeServer struct {
 	// Embed UnimplementedNodeServer to ensure the driver returns Unimplemented for any
 	// new RPC methods that might be introduced in future versions of the spec.
 	csi.UnimplementedNodeServer
+
+	metricsManager *metrics.MetricsManager
 }
 
 type NodeServerArgs struct {
@@ -85,6 +92,11 @@ type NodeServerArgs struct {
 	EnableDataCache bool
 
 	DataCacheEnabledNodePool bool
+
+	// SysfsPath defaults to "/sys", except if it's a unit test.
+	SysfsPath string
+
+	MetricsManager *metrics.MetricsManager
 }
 
 var _ csi.NodeServer = &GCENodeServer{}
@@ -105,12 +117,17 @@ const (
 	defaultLinuxFsType         = "ext4"
 	defaultWindowsFsType       = "ntfs"
 	fsTypeExt3                 = "ext3"
+	fsTypeBtrfs                = "btrfs"
 
 	readAheadKBMountFlagRegexPattern = "^read_ahead_kb=(.+)$"
+	btrfsReclaimDataRegexPattern     = "^btrfs-allocation-data-bg_reclaim_threshold=(\\d{1,2})$"     // 0-99 are valid, incl. 00
+	btrfsReclaimMetadataRegexPattern = "^btrfs-allocation-metadata-bg_reclaim_threshold=(\\d{1,2})$" // ditto ^
 )
 
 var (
 	readAheadKBMountFlagRegex = regexp.MustCompile(readAheadKBMountFlagRegexPattern)
+	btrfsReclaimDataRegex     = regexp.MustCompile(btrfsReclaimDataRegexPattern)
+	btrfsReclaimMetadataRegex = regexp.MustCompile(btrfsReclaimMetadataRegexPattern)
 )
 
 func getDefaultFsType() string {
@@ -362,6 +379,10 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 		}
 		devicePath, err = setupCaching(devFsPath, req, nodeId)
 		if err != nil {
+			errStatus, _ := status.FromError(err)
+			if errStatus.Code() == codes.InvalidArgument {
+				return nil, err
+			}
 			return nil, status.Error(codes.DataLoss, fmt.Sprintf("Error setting up cache: %v", err.Error()))
 		}
 	}
@@ -379,6 +400,7 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 	// Part 3: Mount device to stagingTargetPath
 	fstype := getDefaultFsType()
 
+	var btrfsReclaimData, btrfsReclaimMetadata string
 	shouldUpdateReadAhead := false
 	var readAheadKB int64
 	options := []string{}
@@ -391,6 +413,10 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 		readAheadKB, shouldUpdateReadAhead, err = extractReadAheadKBMountFlag(mnt.MountFlags)
 		if err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "failure parsing mount flags: %v", err.Error())
+		}
+
+		if mnt.FsType == fsTypeBtrfs {
+			btrfsReclaimData, btrfsReclaimMetadata = extractBtrfsReclaimFlags(mnt.MountFlags)
 		}
 	} else if blk := volumeCapability.GetBlock(); blk != nil {
 		// Noop for Block NodeStageVolume
@@ -421,6 +447,7 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 				return &csi.NodeStageVolumeResponse{}, nil
 			}
 		}
+
 		return nil, status.Error(codes.Internal,
 			fmt.Sprintf("Failed to format and mount device from (%q) to (%q) with fstype (%q) and options (%q): %v",
 				devicePath, stagingTargetPath, fstype, options, err.Error()))
@@ -443,8 +470,62 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 		}
 	}
 
+	// Part 6: if configured, write sysfs values
+	if !readonly {
+		sysfs := map[string]string{}
+		if btrfsReclaimData != "" {
+			sysfs["allocation/data/bg_reclaim_threshold"] = btrfsReclaimData
+		}
+		if btrfsReclaimMetadata != "" {
+			sysfs["allocation/metadata/bg_reclaim_threshold"] = btrfsReclaimMetadata
+		}
+
+		if len(sysfs) > 0 {
+			args := []string{"--match-tag", "UUID", "--output", "value", stagingTargetPath}
+			cmd := ns.Mounter.Exec.Command("blkid", args...)
+			var stderr bytes.Buffer
+			cmd.SetStderr(&stderr)
+			klog.V(4).Infof(
+				"running %q for volume %s",
+				strings.Join(append([]string{"blkid"}, args...), " "),
+				volumeID,
+			)
+			uuid, err := cmd.Output()
+			if err != nil {
+				klog.Errorf("blkid failed for %s. stderr:\n%s", volumeID, stderr.String())
+				return nil, status.Errorf(codes.Internal, "blkid failed: %v", err)
+			}
+			uuid = bytes.TrimRight(uuid, "\n")
+
+			for key, value := range sysfs {
+				path := fmt.Sprintf("%s/fs/btrfs/%s/%s", ns.SysfsPath, uuid, key)
+				if err := writeSysfs(path, value); err != nil {
+					return nil, status.Error(codes.Internal, err.Error())
+				}
+				klog.V(4).Infof("NodeStageVolume set %s %s=%s", volumeID, key, value)
+			}
+		}
+	}
+
 	klog.V(4).Infof("NodeStageVolume succeeded on %v to %s", volumeID, stagingTargetPath)
 	return &csi.NodeStageVolumeResponse{}, nil
+}
+
+func writeSysfs(path, value string) (_err error) {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		_err = errors.Join(_err, f.Close())
+	}()
+
+	if _, err := f.Write([]byte(value)); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (ns *GCENodeServer) updateReadAhead(devicePath string, readAheadKB int64) error {
@@ -461,6 +542,18 @@ func (ns *GCENodeServer) updateReadAhead(devicePath string, readAheadKB int64) e
 	}
 
 	return nil
+}
+
+func extractBtrfsReclaimFlags(mountFlags []string) (string, string) {
+	var reclaimData, reclaimMetadata string
+	for _, mountFlag := range mountFlags {
+		if got := btrfsReclaimDataRegex.FindStringSubmatch(mountFlag); len(got) == 2 {
+			reclaimData = got[1]
+		} else if got := btrfsReclaimMetadataRegex.FindStringSubmatch(mountFlag); len(got) == 2 {
+			reclaimMetadata = got[1]
+		}
+	}
+	return reclaimData, reclaimMetadata
 }
 
 func extractReadAheadKBMountFlag(mountFlags []string) (int64, bool, error) {
@@ -567,9 +660,11 @@ func (ns *GCENodeServer) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRe
 
 	nodeID := common.CreateNodeID(ns.MetadataService.GetProject(), ns.MetadataService.GetZone(), ns.MetadataService.GetName())
 
-	volumeLimits, err := ns.GetVolumeLimits()
+	volumeLimits, err := ns.GetVolumeLimits(ctx)
 	if err != nil {
-		klog.Errorf("GetVolumeLimits failed: %v", err.Error())
+		klog.Errorf("GetVolumeLimits failed: %v. The error is ignored so that the driver can register", err.Error())
+		// No error should be returned from NodeGetInfo, otherwise the driver will not register
+		err = nil
 	}
 
 	resp := &csi.NodeGetInfoResponse{
@@ -727,7 +822,7 @@ func (ns *GCENodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpa
 	}, nil
 }
 
-func (ns *GCENodeServer) GetVolumeLimits() (int64, error) {
+func (ns *GCENodeServer) GetVolumeLimits(ctx context.Context) (int64, error) {
 	// Machine-type format: n1-type-CPUS or custom-CPUS-RAM or f1/g1-type
 	machineType := ns.MetadataService.GetMachineType()
 
@@ -737,16 +832,36 @@ func (ns *GCENodeServer) GetVolumeLimits() (int64, error) {
 			return volumeLimitSmall, nil
 		}
 	}
+
+	// Get attach limit override from label
+	attachLimitOverride, err := GetAttachLimitsOverrideFromNodeLabel(ctx, ns.MetadataService.GetName())
+	if err == nil && attachLimitOverride > 0 && attachLimitOverride < 128 {
+		return attachLimitOverride, nil
+	} else {
+		// If there is an error or the range is not valid, still proceed to get defaults for the machine type
+		if err != nil {
+			klog.Warningf("using default value due to err getting node-restriction.kubernetes.io/gke-volume-attach-limit-override: %v", err)
+		}
+		if attachLimitOverride != 0 {
+			klog.Warningf("using default value due to invalid node-restriction.kubernetes.io/gke-volume-attach-limit-override: %d", attachLimitOverride)
+		}
+	}
+
+	// Process gen4 machine attach limits
 	gen4MachineTypesPrefix := []string{"c4a-", "c4-", "n4-"}
 	for _, gen4Prefix := range gen4MachineTypesPrefix {
 		if strings.HasPrefix(machineType, gen4Prefix) {
-			cpuString := machineType[strings.LastIndex(machineType, "-")+1:]
-			cpus, err := strconv.ParseInt(cpuString, 10, 64)
-			if err != nil {
-				return volumeLimitSmall, fmt.Errorf("invalid cpuString %s for machine type: %v", cpuString, machineType)
+			machineTypeSlice := strings.Split(machineType, "-")
+			if len(machineTypeSlice) > 2 {
+				cpuString := machineTypeSlice[2]
+				cpus, err := strconv.ParseInt(cpuString, 10, 64)
+				if err != nil {
+					return volumeLimitBig, fmt.Errorf("invalid cpuString %s for machine type: %v", cpuString, machineType)
+				}
+				return common.MapNumber(cpus), nil
+			} else {
+				return volumeLimitBig, fmt.Errorf("unconventional machine type: %v", machineType)
 			}
-			return common.MapNumber(cpus), nil
-
 		}
 		if strings.HasPrefix(machineType, "x4-") {
 			return x4HyperdiskLimit, nil
@@ -757,4 +872,28 @@ func (ns *GCENodeServer) GetVolumeLimits() (int64, error) {
 	}
 
 	return volumeLimitBig, nil
+}
+
+func GetAttachLimitsOverrideFromNodeLabel(ctx context.Context, nodeName string) (int64, error) {
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		return 0, err
+	}
+	kubeClient, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return 0, err
+	}
+	node, err := getNodeWithRetry(ctx, kubeClient, nodeName)
+	if err != nil {
+		return 0, err
+	}
+	if val, found := node.GetLabels()[fmt.Sprintf(common.NodeRestrictionLabelPrefix, common.AttachLimitOverrideLabel)]; found {
+		attachLimitOverrideForNode, err := strconv.ParseInt(val, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("error getting attach limit override from node label: %v", err)
+		}
+		klog.V(4).Infof("attach limit override for the node: %v", attachLimitOverrideForNode)
+		return attachLimitOverrideForNode, nil
+	}
+	return 0, nil
 }

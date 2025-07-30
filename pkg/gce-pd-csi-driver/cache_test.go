@@ -13,22 +13,22 @@ func TestFetchChunkSizeKiB(t *testing.T) {
 	}{
 		{
 			name:         "chunk size is in the allowed range",
-			cacheSize:    "500Gi",
+			cacheSize:    "500",
 			expChunkSize: "512KiB", //range defined in fetchChunkSizeKiB
 		},
 		{
 			name:         "chunk size is set to the range ceil",
-			cacheSize:    "30000000Gi",
+			cacheSize:    "30000000",
 			expChunkSize: "1048576KiB", //range defined in fetchChunkSizeKiB - max 1GiB
 		},
 		{
 			name:         "chunk size is set to the allowed range floor",
-			cacheSize:    "10Gi",
+			cacheSize:    "100",
 			expChunkSize: "160KiB", //range defined in fetchChunkSizeKiB - min 160 KiB
 		},
 		{
 			name:         "cacheSize set to KiB also sets the chunk size to range floor",
-			cacheSize:    "100Ki",
+			cacheSize:    "1",
 			expChunkSize: "160KiB", //range defined in fetchChunkSizeKiB - min 160 KiB
 		},
 		{
@@ -50,6 +50,66 @@ func TestFetchChunkSizeKiB(t *testing.T) {
 		}
 		if chunkSize != tc.expChunkSize {
 			t.Errorf("Got %s want %s", chunkSize, tc.expChunkSize)
+		}
+
+	}
+
+}
+
+func TestFetchNumberGiB(t *testing.T) {
+	testCases := []struct {
+		name        string
+		stringInput []string
+		expOutput   string // Outputs value in GiB
+		expErr      bool
+	}{
+		{
+			name:        "valid input 1",
+			stringInput: []string{"5000000000B"},
+			expOutput:   "5GiB", //range defined in fetchChunkSizeKiB
+		},
+		{
+			name:        "valid input 2",
+			stringInput: []string{"375000000000B"}, // 1 LSSD attached
+			expOutput:   "350GiB",                  //range defined in fetchChunkSizeKiB
+		},
+		{
+			name:        "valid input 3",
+			stringInput: []string{"9000000000000B"}, // 24 LSSD attached
+			expOutput:   "8382GiB",                  //range defined in fetchChunkSizeKiB
+		},
+		{
+			name:        "valid input 4",
+			stringInput: []string{"Some text before ", "9000000000000B", "Some text after"}, // 24 LSSD attached
+			expOutput:   "8382GiB",                                                          //range defined in fetchChunkSizeKiB
+		},
+		{
+			name:        "invalid input 1",
+			stringInput: []string{"9000000000000"},
+			expErr:      true,
+		},
+		{
+			name:        "invalid input 2",
+			stringInput: []string{"A9000000000000B"},
+			expErr:      true,
+		},
+		{
+			name:        "valid input 5",
+			stringInput: []string{"900000B"}, // <1GiB gets rounded off to 0GiB
+			expOutput:   "1GiB",
+		},
+	}
+
+	for _, tc := range testCases {
+		v, err := fetchNumberGiB(tc.stringInput)
+		if err != nil {
+			if !tc.expErr {
+				t.Errorf("Errored %s", err)
+			}
+			continue
+		}
+		if v != tc.expOutput {
+			t.Errorf("Got %s want %s", v, tc.expOutput)
 		}
 
 	}
