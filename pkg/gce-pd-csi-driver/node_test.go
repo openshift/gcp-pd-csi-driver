@@ -32,8 +32,10 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/mount-utils"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/deviceutils"
 	metadataservice "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/metadata"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/linkcache"
 	mountmanager "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/mount-manager"
 )
 
@@ -44,11 +46,13 @@ const (
 )
 
 func getTestGCEDriver(t *testing.T) *GCEDriver {
-	return getCustomTestGCEDriver(t, mountmanager.NewFakeSafeMounter(), deviceutils.NewFakeDeviceUtils(false), metadataservice.NewFakeService(), &NodeServerArgs{})
+	return getCustomTestGCEDriver(t, mountmanager.NewFakeSafeMounter(), deviceutils.NewFakeDeviceUtils(false), metadataservice.NewFakeService(), &NodeServerArgs{
+		DeviceCache: linkcache.NewTestDeviceCache(1*time.Minute, linkcache.NewTestNodeWithVolumes([]string{defaultVolumeID})),
+	})
 }
 
-func getTestGCEDriverWithCustomMounter(t *testing.T, mounter *mount.SafeFormatAndMount) *GCEDriver {
-	return getCustomTestGCEDriver(t, mounter, deviceutils.NewFakeDeviceUtils(false), metadataservice.NewFakeService(), &NodeServerArgs{})
+func getTestGCEDriverWithCustomMounter(t *testing.T, mounter *mount.SafeFormatAndMount, args *NodeServerArgs) *GCEDriver {
+	return getCustomTestGCEDriver(t, mounter, deviceutils.NewFakeDeviceUtils(false), metadataservice.NewFakeService(), args)
 }
 
 func getCustomTestGCEDriver(t *testing.T, mounter *mount.SafeFormatAndMount, deviceUtils deviceutils.DeviceUtils, metaService metadataservice.MetadataService, args *NodeServerArgs) *GCEDriver {
@@ -188,7 +192,9 @@ func TestNodeGetVolumeStats(t *testing.T) {
 			}
 
 			mounter := mountmanager.NewFakeSafeMounterWithCustomExec(&testingexec.FakeExec{CommandScript: actionList})
-			gceDriver := getTestGCEDriverWithCustomMounter(t, mounter)
+			gceDriver := getTestGCEDriverWithCustomMounter(t, mounter, &NodeServerArgs{
+				DeviceCache: linkcache.NewTestDeviceCache(1*time.Minute, linkcache.NewTestNodeWithVolumes([]string{tc.volumeID})),
+			})
 			ns := gceDriver.ns
 
 			req := &csi.NodeGetVolumeStatsRequest{
@@ -279,6 +285,11 @@ func TestNodeGetVolumeLimits(t *testing.T) {
 			expVolumeLimit: 63,
 		},
 		{
+			name:           "c4-standard-2",
+			machineType:    "c4-standard-2",
+			expVolumeLimit: 7,
+		},
+		{
 			name:           "c4a-standard-4",
 			machineType:    "c4a-standard-4",
 			expVolumeLimit: 15,
@@ -302,7 +313,7 @@ func TestNodeGetVolumeLimits(t *testing.T) {
 		{
 			name:           "n4-custom-8-12345-ext",
 			machineType:    "n4-custom-8-12345-ext",
-			expVolumeLimit: 23,
+			expVolumeLimit: 15,
 		},
 		{
 			name:           "n4-custom-16-12345",
@@ -338,7 +349,87 @@ func TestNodeGetVolumeLimits(t *testing.T) {
 		{
 			name:           "c4a-standard-32-lssd",
 			machineType:    "c4a-standard-32-lssd",
-			expVolumeLimit: 49,
+			expVolumeLimit: 31,
+		},
+		{
+			name:           "c4d-standard-32",
+			machineType:    "c4d-standard-32",
+			expVolumeLimit: 31,
+		},
+		{
+			name:           "c3-highcpu-192-metal",
+			machineType:    "c3-highcpu-192-metal",
+			expVolumeLimit: c3MetalHyperdiskLimit,
+		},
+		{
+			name:           "c3-standard-192-metal",
+			machineType:    "c3-standard-192-metal",
+			expVolumeLimit: c3MetalHyperdiskLimit,
+		},
+		{
+			name:           "c3-highmem-192-metal",
+			machineType:    "c3-highmem-192-metal",
+			expVolumeLimit: c3MetalHyperdiskLimit,
+		},
+		{
+			name:           "a4x-highgpu-1g",
+			machineType:    "a4x-highgpu-1g",
+			expVolumeLimit: 63,
+		},
+		{
+			name:           "a4x-highgpu-2g",
+			machineType:    "a4x-highgpu-2g",
+			expVolumeLimit: 127,
+		},
+		{
+			name:           "a4x-highgpu-2g-nolssd",
+			machineType:    "a4x-highgpu-2g-nolssd",
+			expVolumeLimit: 127,
+		},
+		{
+			name:           "a4x-highgpu-4g",
+			machineType:    "a4x-highgpu-4g",
+			expVolumeLimit: 127,
+		},
+		{
+			name:           "a4x-highgpu-8g",
+			machineType:    "a4x-highgpu-8g",
+			expVolumeLimit: 127,
+		},
+		{
+			name:           "a4x-highgpu-metal",
+			machineType:    "a4x-highgpu-metal",
+			expVolumeLimit: a4xMetalHyperdiskLimit,
+		},
+		{
+			name:           "a4x-max-metal",
+			machineType:    "a4x-max-metal",
+			expVolumeLimit: a4xMetalHyperdiskLimit,
+		},
+		{
+			name:           "a4x-max-1g",
+			machineType:    "a4x-max-1g",
+			expVolumeLimit: 63,
+		},
+		{
+			name:           "a4x-max-highgpu-2g",
+			machineType:    "a4x-max-2g",
+			expVolumeLimit: 127,
+		},
+		{
+			name:           "a4x-max-4g",
+			machineType:    "a4x-max-4g",
+			expVolumeLimit: 127,
+		},
+		{
+			name:           "a4x-max-8g", // -8g does not exist, testing edge case
+			machineType:    "a4x-max-8g",
+			expVolumeLimit: 127,
+		},
+		{
+			name:           "a4x-medgpu-nolssd", // does not exist, testing edge case
+			machineType:    "a4x-medgpu-nolssd",
+			expVolumeLimit: volumeLimitBig,
 		},
 	}
 
@@ -1015,6 +1106,41 @@ func TestNodeStageVolume(t *testing.T) {
 			},
 		},
 		{
+			name: "Valid request with disk size check",
+			req: &csi.NodeStageVolumeRequest{
+				VolumeId:          volumeID,
+				StagingTargetPath: stagingPath,
+				VolumeCapability:  stdVolCap,
+				PublishContext:    map[string]string{common.ContextDiskSizeGB: "1"},
+			},
+			deviceSize:   1,
+			blockExtSize: 1,
+			readonlyBit:  "1",
+			expResize:    false,
+			expCommandList: []fakeCmd{
+				{
+					cmd:    "blockdev",
+					args:   "--getsize64 /dev/disk/fake-path",
+					stdout: "%v",
+				},
+				{
+					cmd:    "blkid",
+					args:   "-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path",
+					stdout: "DEVNAME=/dev/sdb\nTYPE=%v",
+				},
+				{
+					cmd:    "fsck",
+					args:   "-a /dev/disk/fake-path",
+					stdout: "",
+				},
+				{
+					cmd:    "blockdev",
+					args:   "--getro /dev/disk/fake-path",
+					stdout: "%v",
+				},
+			},
+		},
+		{
 			name: "Invalid request (Bad Access Mode)",
 			req: &csi.NodeStageVolumeRequest{
 				VolumeId:          volumeID,
@@ -1093,6 +1219,24 @@ func TestNodeStageVolume(t *testing.T) {
 			},
 			expErrCode: codes.InvalidArgument,
 		},
+		{
+			name: "Invalid request, block size mismatch",
+			req: &csi.NodeStageVolumeRequest{
+				VolumeId:          volumeID,
+				StagingTargetPath: stagingPath,
+				VolumeCapability:  stdVolCap,
+				PublishContext:    map[string]string{common.ContextDiskSizeGB: "10"},
+			},
+			deviceSize: 5,
+			expErrCode: codes.Internal,
+			expCommandList: []fakeCmd{
+				{
+					cmd:    "blockdev",
+					args:   "--getsize64 /dev/disk/fake-path",
+					stdout: "%v",
+				},
+			},
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1142,7 +1286,9 @@ func TestNodeStageVolume(t *testing.T) {
 				))
 			}
 			mounter := mountmanager.NewFakeSafeMounterWithCustomExec(&testingexec.FakeExec{CommandScript: actionList, ExactOrder: true})
-			gceDriver := getTestGCEDriverWithCustomMounter(t, mounter)
+			gceDriver := getTestGCEDriverWithCustomMounter(t, mounter, &NodeServerArgs{
+				DeviceCache: linkcache.NewTestDeviceCache(1*time.Minute, linkcache.NewTestNodeWithVolumes([]string{volumeID})),
+			})
 			ns := gceDriver.ns
 			ns.SysfsPath = tempDir + "/sys"
 			_, err := ns.NodeStageVolume(context.Background(), tc.req)

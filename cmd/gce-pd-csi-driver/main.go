@@ -34,6 +34,7 @@ import (
 	gce "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/compute"
 	metadataservice "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/metadata"
 	driver "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-pd-csi-driver"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/linkcache"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/metrics"
 	mountmanager "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/mount-manager"
 )
@@ -57,10 +58,10 @@ var (
 	attachDiskBackoffJitter   = flag.Float64("attach-disk-backoff-jitter", 0.0, "Jitter for attachDisk backoff")
 	attachDiskBackoffSteps    = flag.Int("attach-disk-backoff-steps", 24, "Steps for attachDisk backoff")
 	attachDiskBackoffCap      = flag.Duration("attach-disk-backoff-cap", 0, "Cap for attachDisk backoff")
-	waitForOpBackoffDuration  = flag.Duration("wait-op-backoff-duration", 3*time.Second, "Duration for wait for operation backoff")
+	waitForOpBackoffDuration  = flag.Duration("wait-op-backoff-duration", 2*time.Minute, "Duration for wait for operation backoff")
 	waitForOpBackoffFactor    = flag.Float64("wait-op-backoff-factor", 0.0, "Factor for wait for operation backoff")
 	waitForOpBackoffJitter    = flag.Float64("wait-op-backoff-jitter", 0.0, "Jitter for wait for operation backoff")
-	waitForOpBackoffSteps     = flag.Int("wait-op-backoff-steps", 100, "Steps for wait for operation backoff")
+	waitForOpBackoffSteps     = flag.Int("wait-op-backoff-steps", 3, "Steps for wait for operation backoff")
 	waitForOpBackoffCap       = flag.Duration("wait-op-backoff-cap", 0, "Cap for wait for operation backoff")
 
 	enableDeviceInUseCheck = flag.Bool("enable-device-in-use-check-on-node-unstage", true, "If set to true, block NodeUnstageVolume requests until the specified device is not in use")
@@ -96,6 +97,10 @@ var (
 	extraTagsStr = flag.String("extra-tags", "", "Extra tags to attach to each Compute Disk, Image, Snapshot created. It is a comma separated list of parent id, key and value like '<parent_id1>/<tag_key1>/<tag_value1>,...,<parent_idN>/<tag_keyN>/<tag_valueN>'. parent_id is the Organization or the Project ID or Project name where the tag key and the tag value resources exist. A maximum of 50 tags bindings is allowed for a resource. See https://cloud.google.com/resource-manager/docs/tags/tags-overview, https://cloud.google.com/resource-manager/docs/tags/tags-creating-and-managing for details")
 
 	diskTopology = flag.Bool("disk-topology", false, "If set to true, the driver will add a disk-type.gke.io/[disk-type] topology label when the StorageClass has the use-allowed-disk-topology parameter set to true. That topology label is included in the Topologies returned in CreateVolumeResponse. This flag is disabled by default.")
+
+	diskCacheSyncPeriod = flag.Duration("disk-cache-sync-period", 10*time.Minute, "Period for the disk cache to check the /dev/disk/by-id/ directory and evaluate the symlinks")
+
+	enableDiskSizeValidation = flag.Bool("enable-disk-size-validation", false, "If set to true, the driver will validate that the requested disk size is matches the physical disk size. This flag is disabled by default.")
 
 	version string
 )
@@ -248,7 +253,8 @@ func handle() {
 		maxBackoffDuration := time.Duration(*errorBackoffMaxDurationMs) * time.Millisecond
 		// TODO(2042): Move more of the constructor args into this struct
 		args := &driver.GCEControllerServerArgs{
-			EnableDiskTopology: *diskTopology,
+			EnableDiskTopology:       *diskTopology,
+			EnableDiskSizeValidation: *enableDiskSizeValidation,
 		}
 
 		controllerServer = driver.NewControllerServer(gceDriver, cloudProvider, initialBackoffDuration, maxBackoffDuration, fallbackRequisiteZones, *enableStoragePoolsFlag, *enableDataCacheFlag, multiZoneVolumeHandleConfig, listVolumesConfig, provisionableDisksConfig, *enableHdHAFlag, args)
@@ -270,9 +276,16 @@ func handle() {
 		if err != nil {
 			klog.Fatalf("Failed to set up metadata service: %v", err.Error())
 		}
-		isDataCacheEnabledNodePool, err := isDataCacheEnabledNodePool(ctx, *nodeName)
+		isDataCacheEnabledNodePool, err := driver.IsDataCacheEnabledNodePool(ctx, *nodeName, *enableDataCacheFlag)
 		if err != nil {
 			klog.Fatalf("Failed to get node info from API server: %v", err.Error())
+		}
+
+		deviceCache, err := linkcache.NewDeviceCacheForNode(ctx, *diskCacheSyncPeriod, *nodeName, driverName, deviceUtils)
+		if err != nil {
+			klog.Warningf("Failed to create device cache: %v", err.Error())
+		} else {
+			go deviceCache.Run(ctx)
 		}
 
 		// TODO(2042): Move more of the constructor args into this struct
@@ -283,6 +296,7 @@ func handle() {
 			DataCacheEnabledNodePool: isDataCacheEnabledNodePool,
 			SysfsPath:                "/sys",
 			MetricsManager:           metricsManager,
+			DeviceCache:              deviceCache,
 		}
 		nodeServer = driver.NewNodeServer(gceDriver, mounter, deviceUtils, meta, statter, nsArgs)
 
@@ -297,9 +311,10 @@ func handle() {
 				if err := setupDataCache(ctx, *nodeName, nodeServer.MetadataService.GetName()); err != nil {
 					klog.Errorf("Data Cache setup failed: %v", err)
 				}
-				go driver.StartWatcher(*nodeName)
+				go driver.StartWatcher(ctx, *nodeName)
 			}
 		}
+
 	}
 
 	err = gceDriver.SetupGCEDriver(driverName, version, extraVolumeLabels, extraTags, identityServer, controllerServer, nodeServer)
@@ -379,17 +394,6 @@ func urlFlag(target **url.URL, name string, usage string) {
 		klog.Errorf("Error parsing endpoint compute endpoint %v", err)
 		return err
 	})
-}
-
-func isDataCacheEnabledNodePool(ctx context.Context, nodeName string) (bool, error) {
-	if !*enableDataCacheFlag {
-		return false, nil
-	}
-	if len(nodeName) > 0 && nodeName != common.TestNode { // disregard logic below when E2E testing.
-		dataCacheLSSDCount, err := driver.GetDataCacheCountFromNodeLabel(ctx, nodeName)
-		return dataCacheLSSDCount != 0, err
-	}
-	return true, nil
 }
 
 func fetchLssdsForRaiding(lssdCount int) ([]string, error) {

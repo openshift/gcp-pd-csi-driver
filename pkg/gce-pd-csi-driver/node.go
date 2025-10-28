@@ -32,14 +32,14 @@ import (
 
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
 
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 	"k8s.io/mount-utils"
 
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/deviceutils"
 	metadataservice "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/metadata"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/k8sclient"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/linkcache"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/metrics"
 	mountmanager "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/mount-manager"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/resizefs"
@@ -80,6 +80,8 @@ type GCENodeServer struct {
 	csi.UnimplementedNodeServer
 
 	metricsManager *metrics.MetricsManager
+	// A cache of the device paths for the volumes that are attached to the node.
+	DeviceCache *linkcache.DeviceCache
 }
 
 type NodeServerArgs struct {
@@ -97,6 +99,7 @@ type NodeServerArgs struct {
 	SysfsPath string
 
 	MetricsManager *metrics.MetricsManager
+	DeviceCache    *linkcache.DeviceCache
 }
 
 var _ csi.NodeServer = &GCENodeServer{}
@@ -113,11 +116,13 @@ const (
 	// doc https://cloud.google.com/compute/docs/memory-optimized-machines#x4_disks
 	x4HyperdiskLimit int64 = 39
 	// doc https://cloud.google.com/compute/docs/accelerator-optimized-machines#a4-disks
-	a4HyperdiskLimit     int64 = 127
-	defaultLinuxFsType         = "ext4"
-	defaultWindowsFsType       = "ntfs"
-	fsTypeExt3                 = "ext3"
-	fsTypeBtrfs                = "btrfs"
+	a4HyperdiskLimit       int64 = 127
+	a4xMetalHyperdiskLimit int64 = 31
+	c3MetalHyperdiskLimit  int64 = 15
+	defaultLinuxFsType           = "ext4"
+	defaultWindowsFsType         = "ntfs"
+	fsTypeExt3                   = "ext3"
+	fsTypeBtrfs                  = "btrfs"
 
 	readAheadKBMountFlagRegexPattern = "^read_ahead_kb=(.+)$"
 	btrfsReclaimDataRegexPattern     = "^btrfs-allocation-data-bg_reclaim_threshold=(\\d{1,2})$"     // 0-99 are valid, incl. 00
@@ -430,6 +435,17 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 		klog.V(4).Infof("CSI volume is read-only, mounting with extra option ro")
 	}
 
+	// If a disk size is provided in the publish context, ensure it matches the actual device size.
+	if expectedSize := req.GetPublishContext()[common.ContextDiskSizeGB]; expectedSize != "" {
+		actualSize, err := getBlockSizeBytes(devicePath, ns.Mounter)
+		if err != nil {
+			return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get block size for '%s': %v", devicePath, err.Error()))
+		}
+		if expectedSize != strconv.FormatInt(actualSize, 10) {
+			return nil, status.Error(codes.Internal, fmt.Sprintf("expected block size %q, got %q", expectedSize, strconv.FormatInt(actualSize, 10)))
+		}
+	}
+
 	err = ns.formatAndMount(devicePath, stagingTargetPath, fstype, options, ns.Mounter)
 	if err != nil {
 		// If a volume is created from a content source like snapshot or cloning, the filesystem might get marked
@@ -504,6 +520,13 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 				}
 				klog.V(4).Infof("NodeStageVolume set %s %s=%s", volumeID, key, value)
 			}
+		}
+	}
+
+	if ns.DeviceCache != nil {
+		err = ns.DeviceCache.AddVolume(volumeID)
+		if err != nil {
+			klog.Warningf("Error adding volume %s to cache: %v", volumeID, err)
 		}
 	}
 
@@ -613,13 +636,18 @@ func (ns *GCENodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUns
 
 	// The NodeUnstageVolume does not have any volume or publish context, we need to get the info from LVM locally
 	// Check if cache group cache-{volumeID} exist in LVM
-	if ns.EnableDataCache {
+	if ns.EnableDataCache && ns.DataCacheEnabledNodePool {
 		nodeId := ns.MetadataService.GetName()
 		err := cleanupCache(volumeID, nodeId)
 		if err != nil {
 			return nil, status.Errorf(codes.DataLoss, "Failed to cleanup cache for volume %s: %v", volumeID, err)
 		}
 	}
+
+	if ns.DeviceCache != nil {
+		ns.DeviceCache.RemoveVolume(volumeID)
+	}
+
 	klog.V(4).Infof("NodeUnstageVolume succeeded on %v from %s", volumeID, stagingTargetPath)
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
@@ -847,8 +875,8 @@ func (ns *GCENodeServer) GetVolumeLimits(ctx context.Context) (int64, error) {
 		}
 	}
 
-	// Process gen4 machine attach limits
-	gen4MachineTypesPrefix := []string{"c4a-", "c4-", "n4-"}
+	// Process gen4 machine attach limits which include vCPUs in the machine type
+	gen4MachineTypesPrefix := []string{"c4a-", "c4-", "n4-", "c4d-"}
 	for _, gen4Prefix := range gen4MachineTypesPrefix {
 		if strings.HasPrefix(machineType, gen4Prefix) {
 			machineTypeSlice := strings.Split(machineType, "-")
@@ -858,32 +886,46 @@ func (ns *GCENodeServer) GetVolumeLimits(ctx context.Context) (int64, error) {
 				if err != nil {
 					return volumeLimitBig, fmt.Errorf("invalid cpuString %s for machine type: %v", cpuString, machineType)
 				}
-				return common.MapNumber(cpus), nil
+				// Extract the machine type prefix (e.g., "c4", "c4a", "n4")
+				prefix := strings.TrimSuffix(gen4Prefix, "-")
+				return common.GetHyperdiskAttachLimit(prefix, cpus), nil
 			} else {
 				return volumeLimitBig, fmt.Errorf("unconventional machine type: %v", machineType)
 			}
 		}
-		if strings.HasPrefix(machineType, "x4-") {
-			return x4HyperdiskLimit, nil
+	}
+	// Process gen4 A4X machine attach limits, which have a -1g/-2g/-4g/metal suffix
+	if strings.HasPrefix(machineType, "a4x-") {
+		machineTypeSlice := strings.Split(machineType, "-")
+		if len(machineTypeSlice) < 3 {
+			return volumeLimitBig, fmt.Errorf("unconventional machine type: %v", machineType)
 		}
-		if strings.HasPrefix(machineType, "a4-") {
-			return a4HyperdiskLimit, nil
+		gpuString := machineTypeSlice[2]
+		if gpuString == "metal" {
+			return a4xMetalHyperdiskLimit, nil
 		}
+		gpuString = gpuString[0 : len(gpuString)-1] // Remove the 'g' suffix
+		gpus, err := strconv.ParseInt(gpuString, 10, 64)
+		if err != nil {
+			return volumeLimitBig, fmt.Errorf("invalid gpuString %s for machine type: %v", gpuString, machineType)
+		}
+		return common.GetHyperdiskAttachLimit("a4x", gpus), nil
+	}
+	if strings.HasPrefix(machineType, "x4-") {
+		return x4HyperdiskLimit, nil
+	}
+	if strings.HasPrefix(machineType, "a4-") {
+		return a4HyperdiskLimit, nil
+	}
+	if strings.HasPrefix(machineType, "c3-") && strings.HasSuffix(machineType, "-metal") {
+		return c3MetalHyperdiskLimit, nil
 	}
 
 	return volumeLimitBig, nil
 }
 
 func GetAttachLimitsOverrideFromNodeLabel(ctx context.Context, nodeName string) (int64, error) {
-	cfg, err := rest.InClusterConfig()
-	if err != nil {
-		return 0, err
-	}
-	kubeClient, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		return 0, err
-	}
-	node, err := getNodeWithRetry(ctx, kubeClient, nodeName)
+	node, err := k8sclient.GetNodeWithRetry(ctx, nodeName)
 	if err != nil {
 		return 0, err
 	}

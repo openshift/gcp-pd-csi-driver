@@ -71,7 +71,7 @@ const (
 	// Example: us
 	multiRegionalLocationFmt = "^[a-z]+$"
 	// Example: us-east1
-	regionalLocationFmt = "^[a-z]+-[a-z]+[0-9]$"
+	regionalLocationFmt = "^[a-z]+-[a-z]+[0-9]{1,2}$"
 
 	// Full or partial URL of the machine type resource, in the format:
 	//   zones/zone/machineTypes/machine-type
@@ -762,14 +762,41 @@ func ShortString(s string) string {
 	return string(short)
 }
 
-// MapNumber is a function to map input cpu number to the Hyperdisk attach limit
-func MapNumber(num int64) int64 {
-	for _, r := range Gen4MachineHyperdiskAttachLimitMap {
-		if num <= r.max {
-			return r.value
+// GetHyperdiskAttachLimit returns the hyperdisk attach limit based on machine type prefix and vCPUs
+func GetHyperdiskAttachLimit(machineTypePrefix string, vCPUs int64) int64 {
+	var limitMap []MachineHyperdiskLimit
+
+	switch machineTypePrefix {
+	case "c4":
+		limitMap = C4MachineHyperdiskAttachLimitMap
+	case "c4d":
+		limitMap = C4DMachineHyperdiskAttachLimitMap
+	case "n4":
+		limitMap = N4MachineHyperdiskAttachLimitMap
+	case "c4a":
+		limitMap = C4AMachineHyperdiskAttachLimitMap
+	case "a4x":
+		limitMap = A4XMachineHyperdiskAttachLimitMap
+	default:
+		// Fallback to the most conservative Gen4 map for unknown types
+		return MapNumber(vCPUs, C4DMachineHyperdiskAttachLimitMap)
+	}
+
+	return MapNumber(vCPUs, limitMap)
+}
+
+// mapNumber maps the vCPUs to the appropriate hyperdisk limit
+func MapNumber(vCPUs int64, limitMap []MachineHyperdiskLimit) int64 {
+	for _, limit := range limitMap {
+		if vCPUs <= limit.max {
+			return limit.value
 		}
 	}
-	return 0
+	// Return the last value if vCPUs exceeds all max values
+	if len(limitMap) > 0 {
+		return limitMap[len(limitMap)-1].value
+	}
+	return 15
 }
 
 func DiskTypeLabelKey(diskType string) string {
