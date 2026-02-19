@@ -33,9 +33,13 @@ import (
 	compute "google.golang.org/api/compute/v1"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/strings/slices"
-	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/constants"
 	testutils "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/test/e2e/utils"
 	remote "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/test/remote"
+)
+
+const (
+	noMachineType = "none"
 )
 
 var (
@@ -43,8 +47,8 @@ var (
 	serviceAccount            = flag.String("service-account", "", "Service account to bring up instance with")
 	vmNamePrefix              = flag.String("vm-name-prefix", "gce-pd-csi-e2e", "VM name prefix")
 	architecture              = flag.String("arch", "amd64", "Architecture pd csi driver build on")
-	minCpuPlatform            = flag.String("min-cpu-platform", "rome", "Minimum CPU architecture")
-	mwMinCpuPlatform          = flag.String("min-cpu-platform-mw", "sapphirerapids", "Minimum CPU architecture for multiwriter tests")
+	minCpuPlatform            = flag.String("min-cpu-platform", "AMD Rome", "Minimum CPU architecture")
+	mwMinCpuPlatform          = flag.String("min-cpu-platform-mw", "Intel Sapphire Rapids", "Minimum CPU architecture for multiwriter tests")
 	zones                     = flag.String("zones", "us-east4-a,us-east4-c", "Zones to run tests in. If there are multiple zones, separate each by comma")
 	machineType               = flag.String("machine-type", "n2d-standard-4", "Type of machine to provision instance on")
 	imageURL                  = flag.String("image-url", "projects/ubuntu-os-cloud/global/images/family/ubuntu-minimal-2404-lts-amd64", "OS image url to get image from")
@@ -55,11 +59,14 @@ var (
 	enableConfidentialCompute = flag.Bool("enable-confidential-compute", false, "Create VMs with confidential compute mode. This uses NVMe devices")
 	// Multi-writer is only supported on M3, C3, and N4
 	// https://cloud.google.com/compute/docs/disks/sharing-disks-between-vms#hd-multi-writer
-	hdMachineType    = flag.String("hyperdisk-machine-type", "c3-standard-4", "Type of machine to provision instance on")
+	hdMachineType    = flag.String("hyperdisk-machine-type", "c3-standard-4", "Type of machine to provision instance on, or `none' to skip")
 	hdMinCpuPlatform = flag.String("hyperdisk-min-cpu-platform", "Intel Sapphire Rapids", "Minimum CPU architecture")
 
-	testContexts          = []*remote.TestContext{}
-	hyperdiskTestContexts = []*remote.TestContext{}
+	// Some architectures don't have local ssd. Give way to opt out of tests like datacache.
+	skipLocalSsdTests = flag.Bool("skip-local-ssd-tests", false, "Skip local ssd tests like datacache")
+
+	testContexts          []*remote.TestContext
+	hyperdiskTestContexts []*remote.TestContext
 	computeService        *compute.Service
 	computeAlphaService   *computealpha.Service
 	computeBetaService    *computebeta.Service
@@ -80,10 +87,6 @@ var _ = BeforeSuite(func() {
 	var err error
 	numberOfInstancesPerZone := 2
 	zones := strings.Split(*zones, ",")
-	tcc := make(chan *remote.TestContext, len(zones)*numberOfInstancesPerZone)
-	hdtcc := make(chan *remote.TestContext, len(zones))
-	defer close(tcc)
-	defer close(hdtcc)
 
 	rand.Seed(time.Now().UnixNano())
 
@@ -109,40 +112,40 @@ var _ = BeforeSuite(func() {
 
 	klog.Infof("Running in project %v with service account %v", *project, *serviceAccount)
 
-	setupContext := func(zone string) {
-		var wg sync.WaitGroup
+	testContexts = make([]*remote.TestContext, numberOfInstancesPerZone*len(zones))
+	if *hdMachineType != noMachineType {
+		hyperdiskTestContexts = make([]*remote.TestContext, len(zones))
+	}
+	var wg sync.WaitGroup
+	setupContext := func(idx int, zone string) {
 		// Create 2 instances for each zone as we need 2 instances each zone for certain test cases
 		for j := 0; j < numberOfInstancesPerZone; j++ {
 			wg.Add(1)
 			go func(curZone string, randInt int) {
 				defer GinkgoRecover()
 				defer wg.Done()
-				tcc <- NewDefaultTestContext(curZone, strconv.Itoa(randInt))
+				tc := NewDefaultTestContext(curZone, strconv.Itoa(randInt))
+				k := j + idx*numberOfInstancesPerZone
+				testContexts[k] = tc
+				klog.Infof("Added TestContext for node %s at %d", tc.Instance.GetName(), k)
 			}(zone, j)
 		}
-		wg.Add(1)
-		go func(curZone string) {
-			defer GinkgoRecover()
-			defer wg.Done()
-			hdtcc <- NewTestContext(curZone, *hdMinCpuPlatform, *hdMachineType, "0")
-		}(zone)
-		wg.Wait()
+		if hyperdiskTestContexts != nil {
+			wg.Add(1)
+			go func(curZone string) {
+				defer GinkgoRecover()
+				defer wg.Done()
+				tc := NewTestContext(curZone, *hdMinCpuPlatform, *hdMachineType, "0")
+				hyperdiskTestContexts[idx] = tc
+				klog.Infof("Added hyperdisk TestContext for node %s at %d", tc.Instance.GetName(), idx)
+			}(zone)
+		}
 	}
 
-	for _, zone := range zones {
-		setupContext(zone)
+	for i, zone := range zones {
+		setupContext(i, zone)
 	}
-
-	for i := 0; i < len(zones)*numberOfInstancesPerZone; i++ {
-		tc := <-tcc
-		testContexts = append(testContexts, tc)
-		klog.Infof("Added TestContext for node %s", tc.Instance.GetName())
-	}
-	for i := 0; i < len(zones); i++ {
-		tc := <-hdtcc
-		hyperdiskTestContexts = append(hyperdiskTestContexts, tc)
-		klog.Infof("Added TestContext for node %s", tc.Instance.GetName())
-	}
+	wg.Wait()
 })
 
 var _ = AfterSuite(func() {
@@ -177,6 +180,13 @@ func NewDefaultTestContext(zone string, instanceNumber string) *remote.TestConte
 	return NewTestContext(zone, *minCpuPlatform, *machineType, instanceNumber)
 }
 
+func getLocalSsdCount() int64 {
+	if *skipLocalSsdTests {
+		return 0
+	}
+	return constants.LocalSSDCountForDataCache
+}
+
 func NewTestContext(zone, minCpuPlatform, machineType string, instanceNumber string) *remote.TestContext {
 	nodeID := fmt.Sprintf("%s-%s-%s-%s", *vmNamePrefix, zone, machineType, instanceNumber)
 	klog.Infof("Setting up node %s", nodeID)
@@ -193,7 +203,7 @@ func NewTestContext(zone, minCpuPlatform, machineType string, instanceNumber str
 		CloudtopHost:              *cloudtopHost,
 		EnableConfidentialCompute: *enableConfidentialCompute,
 		ComputeService:            computeService,
-		LocalSSDCount:             common.LocalSSDCountForDataCache,
+		LocalSSDCount:             getLocalSsdCount(),
 	}
 
 	if machineType == *hdMachineType {

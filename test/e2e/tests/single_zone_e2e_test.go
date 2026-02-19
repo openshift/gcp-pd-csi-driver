@@ -28,8 +28,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/constants"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/deviceutils"
 	gce "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/compute"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/parameters"
 	testutils "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/test/e2e/utils"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/test/remote"
 
@@ -268,7 +270,7 @@ var _ = Describe("GCE PD CSI Driver", func() {
 			topReq := &csi.TopologyRequirement{
 				Requisite: []*csi.Topology{
 					{
-						Segments: map[string]string{common.TopologyKeyZone: zone},
+						Segments: map[string]string{constants.TopologyKeyZone: zone},
 					},
 				},
 			}
@@ -298,7 +300,7 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		topReq := &csi.TopologyRequirement{
 			Requisite: []*csi.Topology{
 				{
-					Segments: map[string]string{common.TopologyKeyZone: "us-central1-c"},
+					Segments: map[string]string{constants.TopologyKeyZone: "us-central1-c"},
 				},
 			},
 		}
@@ -314,7 +316,7 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		Expect(volume.AccessibleTopology).ToNot(BeEmpty(), "Volume should have accessible topologies")
 		Expect(volume.AccessibleTopology).To(HaveLen(1), "Expected exactly one accessible topology") // Zonal clusters have a single Topology.
 		segments := volume.AccessibleTopology[0].Segments
-		Expect(segments).To(HaveKeyWithValue(common.TopologyKeyZone, "us-central1-c"), "Topology should include zone segment with value 'us-central1-c'")
+		Expect(segments).To(HaveKeyWithValue(constants.TopologyKeyZone, "us-central1-c"), "Topology should include zone segment with value 'us-central1-c'")
 		Expect(segments).To(HaveKeyWithValue(common.DiskTypeLabelKey(hdbDiskType), "true"), "Topology should include disk type label with value 'true'")
 	})
 
@@ -331,7 +333,7 @@ var _ = Describe("GCE PD CSI Driver", func() {
 	// 		topReq := &csi.TopologyRequirement{
 	// 			Requisite: []*csi.Topology{
 	// 				{
-	// 					Segments: map[string]string{common.TopologyKeyZone: zone},
+	// 					Segments: map[string]string{constants.TopologyKeyZone: zone},
 	// 				},
 	// 			},
 	// 		}
@@ -431,7 +433,7 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		// Create Disk
 		volName := testNamePrefix + string(uuid.NewUUID())
 		volume, err := controllerClient.CreateVolume(volName, map[string]string{
-			common.ParameterKeyReplicationType: "regional-pd",
+			parameters.ParameterKeyReplicationType: "regional-pd",
 		}, defaultRepdSizeGb, nil, nil)
 		Expect(err).To(BeNil(), "CreateVolume failed with error: %v", err)
 
@@ -513,7 +515,7 @@ var _ = Describe("GCE PD CSI Driver", func() {
 
 			// Create Disk
 			diskParams := map[string]string{
-				common.ParameterKeyType: diskType,
+				parameters.ParameterKeyType: diskType,
 			}
 			volName := testNamePrefix + string(uuid.NewUUID())
 
@@ -557,7 +559,7 @@ var _ = Describe("GCE PD CSI Driver", func() {
 			disk := typeToDisk[diskType]
 			volName := testNamePrefix + string(uuid.NewUUID())
 			params := merge(disk.params, map[string]string{
-				common.ParameterKeyLabels: "key1=value1,key2=value2",
+				parameters.ParameterKeyLabels: "key1=value1,key2=value2",
 			})
 
 			diskSize := defaultSizeGb
@@ -684,12 +686,12 @@ var _ = Describe("GCE PD CSI Driver", func() {
 			disk := typeToDisk[diskType]
 			volName := testNamePrefix + string(uuid.NewUUID())
 			params := merge(disk.params, map[string]string{
-				common.ParameterKeyDiskEncryptionKmsKey: key.Name,
+				parameters.ParameterKeyDiskEncryptionKmsKey: key.Name,
 			})
 			topology := &csi.TopologyRequirement{
 				Requisite: []*csi.Topology{
 					{
-						Segments: map[string]string{common.TopologyKeyZone: z},
+						Segments: map[string]string{constants.TopologyKeyZone: z},
 					},
 				},
 			}
@@ -814,7 +816,7 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		// Create Disk
 		volName := testNamePrefix + string(uuid.NewUUID())
 		volume, err := controllerClient.CreateVolume(volName, map[string]string{
-			common.ParameterKeyReplicationType: "regional-pd",
+			parameters.ParameterKeyReplicationType: "regional-pd",
 		}, defaultRepdSizeGb, nil, nil)
 		Expect(err).To(BeNil(), "CreateVolume failed with error: %v", err)
 
@@ -1028,9 +1030,9 @@ var _ = Describe("GCE PD CSI Driver", func() {
 			disk := typeToDisk[diskType]
 			volName := testNamePrefix + string(uuid.NewUUID())
 			params := merge(disk.params, map[string]string{
-				common.ParameterKeyPVCName:      "test-pvc",
-				common.ParameterKeyPVCNamespace: "test-pvc-namespace",
-				common.ParameterKeyPVName:       "test-pv-name",
+				parameters.ParameterKeyPVCName:      "test-pvc",
+				parameters.ParameterKeyPVCNamespace: "test-pvc-namespace",
+				parameters.ParameterKeyPVName:       "test-pv-name",
 			})
 			volume, err := controllerClient.CreateVolume(volName, params, diskSize, nil /* topReq */, nil)
 			Expect(err).To(BeNil(), "CreateVolume failed with error: %v", err)
@@ -1076,10 +1078,10 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		snapshotLocation := z[:len(z)-2]
 
 		snapshotParams := map[string]string{
-			common.ParameterKeyStorageLocations:          snapshotLocation,
-			common.ParameterKeyVolumeSnapshotName:        "test-volumesnapshot-name",
-			common.ParameterKeyVolumeSnapshotNamespace:   "test-volumesnapshot-namespace",
-			common.ParameterKeyVolumeSnapshotContentName: "test-volumesnapshotcontent-name",
+			parameters.ParameterKeyStorageLocations:          snapshotLocation,
+			parameters.ParameterKeyVolumeSnapshotName:        "test-volumesnapshot-name",
+			parameters.ParameterKeyVolumeSnapshotNamespace:   "test-volumesnapshot-namespace",
+			parameters.ParameterKeyVolumeSnapshotContentName: "test-volumesnapshotcontent-name",
 		}
 		snapshotID, err := client.CreateSnapshot(snapshotName, volID, snapshotParams)
 		Expect(err).To(BeNil(), "CreateSnapshot failed with error: %v", err)
@@ -1137,7 +1139,7 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		snapshotName := testNamePrefix + string(uuid.NewUUID())
 		testImageFamily := "test-family"
 
-		snapshotParams := map[string]string{common.ParameterKeySnapshotType: common.DiskImageType, common.ParameterKeyImageFamily: testImageFamily}
+		snapshotParams := map[string]string{parameters.ParameterKeySnapshotType: parameters.DiskImageType, parameters.ParameterKeyImageFamily: testImageFamily}
 		snapshotID, err := client.CreateSnapshot(snapshotName, volID, snapshotParams)
 		Expect(err).To(BeNil(), "CreateSnapshot failed with error: %v", err)
 
@@ -1161,7 +1163,7 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		Expect(err).To(BeNil(), "Could not get snapshot from cloud directly")
 		_, snapshotType, _, err := common.SnapshotIDToProjectKey(cleanSelfLink(snapshot.SelfLink))
 		Expect(err).To(BeNil(), "Failed to parse snapshot ID")
-		Expect(snapshotType).To(Equal(common.DiskImageType), "Expected images type in snapshot ID")
+		Expect(snapshotType).To(Equal(parameters.DiskImageType), "Expected images type in snapshot ID")
 
 		snapshots, err := client.ListSnapshots()
 		Expect(err).To(BeNil(), "Could not list snapshots")
@@ -1201,12 +1203,12 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		// Create Disk
 		volName := testNamePrefix + string(uuid.NewUUID())
 		volume, err := controllerClient.CreateVolume(volName, map[string]string{
-			common.ParameterKeyReplicationType: "none",
+			parameters.ParameterKeyReplicationType: "none",
 		}, defaultSizeGb,
 			&csi.TopologyRequirement{
 				Requisite: []*csi.Topology{
 					{
-						Segments: map[string]string{common.TopologyKeyZone: z},
+						Segments: map[string]string{constants.TopologyKeyZone: z},
 					},
 				},
 			},
@@ -1257,12 +1259,12 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		// Create Source Disk
 		srcVolName := testNamePrefix + string(uuid.NewUUID())
 		srcVolume, err := controllerClient.CreateVolume(srcVolName, map[string]string{
-			common.ParameterKeyReplicationType: "none",
+			parameters.ParameterKeyReplicationType: "none",
 		}, defaultRepdSizeGb, nil, nil)
 		// Create Disk
 		volName := testNamePrefix + string(uuid.NewUUID())
 		volume, err := controllerClient.CreateVolume(volName, map[string]string{
-			common.ParameterKeyReplicationType: "regional-pd",
+			parameters.ParameterKeyReplicationType: "regional-pd",
 		}, defaultRepdSizeGb, nil,
 			&csi.VolumeContentSource{
 				Type: &csi.VolumeContentSource_Volume{
@@ -1322,12 +1324,12 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		// Create Source Disk
 		srcVolName := testNamePrefix + string(uuid.NewUUID())
 		srcVolume, err := controllerClient.CreateVolume(srcVolName, map[string]string{
-			common.ParameterKeyReplicationType: "regional-pd",
+			parameters.ParameterKeyReplicationType: "regional-pd",
 		}, defaultRepdSizeGb, nil, nil)
 		// Create Disk
 		volName := testNamePrefix + string(uuid.NewUUID())
 		volume, err := controllerClient.CreateVolume(volName, map[string]string{
-			common.ParameterKeyReplicationType: "regional-pd",
+			parameters.ParameterKeyReplicationType: "regional-pd",
 		}, defaultRepdSizeGb, nil,
 			&csi.VolumeContentSource{
 				Type: &csi.VolumeContentSource_Volume{
@@ -1483,6 +1485,9 @@ var _ = Describe("GCE PD CSI Driver", func() {
 	It("Should create disks, attach them to instance with local ssd, setup caching between LSSD->detach->reattach to same instance", func() {
 		Expect(testContexts).ToNot(BeEmpty())
 		testContext := getRandomTestContext()
+		if testContext.Instance.GetLocalSSD() == 0 {
+			Skip("Skipping data cache as no local ssd in context")
+		}
 
 		p, z, _ := testContext.Instance.GetIdentity()
 		client := testContext.Client
@@ -1663,6 +1668,94 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		Expect(err).To(BeNil(), "Failed to rm file path %s: %v", fp, err)
 	})
 
+	It("Should mount if udev disabled, and remount if it's enabled again", func() {
+		testContext := getRandomTestContext()
+		p, z, _ := testContext.Instance.GetIdentity()
+		client := testContext.Client
+		instance := testContext.Instance
+
+		klog.Infof("Disabling udev")
+		err := instance.DisableUdev()
+		Expect(err).To(BeNil(), "Failed to disable udev")
+
+		// Create Disk
+		volName, volID := createAndValidateUniqueZonalDisk(client, p, z, standardDiskType)
+		vol2Name, vol2ID := createAndValidateUniqueZonalDisk(client, p, z, standardDiskType)
+
+		defer func() {
+			// Delete Disks
+			err := client.DeleteVolume(volID)
+			Expect(err).To(BeNil(), "DeleteVolume failed")
+
+			err = client.DeleteVolume(vol2ID)
+			Expect(err).To(BeNil(), "DeleteVolume failed")
+
+			// Validate Disks Deleted
+			_, err = computeService.Disks.Get(p, z, volName).Do()
+			Expect(gce.IsGCEError(err, "notFound")).To(BeTrue(), "Expected disk to not be found")
+			_, err = computeService.Disks.Get(p, z, vol2Name).Do()
+			Expect(gce.IsGCEError(err, "notFound")).To(BeTrue(), "Expected disk to not be found")
+		}()
+
+		// Attach & detach disk. We retry as we expect the udev repair to take a little bit of time.
+		klog.Infof("Starting attach & detach with disabled udev")
+		err = wait.Poll(10*time.Second, 5*time.Minute, func() (bool, error) {
+			err = testAttachWriteReadDetach(volID, volName, instance, client, false /* readOnly */, false /* detachAndReattach */, false /* setupDataCache */)
+			if err != nil {
+				klog.Infof("Initial udev error, retrying: %v", err)
+			}
+			return err == nil, nil
+		})
+		Expect(err).To(BeNil(), "Failed to go through volume lifecycle")
+
+		// Attach a different disk. The conflicting udev paths should not cause a problem.
+		klog.Infof("Starting second attach & detach with disabled udev")
+		err = wait.Poll(10*time.Second, 5*time.Minute, func() (bool, error) {
+			err = testAttachWriteReadDetach(vol2ID, vol2Name, instance, client, false /* readOnly */, false /* detachAndReattach */, false /* setupDataCache */)
+			if err != nil {
+				klog.Infof("second disk udev error, retrying: %v", err)
+			}
+			return err == nil, nil
+		})
+		Expect(err).To(BeNil(), "Failed to go through second volume lifecycle")
+
+		// Attach, reenable udev, go through lifecycle of second disk, detach first
+		klog.Infof("Starting attach & udev re-enable")
+		var detacher func()
+		var args *verifyArgs
+		err = wait.Poll(10*time.Second, 5*time.Minute, func() (bool, error) {
+			err, detacher, args = testAttachAndMount(volID, volName, instance, client, attachAndMountArgs{})
+			if err != nil {
+				klog.Infof("attach before reenable failed, retrying: %v", err)
+			}
+			return err == nil, nil
+		})
+		Expect(err).To(BeNil(), "Failed second attach")
+		defer detacher()
+
+		klog.Infof("Re-enabling udev")
+		err = instance.EnableUdev()
+		Expect(err).To(BeNil(), "Failed to enable udev")
+
+		// After udev is enabled we expect everything to succeed on the first try.
+
+		klog.Infof("Testing attach & detach with re-enabled udev")
+		err = testAttachWriteReadDetach(vol2ID, vol2Name, instance, client, false /* readOnly */, false /* detachAndReattach */, false /* setupDataCache */)
+		Expect(err).To(BeNil(), "Failed to go through nested volume lifecycle with enabled")
+
+		klog.Infof("Testing detach with re-enabled udev")
+		err = client.NodeUnpublishVolume(volID, args.publishDir)
+		Expect(err).To(BeNil(), "Failed to unpublish first")
+
+		err = client.NodeUnstageVolume(volID, args.stageDir)
+		Expect(err).To(BeNil(), "Failed to unstage first")
+
+		// Go through complete lifecycle again, with udev enabled.
+		klog.Infof("Testing final lifecycle enabled udev")
+		err = testAttachWriteReadDetach(volID, volName, instance, client, false /* readOnly */, false /* detachAndReattach */, false /* setupDataCache */)
+		Expect(err).To(BeNil(), "Failed to go through volume lifecycle with udev enabled")
+	})
+
 	type multiZoneTestConfig struct {
 		diskType          string
 		readOnly          bool
@@ -1686,7 +1779,7 @@ var _ = Describe("GCE PD CSI Driver", func() {
 
 			if cfg.hasMultiZoneLabel {
 				labelsMap := map[string]string{
-					common.MultiZoneLabel: "true",
+					constants.MultiZoneLabel: "true",
 				}
 				disk, err := computeService.Disks.Get(p, z, volName).Do()
 				Expect(err).To(BeNil(), "Could not get disk")
@@ -1828,7 +1921,7 @@ func createAndValidateZonalDisk(client *remote.CsiClient, project, zone string, 
 		&csi.TopologyRequirement{
 			Requisite: []*csi.Topology{
 				{
-					Segments: map[string]string{common.TopologyKeyZone: zone},
+					Segments: map[string]string{constants.TopologyKeyZone: zone},
 				},
 			},
 		}, nil)
@@ -1861,13 +1954,13 @@ func createAndValidateUniqueZonalMultiWriterDisk(client *remote.CsiClient, proje
 	// Create Disk
 	disk := typeToDisk[diskType]
 
-	disk.params[common.ParameterAccessMode] = "READ_WRITE_MANY"
+	disk.params[parameters.ParameterAccessMode] = "READ_WRITE_MANY"
 	volName := testNamePrefix + string(uuid.NewUUID())
 	volume, err := client.CreateVolumeWithCaps(volName, disk.params, defaultMwSizeGb,
 		&csi.TopologyRequirement{
 			Requisite: []*csi.Topology{
 				{
-					Segments: map[string]string{common.TopologyKeyZone: zone},
+					Segments: map[string]string{constants.TopologyKeyZone: zone},
 				},
 			},
 		},
@@ -1968,7 +2061,7 @@ type disk struct {
 var typeToDisk = map[string]*disk{
 	standardDiskType: {
 		params: map[string]string{
-			common.ParameterKeyType: standardDiskType,
+			parameters.ParameterKeyType: standardDiskType,
 		},
 		validate: func(disk *compute.Disk) {
 			Expect(disk.Type).To(ContainSubstring(standardDiskType))
@@ -1976,8 +2069,8 @@ var typeToDisk = map[string]*disk{
 	},
 	extremeDiskType: {
 		params: map[string]string{
-			common.ParameterKeyType:                    extremeDiskType,
-			common.ParameterKeyProvisionedIOPSOnCreate: provisionedIOPSOnCreate,
+			parameters.ParameterKeyType:                    extremeDiskType,
+			parameters.ParameterKeyProvisionedIOPSOnCreate: provisionedIOPSOnCreate,
 		},
 		validate: func(disk *compute.Disk) {
 			Expect(disk.Type).To(ContainSubstring(extremeDiskType))
@@ -1986,9 +2079,9 @@ var typeToDisk = map[string]*disk{
 	},
 	hdbDiskType: {
 		params: map[string]string{
-			common.ParameterKeyType:                          hdbDiskType,
-			common.ParameterKeyProvisionedIOPSOnCreate:       provisionedIOPSOnCreateHdb,
-			common.ParameterKeyProvisionedThroughputOnCreate: provisionedThroughputOnCreateHdb,
+			parameters.ParameterKeyType:                          hdbDiskType,
+			parameters.ParameterKeyProvisionedIOPSOnCreate:       provisionedIOPSOnCreateHdb,
+			parameters.ParameterKeyProvisionedThroughputOnCreate: provisionedThroughputOnCreateHdb,
 		},
 		validate: func(disk *compute.Disk) {
 			Expect(disk.Type).To(ContainSubstring(hdbDiskType))
@@ -1998,8 +2091,8 @@ var typeToDisk = map[string]*disk{
 	},
 	hdxDiskType: {
 		params: map[string]string{
-			common.ParameterKeyType:                    hdxDiskType,
-			common.ParameterKeyProvisionedIOPSOnCreate: provisionedIOPSOnCreateHdx,
+			parameters.ParameterKeyType:                    hdxDiskType,
+			parameters.ParameterKeyProvisionedIOPSOnCreate: provisionedIOPSOnCreateHdx,
 		},
 		validate: func(disk *compute.Disk) {
 			Expect(disk.Type).To(ContainSubstring(hdxDiskType))
@@ -2008,8 +2101,8 @@ var typeToDisk = map[string]*disk{
 	},
 	hdtDiskType: {
 		params: map[string]string{
-			common.ParameterKeyType:                          hdtDiskType,
-			common.ParameterKeyProvisionedThroughputOnCreate: provisionedThroughputOnCreate,
+			parameters.ParameterKeyType:                          hdtDiskType,
+			parameters.ParameterKeyProvisionedThroughputOnCreate: provisionedThroughputOnCreate,
 		},
 		validate: func(disk *compute.Disk) {
 			Expect(disk.Type).To(ContainSubstring(hdtDiskType))
@@ -2018,7 +2111,7 @@ var typeToDisk = map[string]*disk{
 	},
 	ssdDiskType: {
 		params: map[string]string{
-			common.ParameterKeyType: ssdDiskType,
+			parameters.ParameterKeyType: ssdDiskType,
 		},
 		validate: func(disk *compute.Disk) {
 			Expect(disk.Type).To(ContainSubstring(ssdDiskType))
@@ -2026,7 +2119,7 @@ var typeToDisk = map[string]*disk{
 	},
 	"hyperdisk-ml": {
 		params: map[string]string{
-			common.ParameterKeyType: "hyperdisk-ml",
+			parameters.ParameterKeyType: "hyperdisk-ml",
 		},
 		validate: func(disk *compute.Disk) {
 			Expect(disk.Type).To(ContainSubstring("hyperdisk-ml"))

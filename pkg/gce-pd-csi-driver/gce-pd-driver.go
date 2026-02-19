@@ -160,6 +160,7 @@ func NewNodeServer(gceDriver *GCEDriver, mounter *mount.SafeFormatAndMount, devi
 		SysfsPath:                args.SysfsPath,
 		metricsManager:           args.MetricsManager,
 		DeviceCache:              args.DeviceCache,
+		EnableDynamicVolumes:     args.EnableDynamicVolumes,
 	}
 }
 
@@ -177,6 +178,7 @@ func NewControllerServer(gceDriver *GCEDriver, cloudProvider gce.GCECompute, err
 		listVolumesConfig:           listVolumesConfig,
 		provisionableDisksConfig:    provisionableDisksConfig,
 		enableHdHA:                  enableHdHA,
+		enableDynamicVolumes:        args.EnableDynamicVolumes,
 		EnableDiskTopology:          args.EnableDiskTopology,
 		EnableDiskSizeValidation:    args.EnableDiskSizeValidation,
 	}
