@@ -301,6 +301,7 @@ func handle() {
 			MetricsManager:           metricsManager,
 			DeviceCache:              deviceCache,
 			EnableDynamicVolumes:     *dynamicVolumes,
+			NodeName:                 *nodeName,
 		}
 		nodeServer = driver.NewNodeServer(gceDriver, mounter, deviceUtils, meta, statter, nsArgs)
 
