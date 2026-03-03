@@ -54,6 +54,7 @@ type GCENodeServer struct {
 	EnableDataCache          bool
 	DataCacheEnabledNodePool bool
 	SysfsPath                string
+	nodeName                 string
 
 	// A map storing all volumes with ongoing operations so that additional operations
 	// for that same volume (as defined by VolumeID) return an Aborted error
@@ -99,6 +100,8 @@ type NodeServerArgs struct {
 
 	// SysfsPath defaults to "/sys", except if it's a unit test.
 	SysfsPath string
+
+	NodeName string
 
 	MetricsManager *metrics.MetricsManager
 	DeviceCache    *linkcache.DeviceCache
@@ -168,6 +171,15 @@ func (ns *GCENodeServer) WithSerializedFormatAndMount(timeout time.Duration, max
 		ns.formatAndMountTimeout = timeout
 	}
 	return ns
+}
+
+// GetNodeName returns the node name, prioritizing the override value (from Downward API)
+// over the metadata service if available.
+func (ns *GCENodeServer) GetNodeName() string {
+	if ns.nodeName != "" {
+		return ns.nodeName
+	}
+	return ns.MetadataService.GetName()
 }
 
 func (ns *GCENodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
@@ -690,9 +702,9 @@ func (ns *GCENodeServer) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRe
 		Segments: map[string]string{common.TopologyKeyZone: ns.MetadataService.GetZone()},
 	}
 
-	node, err := k8sclient.GetNodeWithRetry(ctx, ns.MetadataService.GetName())
+	node, err := k8sclient.GetNodeWithRetry(ctx, ns.GetNodeName())
 	if err != nil {
-		klog.Errorf("Failed to get node %s: %v. The error is ignored so that the driver can register", ns.MetadataService.GetName(), err.Error())
+		klog.Errorf("Failed to get node %s: %v. The error is ignored so that the driver can register", ns.GetNodeName(), err.Error())
 	}
 
 	if ns.EnableDynamicVolumes {
@@ -706,7 +718,7 @@ func (ns *GCENodeServer) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRe
 		}
 	}
 
-	nodeID := common.CreateNodeID(ns.MetadataService.GetProject(), ns.MetadataService.GetZone(), ns.MetadataService.GetName())
+	nodeID := common.CreateNodeID(ns.MetadataService.GetProject(), ns.MetadataService.GetZone(), ns.GetNodeName())
 
 	volumeLimits, err := ns.getVolumeLimits(ctx, node)
 	if err != nil {
