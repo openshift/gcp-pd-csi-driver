@@ -799,6 +799,11 @@ func MapNumber(vCPUs int64, limitMap []MachineHyperdiskLimit) int64 {
 	return 15
 }
 
+// HasDiskTypeLabelKeyPrefix checks if the label key starts with the DiskTypeKeyPrefix.
+func HasDiskTypeLabelKeyPrefix(labelKey string) bool {
+	return strings.HasPrefix(labelKey, DiskTypeKeyPrefix)
+}
+
 func DiskTypeLabelKey(diskType string) string {
 	return fmt.Sprintf("%s/%s", DiskTypeKeyPrefix, diskType)
 }
