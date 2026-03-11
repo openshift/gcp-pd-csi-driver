@@ -33,9 +33,12 @@ import (
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	volumehelpers "k8s.io/cloud-provider/volume/helpers"
 	"k8s.io/klog/v2"
 	"k8s.io/mount-utils"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/constants"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/deviceutils"
 	metadataservice "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/metadata"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/k8sclient"
@@ -131,16 +134,30 @@ const (
 	fsTypeExt3                   = "ext3"
 	fsTypeBtrfs                  = "btrfs"
 
-	readAheadKBMountFlagRegexPattern = "^read_ahead_kb=(.+)$"
-	btrfsReclaimDataRegexPattern     = "^btrfs-allocation-data-bg_reclaim_threshold=(\\d{1,2})$"     // 0-99 are valid, incl. 00
-	btrfsReclaimMetadataRegexPattern = "^btrfs-allocation-metadata-bg_reclaim_threshold=(\\d{1,2})$" // ditto ^
+	readAheadKBMountFlagRegexPattern        = "^read_ahead_kb=(.+)$"
+	btrfsReclaimDataRegexPattern            = "^btrfs-allocation-data-bg_reclaim_threshold=(\\d{1,2})$"     // 0-99 are valid, incl. 00
+	btrfsReclaimMetadataRegexPattern        = "^btrfs-allocation-metadata-bg_reclaim_threshold=(\\d{1,2})$" // ditto ^
+	btrfsDynamicReclaimDataRegexPattern     = "^btrfs-allocation-data-dynamic_reclaim=(0|1)$"               // boolean in kernel, so accepting 0 or 1
+	btrfsDynamicReclaimMetadataRegexPattern = "^btrfs-allocation-metadata-dynamic_reclaim=(0|1)$"           // ditto ^
+	btrfsReadAheadKBRegexPattern            = "^btrfs-bdi-read_ahead_kb=(\\d+)$"
 )
 
 var (
-	readAheadKBMountFlagRegex = regexp.MustCompile(readAheadKBMountFlagRegexPattern)
-	btrfsReclaimDataRegex     = regexp.MustCompile(btrfsReclaimDataRegexPattern)
-	btrfsReclaimMetadataRegex = regexp.MustCompile(btrfsReclaimMetadataRegexPattern)
+	readAheadKBMountFlagRegex        = regexp.MustCompile(readAheadKBMountFlagRegexPattern)
+	btrfsReclaimDataRegex            = regexp.MustCompile(btrfsReclaimDataRegexPattern)
+	btrfsReclaimMetadataRegex        = regexp.MustCompile(btrfsReclaimMetadataRegexPattern)
+	btrfsDynamicReclaimDataRegex     = regexp.MustCompile(btrfsDynamicReclaimDataRegexPattern)
+	btrfsDynamicReclaimMetadataRegex = regexp.MustCompile(btrfsDynamicReclaimMetadataRegexPattern)
+	btrfsReadAheadKBRegex            = regexp.MustCompile(btrfsReadAheadKBRegexPattern)
 )
+
+type btrfsFlags struct {
+	reclaimData,
+	reclaimMetadata,
+	dynamicReclaimData,
+	dynamicReclaimMetadata,
+	readAheadKb string
+}
 
 func getDefaultFsType() string {
 	if runtime.GOOS == "windows" {
@@ -203,7 +220,7 @@ func (ns *GCENodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePub
 	}
 
 	if acquired := ns.volumeLocks.TryAcquire(volumeID); !acquired {
-		return nil, status.Errorf(codes.Aborted, common.VolumeOperationAlreadyExistsFmt, volumeID)
+		return nil, status.Errorf(codes.Aborted, constants.VolumeOperationAlreadyExistsFmt, volumeID)
 	}
 	defer ns.volumeLocks.Release(volumeID)
 
@@ -245,7 +262,7 @@ func (ns *GCENodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePub
 		klog.V(4).Infof("NodePublishVolume with block volume mode")
 
 		partition := ""
-		if part, ok := req.GetVolumeContext()[common.VolumeAttributePartition]; ok {
+		if part, ok := req.GetVolumeContext()[constants.VolumeAttributePartition]; ok {
 			partition = part
 		}
 
@@ -327,7 +344,7 @@ func (ns *GCENodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeU
 	}
 
 	if acquired := ns.volumeLocks.TryAcquire(volumeID); !acquired {
-		return nil, status.Errorf(codes.Aborted, common.VolumeOperationAlreadyExistsFmt, volumeID)
+		return nil, status.Errorf(codes.Aborted, constants.VolumeOperationAlreadyExistsFmt, volumeID)
 	}
 	defer ns.volumeLocks.Release(volumeID)
 
@@ -355,7 +372,7 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 	}
 
 	if acquired := ns.volumeLocks.TryAcquire(volumeID); !acquired {
-		return nil, status.Errorf(codes.Aborted, common.VolumeOperationAlreadyExistsFmt, volumeID)
+		return nil, status.Errorf(codes.Aborted, constants.VolumeOperationAlreadyExistsFmt, volumeID)
 	}
 	defer ns.volumeLocks.Release(volumeID)
 
@@ -373,7 +390,7 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 	// Part 1: Get device path of attached device
 	partition := ""
 
-	if part, ok := req.GetVolumeContext()[common.VolumeAttributePartition]; ok {
+	if part, ok := req.GetVolumeContext()[constants.VolumeAttributePartition]; ok {
 		partition = part
 	}
 	devicePath, err := getDevicePath(ns, volumeID, partition)
@@ -383,7 +400,7 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 
 	klog.Infof("Successfully found attached GCE PD %q at device path %s.", volumeKey.Name, devicePath)
 
-	if ns.EnableDataCache && (req.GetPublishContext()[common.ContextDataCacheSize] != "" || req.GetPublishContext()[common.ContextDataCacheMode] != "") {
+	if ns.EnableDataCache && (req.GetPublishContext()[constants.ContextDataCacheSize] != "" || req.GetPublishContext()[constants.ContextDataCacheMode] != "") {
 		if len(nodeId) == 0 {
 			return nil, status.Error(codes.InvalidArgument, "NodeStageVolume Node ID must be provided")
 		}
@@ -391,7 +408,7 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 		if err != nil {
 			klog.Errorf("filepath.EvalSymlinks(%q) failed when trying to create volume group: %v", devicePath, err)
 		}
-		configError := ValidateDataCacheConfig(req.GetPublishContext()[common.ContextDataCacheMode], req.GetPublishContext()[common.ContextDataCacheSize], ctx)
+		configError := ValidateDataCacheConfig(req.GetPublishContext()[constants.ContextDataCacheMode], req.GetPublishContext()[constants.ContextDataCacheSize], ctx)
 		if configError != nil {
 			if ns.DataCacheEnabledNodePool {
 				return nil, status.Error(codes.DataLoss, fmt.Sprintf("Error validate configuration for Data Cache: %v", configError.Error()))
@@ -421,7 +438,7 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 	// Part 3: Mount device to stagingTargetPath
 	fstype := getDefaultFsType()
 
-	var btrfsReclaimData, btrfsReclaimMetadata string
+	var btrfsFlags btrfsFlags
 	shouldUpdateReadAhead := false
 	var readAheadKB int64
 	options := []string{}
@@ -437,7 +454,7 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 		}
 
 		if mnt.FsType == fsTypeBtrfs {
-			btrfsReclaimData, btrfsReclaimMetadata = extractBtrfsReclaimFlags(mnt.MountFlags)
+			btrfsFlags = extractBtrfsFlags(mnt.MountFlags)
 		}
 	} else if blk := volumeCapability.GetBlock(); blk != nil {
 		// Noop for Block NodeStageVolume
@@ -452,14 +469,22 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 	}
 
 	// If a disk size is provided in the publish context, ensure it matches the actual device size.
-	if expectedSize := req.GetPublishContext()[common.ContextDiskSizeGB]; expectedSize != "" {
-		actualSize, err := getBlockSizeBytes(devicePath, ns.Mounter)
+	expectedDiskSizeStr := req.GetPublishContext()[constants.ContextDiskSizeGB]
+	if expectedSizeGib, err := strconv.ParseInt(expectedDiskSizeStr, 10, 64); err == nil {
+		actualSizeBytes, err := getBlockSizeBytes(devicePath, ns.Mounter)
 		if err != nil {
 			return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get block size for '%s': %v", devicePath, err.Error()))
 		}
-		if expectedSize != strconv.FormatInt(actualSize, 10) {
-			return nil, status.Error(codes.Internal, fmt.Sprintf("expected block size %q, got %q", expectedSize, strconv.FormatInt(actualSize, 10)))
+		actualSizeGib, err := volumehelpers.RoundUpToGiB(*resource.NewQuantity(actualSizeBytes, resource.DecimalSI))
+		if err != nil {
+			return nil, status.Error(codes.Internal, fmt.Sprintf("failed to convert block size '%d' to GiB: %v", actualSizeBytes, err.Error()))
 		}
+
+		if expectedSizeGib > actualSizeGib {
+			return nil, status.Error(codes.Internal, fmt.Sprintf("expected block size %q, got %q", expectedSizeGib, actualSizeGib))
+		}
+	} else {
+		klog.V(4).Infof("skipping disk size validation due to invalid expected size: %v", err)
 	}
 
 	err = ns.formatAndMount(devicePath, stagingTargetPath, fstype, options, ns.Mounter)
@@ -495,47 +520,58 @@ func (ns *GCENodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStage
 		}
 	}
 
-	// Part 5: Update read_ahead
+	// Part 5: Update read_ahead for the block device
 	if shouldUpdateReadAhead {
 		if err := ns.updateReadAhead(devicePath, readAheadKB); err != nil {
 			return nil, status.Errorf(codes.Internal, "failure updating readahead for %s to %dKB: %v", devicePath, readAheadKB, err.Error())
 		}
 	}
 
-	// Part 6: if configured, write sysfs values
+	btrfsSysfs := map[string]string{}
+
+	if btrfsFlags.readAheadKb != "" {
+		btrfsSysfs["bdi/read_ahead_kb"] = btrfsFlags.readAheadKb
+	}
+
 	if !readonly {
-		sysfs := map[string]string{}
-		if btrfsReclaimData != "" {
-			sysfs["allocation/data/bg_reclaim_threshold"] = btrfsReclaimData
+		if btrfsFlags.reclaimData != "" {
+			btrfsSysfs["allocation/data/bg_reclaim_threshold"] = btrfsFlags.reclaimData
 		}
-		if btrfsReclaimMetadata != "" {
-			sysfs["allocation/metadata/bg_reclaim_threshold"] = btrfsReclaimMetadata
+		if btrfsFlags.reclaimMetadata != "" {
+			btrfsSysfs["allocation/metadata/bg_reclaim_threshold"] = btrfsFlags.reclaimMetadata
 		}
+		if btrfsFlags.dynamicReclaimData != "" {
+			btrfsSysfs["allocation/data/dynamic_reclaim"] = btrfsFlags.dynamicReclaimData
+		}
+		if btrfsFlags.dynamicReclaimMetadata != "" {
+			btrfsSysfs["allocation/metadata/dynamic_reclaim"] = btrfsFlags.dynamicReclaimMetadata
+		}
+	}
 
-		if len(sysfs) > 0 {
-			args := []string{"--match-tag", "UUID", "--output", "value", stagingTargetPath}
-			cmd := ns.Mounter.Exec.Command("blkid", args...)
-			var stderr bytes.Buffer
-			cmd.SetStderr(&stderr)
-			klog.V(4).Infof(
-				"running %q for volume %s",
-				strings.Join(append([]string{"blkid"}, args...), " "),
-				volumeID,
-			)
-			uuid, err := cmd.Output()
-			if err != nil {
-				klog.Errorf("blkid failed for %s. stderr:\n%s", volumeID, stderr.String())
-				return nil, status.Errorf(codes.Internal, "blkid failed: %v", err)
-			}
-			uuid = bytes.TrimRight(uuid, "\n")
+	// Part 6: if configured, write sysfs values
+	if len(btrfsSysfs) > 0 {
+		args := []string{"--match-tag", "UUID", "--output", "value", devicePath}
+		cmd := ns.Mounter.Exec.Command("blkid", args...)
+		var stderr bytes.Buffer
+		cmd.SetStderr(&stderr)
+		klog.V(4).Infof(
+			"running %q for volume %s",
+			strings.Join(append([]string{"blkid"}, args...), " "),
+			volumeID,
+		)
+		uuid, err := cmd.Output()
+		if err != nil {
+			klog.Errorf("blkid failed for %s. stderr:\n%s", volumeID, stderr.String())
+			return nil, status.Errorf(codes.Internal, "blkid failed: %v", err)
+		}
+		uuid = bytes.TrimRight(uuid, "\n")
 
-			for key, value := range sysfs {
-				path := fmt.Sprintf("%s/fs/btrfs/%s/%s", ns.SysfsPath, uuid, key)
-				if err := writeSysfs(path, value); err != nil {
-					return nil, status.Error(codes.Internal, err.Error())
-				}
-				klog.V(4).Infof("NodeStageVolume set %s %s=%s", volumeID, key, value)
+		for key, value := range btrfsSysfs {
+			path := fmt.Sprintf("%s/fs/btrfs/%s/%s", ns.SysfsPath, uuid, key)
+			if err := writeSysfs(path, value); err != nil {
+				return nil, status.Error(codes.Internal, err.Error())
 			}
+			klog.V(4).Infof("NodeStageVolume set %s %s=%s", volumeID, key, value)
 		}
 	}
 
@@ -563,7 +599,6 @@ func writeSysfs(path, value string) (_err error) {
 	if _, err := f.Write([]byte(value)); err != nil {
 		return err
 	}
-
 	return nil
 }
 
@@ -583,16 +618,22 @@ func (ns *GCENodeServer) updateReadAhead(devicePath string, readAheadKB int64) e
 	return nil
 }
 
-func extractBtrfsReclaimFlags(mountFlags []string) (string, string) {
-	var reclaimData, reclaimMetadata string
+func extractBtrfsFlags(mountFlags []string) btrfsFlags {
+	var flags btrfsFlags
 	for _, mountFlag := range mountFlags {
 		if got := btrfsReclaimDataRegex.FindStringSubmatch(mountFlag); len(got) == 2 {
-			reclaimData = got[1]
+			flags.reclaimData = got[1]
 		} else if got := btrfsReclaimMetadataRegex.FindStringSubmatch(mountFlag); len(got) == 2 {
-			reclaimMetadata = got[1]
+			flags.reclaimMetadata = got[1]
+		} else if got := btrfsReadAheadKBRegex.FindStringSubmatch(mountFlag); len(got) == 2 {
+			flags.readAheadKb = got[1]
+		} else if got := btrfsDynamicReclaimDataRegex.FindStringSubmatch(mountFlag); len(got) == 2 {
+			flags.dynamicReclaimData = got[1]
+		} else if got := btrfsDynamicReclaimMetadataRegex.FindStringSubmatch(mountFlag); len(got) == 2 {
+			flags.dynamicReclaimMetadata = got[1]
 		}
 	}
-	return reclaimData, reclaimMetadata
+	return flags
 }
 
 func extractReadAheadKBMountFlag(mountFlags []string) (int64, bool, error) {
@@ -627,7 +668,7 @@ func (ns *GCENodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUns
 	}
 
 	if acquired := ns.volumeLocks.TryAcquire(volumeID); !acquired {
-		return nil, status.Errorf(codes.Aborted, common.VolumeOperationAlreadyExistsFmt, volumeID)
+		return nil, status.Errorf(codes.Aborted, constants.VolumeOperationAlreadyExistsFmt, volumeID)
 	}
 	defer ns.volumeLocks.Release(volumeID)
 
@@ -699,7 +740,7 @@ func (ns *GCENodeServer) NodeGetCapabilities(ctx context.Context, req *csi.NodeG
 
 func (ns *GCENodeServer) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
 	top := &csi.Topology{
-		Segments: map[string]string{common.TopologyKeyZone: ns.MetadataService.GetZone()},
+		Segments: map[string]string{constants.TopologyKeyZone: ns.MetadataService.GetZone()},
 	}
 
 	node, err := k8sclient.GetNodeWithRetry(ctx, ns.GetNodeName())
@@ -961,7 +1002,8 @@ func getAttachLimitsOverrideFromNodeLabel(node *corev1.Node) (int64, error) {
 	if node == nil {
 		return 0, fmt.Errorf("node is nil")
 	}
-	if val, found := node.GetLabels()[fmt.Sprintf(common.NodeRestrictionLabelPrefix, common.AttachLimitOverrideLabel)]; found {
+
+	if val, found := node.GetLabels()[fmt.Sprintf(constants.NodeRestrictionLabelPrefix, constants.AttachLimitOverrideLabel)]; found {
 		attachLimitOverrideForNode, err := strconv.ParseInt(val, 10, 64)
 		if err != nil {
 			return 0, fmt.Errorf("error getting attach limit override from node label: %v", err)

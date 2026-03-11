@@ -29,7 +29,8 @@ import (
 
 	"k8s.io/klog/v2"
 	"k8s.io/utils/strings/slices"
-	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/constants"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/convert"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/deviceutils"
 	gce "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/compute"
 	metadataservice "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/metadata"
@@ -175,6 +176,7 @@ func handle() {
 				klog.Errorf("Failed to emit process start time: %v", err.Error())
 			}
 			mm.RegisterMountMetric()
+			mm.RegisterUnexpectedDevicePathChangesMetric()
 		}
 		metricsManager = &mm
 	}
@@ -182,7 +184,7 @@ func handle() {
 	if len(*extraVolumeLabelsStr) > 0 && !*runControllerService {
 		klog.Fatalf("Extra volume labels provided but not running controller")
 	}
-	extraVolumeLabels, err := common.ConvertLabelsStringToMap(*extraVolumeLabelsStr)
+	extraVolumeLabels, err := convert.ConvertLabelsStringToMap(*extraVolumeLabelsStr)
 	if err != nil {
 		klog.Fatalf("Bad extra volume labels: %v", err.Error())
 	}
@@ -190,7 +192,7 @@ func handle() {
 	if len(*extraTagsStr) > 0 && !*runControllerService {
 		klog.Fatalf("Extra tags provided but not running controller")
 	}
-	extraTags, err := common.ConvertTagsStringToMap(*extraTagsStr)
+	extraTags, err := convert.ConvertTagsStringToMap(*extraTagsStr)
 	if err != nil {
 		klog.Fatalf("Bad extra tags: %v", err.Error())
 	}
@@ -284,7 +286,7 @@ func handle() {
 			klog.Fatalf("Failed to get node info from API server: %v", err.Error())
 		}
 
-		deviceCache, err := linkcache.NewDeviceCacheForNode(ctx, *diskCacheSyncPeriod, *nodeName, driverName, deviceUtils)
+		deviceCache, err := linkcache.NewDeviceCacheForNode(ctx, *diskCacheSyncPeriod, *nodeName, driverName, deviceUtils, metricsManager)
 		if err != nil {
 			klog.Warningf("Failed to create device cache: %v", err.Error())
 		} else {
@@ -442,8 +444,8 @@ func setupDataCache(ctx context.Context, nodeName string, nodeId string) error {
 		return nil
 	}
 
-	lssdCount := common.LocalSSDCountForDataCache
-	if nodeName != common.TestNode {
+	lssdCount := constants.LocalSSDCountForDataCache
+	if nodeName != constants.TestNode {
 		var err error
 		lssdCount, err = driver.GetDataCacheCountFromNodeLabel(ctx, nodeName)
 		if err != nil {

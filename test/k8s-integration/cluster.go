@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	apimachineryversion "k8s.io/apimachinery/pkg/version"
 	"k8s.io/client-go/kubernetes"
@@ -254,6 +256,17 @@ func clusterUpGKE(gceZone, gceRegion string, numNodes int, numWindowsNodes int, 
 		return fmt.Errorf("failed to bring up kubernetes e2e cluster on gke: %v", err.Error())
 	}
 
+	// To avoid unexpected GKE maintenance, create a 4-hour maintenance exclusion window.
+	startExclusionTime := time.Now().UTC()
+	cmd = exec.Command("gcloud", "container", "clusters", "update", *gkeTestClusterName, locationArg, locationVal, "--quiet",
+		"--add-maintenance-exclusion-name", "no-upgrades-during-test",
+		"--add-maintenance-exclusion-start", startExclusionTime.Format(time.RFC3339),
+		"--add-maintenance-exclusion-end", startExclusionTime.Add(2*time.Hour).Format(time.RFC3339),
+		"--add-maintenance-exclusion-scope", "no_upgrades")
+	if err := runCommand("Updating Cluster with maintenance window", cmd); err != nil {
+		return fmt.Errorf("failed to update cluster with maintenance window: %w", err)
+	}
+
 	// Because gcloud cannot disable addons on cluster create, the deployment has
 	// to be disabled on update.
 	clusterVersion := mustGetKubeClusterVersion()
@@ -266,6 +279,26 @@ func clusterUpGKE(gceZone, gceRegion string, numNodes int, numWindowsNodes int, 
 		if err != nil {
 			return fmt.Errorf("failed to update kubernetes e2e cluster on gke: %v", err.Error())
 		}
+	}
+
+	cmd = exec.Command("gcloud", "container", "clusters", "describe", *gkeTestClusterName, locationArg, locationVal)
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to list cluster: %v %s", err, out)
+	}
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	printedHash := false
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "id: ") {
+			klog.Infof("GKE cluster: %s %s", *gkeTestClusterName, locationVal)
+			klog.Infof("GKE cluster hash %s", line)
+			printedHash = true
+			break
+		}
+	}
+	if !printedHash {
+		return fmt.Errorf("failed to find cluster hash in cluster describe: %s", out)
 	}
 
 	return nil
