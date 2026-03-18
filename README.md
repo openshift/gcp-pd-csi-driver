@@ -99,12 +99,17 @@ Controller-level and node-level deployments will both have priorityClassName set
 As noted in [GCP PD documentation](https://cloud.google.com/kubernetes-engine/docs/how-to/persistent-volumes/gce-pd-csi-driver), `ext4` and `xfs` are officially supported. `btrfs` support is experimental:
 - As of writing, Ubuntu VM images support btrfs, but [COS does not](https://cloud.google.com/container-optimized-os/docs/concepts/supported-filesystems).
 
-`btrfs` filesystem accepts two "special" mount options:
+`btrfs` filesystem accepts the following "special" mount options and the sysfs paths they target:
 
-- `btrfs-data-bg_reclaim_threshold`
-- `btrfs-metadata-bg_reclaim_threshold`
+| Setting                                          | Sysfs path                                                        | Value          | Default                 | Supported on Linux versions | Notes |
+|--------------------------------------------------|-------------------------------------------------------------------|----------------|-------------------------|-----------------------------|-------|
+| `btrfs-allocation-data-bg_reclaim_threshold`     | `/sys/fs/btrfs/FS-UUID/allocation/data/bg_reclaim_threshold`      | 0–99 (percent) | 0 (off)                 | v5.19+                      | Triggers background reclaim for DATA block groups when usage drops to the threshold. |
+| `btrfs-allocation-metadata-bg_reclaim_threshold` | `/sys/fs/btrfs/FS-UUID/allocation/metadata/bg_reclaim_threshold`  | 0–99 (percent) | 0 (off)                 | v5.19+                      | Same as above, for METADATA block groups. |
+| `btrfs-allocation-data-dynamic_reclaim`          | `/sys/fs/btrfs/FS-UUID/allocation/data/dynamic_reclaim`           | `0` or `1`     | 0 (off)                 | v6.11+                      | Heuristic reclaim that addresses [some concerns](https://web.git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=f5ff64ccf7bb7274ed66b0d835b2f6ae10af5d7a) of `bg_reclaim_threshold`. |
+| `btrfs-allocation-metadata-dynamic_reclaim`      | `/sys/fs/btrfs/FS-UUID/allocation/metadata/dynamic_reclaim`       | `0` or `1`     | 0 (off)                 | v6.11+                      | Same as above, for METADATA block groups. |
+| `btrfs-bdi-read_ahead_kb`                        | `/sys/fs/btrfs/FS-UUID/bdi/read_ahead_kb`                         | integer kB ≥ 0 | kernel/device dependent | v5.9+                       | Per-BDI readahead. Powers of two are commonly used. |
 
-Which writes to `/sys/fs/btrfs/FS-UUID/allocation/{,meta}data/bg_reclaim_threshold`, as documented [in btrfs docs](https://btrfs.readthedocs.io/en/latest/ch-sysfs.html#uuid-allocations-data-metadata-system).
+See more in the [in btrfs docs](https://btrfs.readthedocs.io/en/latest/ch-sysfs.html#uuid-allocations-data-metadata-system).
 
 ## Further Documentation
 

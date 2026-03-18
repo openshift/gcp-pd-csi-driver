@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -36,7 +37,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/mount-utils"
-	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/constants"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/deviceutils"
 	metadataservice "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/metadata"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/linkcache"
@@ -442,7 +443,7 @@ func TestNodeGetVolumeLimits(t *testing.T) {
 			node: &corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
-						fmt.Sprintf(common.NodeRestrictionLabelPrefix, common.AttachLimitOverrideLabel): "63",
+						fmt.Sprintf(constants.NodeRestrictionLabelPrefix, constants.AttachLimitOverrideLabel): "63",
 					},
 				},
 			},
@@ -454,7 +455,7 @@ func TestNodeGetVolumeLimits(t *testing.T) {
 			node: &corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
-						fmt.Sprintf(common.NodeRestrictionLabelPrefix, common.AttachLimitOverrideLabel): "invalid",
+						fmt.Sprintf(constants.NodeRestrictionLabelPrefix, constants.AttachLimitOverrideLabel): "invalid",
 					},
 				},
 			},
@@ -466,7 +467,7 @@ func TestNodeGetVolumeLimits(t *testing.T) {
 			node: &corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
-						fmt.Sprintf(common.NodeRestrictionLabelPrefix, common.AttachLimitOverrideLabel): "9999",
+						fmt.Sprintf(constants.NodeRestrictionLabelPrefix, constants.AttachLimitOverrideLabel): "9999",
 					},
 				},
 			},
@@ -669,36 +670,48 @@ func TestNodeStageVolume(t *testing.T) {
 	defer os.RemoveAll(tempDir)
 	stagingPath := filepath.Join(tempDir, defaultStagingPath)
 
-	btrfsUUID := "00000000-0000-0000-0000-000000000001"
-	btrfsPrefix := fmt.Sprintf("%s/sys/fs/btrfs/%s/allocation", tempDir, btrfsUUID)
+	var (
+		btrfsUUID     = "00000000-0000-0000-0000-000000000001"
+		btrfsPrefix   = fmt.Sprintf("%s/sys/fs/btrfs/%s", tempDir, btrfsUUID)
+		btrfsFixtures = map[string]string{
+			"allocation/data/bg_reclaim_threshold":     "0\n",
+			"allocation/data/dynamic_reclaim":          "0\n",
+			"allocation/metadata/bg_reclaim_threshold": "0\n",
+			"allocation/metadata/dynamic_reclaim":      "0\n",
+			"bdi/read_ahead_kb":                        "4096\n",
+		}
+	)
 
-	for _, suffix := range []string{"data", "metadata"} {
-		dir := btrfsPrefix + "/" + suffix
+	for fname, contents := range btrfsFixtures {
+		fullPath := btrfsPrefix + "/" + fname
+		dir := path.Dir(fullPath)
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			t.Fatalf("Failed to set up fake sysfs dir %q: %v", dir, err)
 		}
-		fname := dir + "/bg_reclaim_threshold"
-		if err := os.WriteFile(fname, []byte("0\n"), 0644); err != nil {
-			t.Fatalf("write %q: %v", fname, err)
+		if err := os.WriteFile(fullPath, []byte(contents), 0644); err != nil {
+			t.Fatalf("write %q: %v", fullPath, err)
 		}
 	}
 
 	testCases := []struct {
-		name                 string
-		req                  *csi.NodeStageVolumeRequest
-		deviceSize           int
-		blockExtSize         int
-		readonlyBit          string
-		expResize            bool
-		expReadAheadUpdate   bool
-		expReadAheadKB       string
-		expReadOnlyRemount   bool
-		expCommandList       []fakeCmd
-		readAheadSectors     string
-		btrfsReclaimData     string
-		btrfsReclaimMetadata string
-		sectorSizeInBytes    int
-		expErrCode           codes.Code
+		name                        string
+		req                         *csi.NodeStageVolumeRequest
+		deviceSize                  int
+		blockExtSize                int
+		readonlyBit                 string
+		expResize                   bool
+		expReadAheadUpdate          bool
+		expReadAheadKB              string
+		expReadOnlyRemount          bool
+		expCommandList              []fakeCmd
+		readAheadSectors            string
+		btrfsReclaimData            string
+		btrfsReclaimMetadata        string
+		btrfsDynamicReclaimData     string
+		btrfsDynamicReclaimMetadata string
+		btrfsReadAheadKb            string
+		sectorSizeInBytes           int
+		expErrCode                  codes.Code
 	}{
 		{
 			name: "Valid request, resize even though block and filesystem sizes match",
@@ -945,13 +958,13 @@ func TestNodeStageVolume(t *testing.T) {
 				},
 				{
 					cmd:    "blkid",
-					args:   fmt.Sprintf("--match-tag UUID --output value %v", stagingPath),
+					args:   fmt.Sprintf("--match-tag UUID --output value /dev/disk/fake-path"),
 					stdout: btrfsUUID + "\n",
 				},
 			},
 		},
 		{
-			name: "Valid request, set btrfs-allocation-{,meta}data-bg_reclaim_threshold",
+			name: "Valid request, set btrfs props",
 			req: &csi.NodeStageVolumeRequest{
 				VolumeId:          volumeID,
 				StagingTargetPath: stagingPath,
@@ -962,6 +975,9 @@ func TestNodeStageVolume(t *testing.T) {
 							MountFlags: []string{
 								"btrfs-allocation-data-bg_reclaim_threshold=90",
 								"btrfs-allocation-metadata-bg_reclaim_threshold=91",
+								"btrfs-allocation-data-dynamic_reclaim=1",
+								"btrfs-allocation-metadata-dynamic_reclaim=1",
+								"btrfs-bdi-read_ahead_kb=128",
 							},
 						},
 					},
@@ -970,11 +986,14 @@ func TestNodeStageVolume(t *testing.T) {
 					},
 				},
 			},
-			deviceSize:           1,
-			blockExtSize:         1,
-			readonlyBit:          "0",
-			btrfsReclaimData:     "90",
-			btrfsReclaimMetadata: "91",
+			deviceSize:                  1,
+			blockExtSize:                1,
+			readonlyBit:                 "0",
+			btrfsReclaimData:            "90",
+			btrfsReclaimMetadata:        "91",
+			btrfsDynamicReclaimData:     "1",
+			btrfsDynamicReclaimMetadata: "1",
+			btrfsReadAheadKb:            "128",
 			expCommandList: []fakeCmd{
 				{
 					cmd:    "blkid",
@@ -1008,7 +1027,7 @@ func TestNodeStageVolume(t *testing.T) {
 				},
 				{
 					cmd:    "blkid",
-					args:   fmt.Sprintf("--match-tag UUID --output value %v", stagingPath),
+					args:   fmt.Sprintf("--match-tag UUID --output value /dev/disk/fake-path"),
 					stdout: btrfsUUID + "\n",
 				},
 			},
@@ -1144,14 +1163,49 @@ func TestNodeStageVolume(t *testing.T) {
 			},
 		},
 		{
-			name: "Valid request with disk size check",
+			name: "Valid request disk size matches expected size",
 			req: &csi.NodeStageVolumeRequest{
 				VolumeId:          volumeID,
 				StagingTargetPath: stagingPath,
 				VolumeCapability:  stdVolCap,
-				PublishContext:    map[string]string{common.ContextDiskSizeGB: "1"},
+				PublishContext:    map[string]string{constants.ContextDiskSizeGB: "6"},
 			},
-			deviceSize:   1,
+			deviceSize:   6442450944,
+			blockExtSize: 1,
+			readonlyBit:  "1",
+			expResize:    false,
+			expCommandList: []fakeCmd{
+				{
+					cmd:    "blockdev",
+					args:   "--getsize64 /dev/disk/fake-path",
+					stdout: "%v",
+				},
+				{
+					cmd:    "blkid",
+					args:   "-p -s TYPE -s PTTYPE -o export /dev/disk/fake-path",
+					stdout: "DEVNAME=/dev/sdb\nTYPE=%v",
+				},
+				{
+					cmd:    "fsck",
+					args:   "-a /dev/disk/fake-path",
+					stdout: "",
+				},
+				{
+					cmd:    "blockdev",
+					args:   "--getro /dev/disk/fake-path",
+					stdout: "%v",
+				},
+			},
+		},
+		{
+			name: "Valid request disk size exceeds expected size",
+			req: &csi.NodeStageVolumeRequest{
+				VolumeId:          volumeID,
+				StagingTargetPath: stagingPath,
+				VolumeCapability:  stdVolCap,
+				PublishContext:    map[string]string{constants.ContextDiskSizeGB: "1"},
+			},
+			deviceSize:   6442450944,
 			blockExtSize: 1,
 			readonlyBit:  "1",
 			expResize:    false,
@@ -1263,9 +1317,9 @@ func TestNodeStageVolume(t *testing.T) {
 				VolumeId:          volumeID,
 				StagingTargetPath: stagingPath,
 				VolumeCapability:  stdVolCap,
-				PublishContext:    map[string]string{common.ContextDiskSizeGB: "10"},
+				PublishContext:    map[string]string{constants.ContextDiskSizeGB: "10"},
 			},
-			deviceSize: 5,
+			deviceSize: 6442450944,
 			expErrCode: codes.Internal,
 			expCommandList: []fakeCmd{
 				{
@@ -1355,29 +1409,33 @@ func TestNodeStageVolume(t *testing.T) {
 			if tc.expReadAheadUpdate == false && readAheadUpdateCalled == true {
 				t.Fatalf("Test updated read ahead, but it was not expected.")
 			}
-			if tc.btrfsReclaimData == "" && tc.btrfsReclaimMetadata == "" && blkidCalled {
+			if tc.btrfsReclaimData == "" && tc.btrfsReclaimMetadata == "" &&
+				tc.btrfsDynamicReclaimData == "" && tc.btrfsDynamicReclaimMetadata == "" &&
+				tc.btrfsReadAheadKb == "" && blkidCalled {
 				t.Fatalf("blkid was called, but was not expected.")
 			}
 
-			if tc.btrfsReclaimData != "" {
-				fname := btrfsPrefix + "/data/bg_reclaim_threshold"
-				got, err := os.ReadFile(fname)
-				if err != nil {
-					t.Fatalf("read %q: %v", fname, err)
-				}
-				if s := strings.TrimSpace(string(got)); s != tc.btrfsReclaimData {
-					t.Fatalf("%q: expected %q, got %q", fname, tc.btrfsReclaimData, s)
-				}
+			btrfsProps := map[string]string{
+				"/allocation/data/bg_reclaim_threshold":     tc.btrfsReclaimData,
+				"/allocation/metadata/bg_reclaim_threshold": tc.btrfsReclaimMetadata,
+				"/allocation/data/dynamic_reclaim":          tc.btrfsDynamicReclaimData,
+				"/allocation/metadata/dynamic_reclaim":      tc.btrfsDynamicReclaimMetadata,
+				"/bdi/read_ahead_kb":                        tc.btrfsReadAheadKb,
 			}
-			if tc.btrfsReclaimMetadata != "" {
-				fname := btrfsPrefix + "/metadata/bg_reclaim_threshold"
-				got, err := os.ReadFile(fname)
+
+			for fname, prop := range btrfsProps {
+				if prop == "" {
+					continue
+				}
+
+				got, err := os.ReadFile(btrfsPrefix + fname)
 				if err != nil {
-					t.Fatalf("read %q: %v", fname, err)
+					t.Fatalf("read %q: %v", btrfsPrefix+fname, err)
 				}
-				if s := strings.TrimSpace(string(got)); s != tc.btrfsReclaimMetadata {
-					t.Fatalf("%q: expected %q, got %q", fname, tc.btrfsReclaimMetadata, s)
+				if s := strings.TrimSpace(string(got)); s != prop {
+					t.Fatalf("%q: expected %q, got %q", btrfsPrefix+fname, prop, s)
 				}
+
 			}
 		})
 	}
@@ -1721,8 +1779,8 @@ func TestBlockingFormatAndMount(t *testing.T) {
 func TestGetDiskTypeLabels(t *testing.T) {
 	const (
 		nodeName = "test-node"
-		diskA    = common.DiskTypeKeyPrefix + "/disk-a"
-		diskB    = common.DiskTypeKeyPrefix + "/disk-b"
+		diskA    = constants.DiskTypeKeyPrefix + "/disk-a"
+		diskB    = constants.DiskTypeKeyPrefix + "/disk-b"
 	)
 
 	testCases := []struct {
@@ -1808,7 +1866,7 @@ func TestNodeGetInfo(t *testing.T) {
 				MaxVolumesPerNode: volumeLimitBig,
 				AccessibleTopology: &csi.Topology{
 					Segments: map[string]string{
-						common.TopologyKeyZone: zone,
+						constants.TopologyKeyZone: zone,
 					},
 				},
 			},
@@ -1821,7 +1879,7 @@ func TestNodeGetInfo(t *testing.T) {
 				MaxVolumesPerNode: volumeLimitBig,
 				AccessibleTopology: &csi.Topology{
 					Segments: map[string]string{
-						common.TopologyKeyZone: zone,
+						constants.TopologyKeyZone: zone,
 					},
 				},
 			},
