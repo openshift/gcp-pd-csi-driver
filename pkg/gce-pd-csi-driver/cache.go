@@ -253,7 +253,7 @@ func ValidateDataCacheConfig(dataCacheMode string, dataCacheSize string, ctx con
 }
 
 func GetDataCacheCountFromNodeLabel(ctx context.Context, nodeName string) (int, error) {
-	node, err := k8sclient.GetNodeWithRetry(ctx, nodeName)
+	node, err := k8sclient.GetNodeWithStartupRetry(ctx, nodeName)
 	if err != nil {
 		return 0, err
 	}
