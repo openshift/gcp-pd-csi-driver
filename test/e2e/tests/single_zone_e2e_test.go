@@ -380,6 +380,43 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		Entry("on pd-ssd", ssdDiskType),
 	)
 
+	DescribeTable("Should succeed calling CreateVolume twice",
+		func(diskType string, diskSize int64) {
+			testContext := getRandomTestContext()
+
+			p, z, _ := testContext.Instance.GetIdentity()
+			client := testContext.Client
+
+			disk := typeToDisk[diskType]
+			volName := testNamePrefix + string(uuid.NewUUID())
+
+			// First CreateVolume call
+			vol1, err := client.CreateVolume(volName, disk.params, diskSize, nil, nil)
+			Expect(err).To(BeNil(), "First CreateVolume call failed")
+			Expect(vol1).ToNot(BeNil())
+
+			defer func() {
+				// Delete Disk
+				err := client.DeleteVolume(vol1.VolumeId)
+				Expect(err).To(BeNil(), "DeleteVolume failed")
+
+				// Validate Disk Deleted
+				_, err = computeService.Disks.Get(p, z, volName).Do()
+				Expect(gce.IsGCEError(err, "notFound")).To(BeTrue(), "Expected disk to not be found")
+			}()
+
+			// Second CreateVolume call with identical parameters
+			vol2, err := client.CreateVolume(volName, disk.params, diskSize, nil, nil)
+			Expect(err).To(BeNil(), "Second CreateVolume call failed")
+			Expect(vol2).ToNot(BeNil())
+			Expect(vol2.VolumeId).To(Equal(vol1.VolumeId), "Expected volume IDs to match for idempotent CreateVolume calls")
+		},
+		Entry("on pd-ssd", ssdDiskType, defaultSizeGb),
+		Entry("on hyperdisk-balanced", hdbDiskType, defaultHdBSizeGb),
+		Entry("on hyperdisk-extreme", hdxDiskType, defaultHdXSizeGb),
+		Entry("on hyperdisk-throughput", hdtDiskType, defaultHdTSizeGb),
+	)
+
 	DescribeTable("[NVMe] Should complete publish/unpublish lifecycle with underspecified volume ID and missing volume",
 		func(diskType string) {
 			testContext := getRandomTestContext()
@@ -1499,6 +1536,105 @@ var _ = Describe("GCE PD CSI Driver", func() {
 		err := testAttachWriteReadDetach(volID, volName, instance, client, false /* readOnly */, true /* detachAndReattach */, true /* setupDataCache */)
 		Expect(err).To(BeNil(), "Failed to go through volume lifecycle")
 
+	})
+	It("Should successfully recover from hard preemption and duplicate VG name conflict on same node", func() {
+		Expect(testContexts).ToNot(BeEmpty())
+		// Select the last instance in the pool which is isolated and reserved for this test case
+		testContextForVm := testContexts[len(testContexts)-1]
+		if testContextForVm.Instance.GetLocalSSD() == 0 {
+			Skip("Skipping Data Cache preemption test as isolated VM instance does not have local SSD")
+		}
+
+		p, z, _ := testContextForVm.Instance.GetIdentity()
+		client := testContextForVm.Client
+		instance := testContextForVm.Instance
+
+		volName, volID := createAndValidateUniqueZonalDisk(client, p, z, standardDiskType)
+		defer deleteVolumeOrError(client, volID)
+
+		defer func() {
+			klog.Infof("Cleaning up preemption test resources on VM %s...", instance.GetName())
+			// Force-detach GCE PD using controller API
+			_ = client.ControllerUnpublishVolume(volID, instance.GetNodeID())
+			klog.Infof("Cleanup completed.")
+		}()
+
+		attachMountArgs := attachAndMountArgs{
+			readOnly:       false,
+			useBlock:       false,
+			forceAttach:    false,
+			setupDataCache: true,
+		}
+
+		// 1. Stage and Mount the volume with Data Cache enabled on the VM
+		klog.Infof("Step 1: Staging and mounting Data Cache volume %s on VM %s", volName, instance.GetName())
+		err, _, args := testAttachAndMount(volID, volName, instance, client, attachMountArgs)
+		Expect(err).To(BeNil(), "Failed to stage and mount volume on VM")
+
+		// 2. Write a verification file to prove data persistence on the VM
+		klog.Infof("Step 2: Writing verification file to volume on VM")
+		writeVerifyFunc, readVerifyFunc := testWriteAndReadFile(instance, false /* readOnly */)
+		err = writeVerifyFunc(args)
+		Expect(err).To(BeNil(), "Failed to write verification file to mounted volume on VM")
+
+		// Verify we can read the file back immediately on VM before preemption
+		err = readVerifyFunc(args)
+		Expect(err).To(BeNil(), "Failed to read verification file back on VM before preemption")
+
+		// Flush filesystem page cache to physical GCE PD before force-detaching!
+		_, err = instance.SSHNoSudo("sync")
+		Expect(err).To(BeNil(), "Failed to run sync command on VM")
+		time.Sleep(10 * time.Second)
+
+		// 3. Simulate hard preemption: Force-detach the GCE PD from the VM WITHOUT unstaging!
+		klog.Infof("Step 3: Simulating preemption by force-detaching the disk from VM without unstaging...")
+		err = instance.DetachDisk(volName)
+		Expect(err).To(BeNil(), "Failed to force-detach disk from VM to simulate preemption")
+
+		// Emulate a node reset/reboot on the same VM instance:
+		// We deactivate and wipe the host's Volume Group and Physical Volume from the local SSD.
+		// When the GCE PD is attached back and staged, the driver will recreate the host VG with a new UUID,
+		// triggering the duplicate VG name conflict deadlock!
+		nodeHash := common.ShortString(instance.GetName())
+		volumeGroupName := fmt.Sprintf("csi-vg-%s", nodeHash)
+		klog.Infof("Step 3.5: Emulating node reset by wiping host VG %s and local SSD on VM...", volumeGroupName)
+		mountDir := filepath.Join("/tmp/", volName, "mount")
+		stageDirLocal := filepath.Join("/tmp/", volName, "stage")
+
+		// Force-release kernel locks using lazy unmounts (ignoring errors if not mounted)
+		_, _ = instance.SSH("umount", "-l", mountDir)
+		_, _ = instance.SSH("umount", "-l", stageDirLocal)
+
+		// Wipe LVM state and log results
+		_, _ = instance.SSH("vgreduce", "--removemissing", "--force", volumeGroupName)
+		out1, err1 := instance.SSH("vgchange", "-an", volumeGroupName)
+		klog.Infof("vgchange -an: out=%s, err=%v", out1, err1)
+		out2, err2 := instance.SSH("vgremove", "-y", volumeGroupName)
+		klog.Infof("vgremove -y: out=%s, err=%v", out2, err2)
+		out3, err3 := instance.SSH("pvremove", "-y", "/dev/md127")
+		klog.Infof("pvremove -y: out=%s, err=%v", out3, err3)
+
+		// Wait a few seconds for the GCE control plane to register the detach
+		time.Sleep(10 * time.Second)
+
+		// 4. Attach and Stage the GCE PD back to the same VM.
+		klog.Infof("Step 4: Attaching the disk back to the same VM %s...", instance.GetName())
+		var stageDir string
+		err, _, stageDir = testAttach(volID, volName, instance, client, attachMountArgs)
+		Expect(err).To(BeNil(), "Failed to attach disk back to VM after simulated preemption")
+
+		// 5. Run NodeStage and NodePublish back on the VM.
+		// The driver must detect the duplicate VG conflict, rename the PD's VG, and merge it safely!
+		klog.Infof("Step 5: Staging and mounting back on VM (recovering from duplicate VG conflict)...")
+		err, _, args = testMount(volID, volName, instance, client, attachMountArgs, stageDir)
+		Expect(err).To(BeNil(), "Failed to recover and mount volume back on VM after simulated preemption")
+
+		// 6. Verify data integrity: Read the verification file back on the VM!
+		klog.Infof("Step 6: Verifying data integrity after preemption recovery on VM")
+		_, readVerifyFunc = testWriteAndReadFile(instance, false /* readOnly */)
+		err = readVerifyFunc(args)
+		Expect(err).To(BeNil(), "Data integrity verification failed on VM after preemption recovery! Potential data loss.")
+		klog.Infof("Success: Volume successfully recovered and verified with zero data loss on VM after preemption!")
 	})
 	It("Should create->attach->setup caching->write->detach->attach to different node->mount->read", func() {
 		Expect(testContexts).ToNot(BeEmpty())

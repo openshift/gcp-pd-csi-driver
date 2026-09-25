@@ -80,7 +80,7 @@ type GCEControllerServer struct {
 	// pair.
 	//
 	// An implication is that in the full operation queue situation, requests
-	// for new disks will not backoff the first time. This is acceptible as a
+	// for new disks will not backoff the first time. This is acceptable as a
 	// single spurious call will not cause problems for quota exhaustion or make
 	// the operation queue problem worse. This is well compensated by giving
 	// disks where no problems are ocurring a chance to be processed.
@@ -435,7 +435,7 @@ func (gceCS *GCEControllerServer) createVolumeInternal(ctx context.Context, req 
 
 	// Verify that the regional availability class is only used on regional disks.
 	if params.ForceAttach && !params.IsRegional() {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid availabilty class for zonal disk")
+		return nil, status.Errorf(codes.InvalidArgument, "invalid availability class for zonal disk")
 	}
 
 	if gceCS.multiZoneVolumeHandleConfig.Enable && params.MultiZoneProvisioning {
@@ -683,8 +683,10 @@ func getAccessMode(req *csi.CreateVolumeRequest, params parameters.DiskParameter
 			// Disallow multi-attach for HdT and HdE. These checks were done in `createVolumeInternal`,
 			// but repeating them here future-proves us from possible refactors.
 			if am != constants.GCEReadWriteOnceAccessMode {
-				return "", status.Errorf(codes.Internal, "")
+				return "", status.Errorf(codes.InvalidArgument, "Hyperdisk Throughput and Extreme disks only support ReadWriteOnce access mode")
 			}
+			// Return empty string to indicate the default ReadWriteOnce access mode
+			return "", nil
 		} else {
 			return am, nil
 		}
