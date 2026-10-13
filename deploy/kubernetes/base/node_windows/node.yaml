@@ -1,0 +1,118 @@
+#TODO(#40): Force DaemonSet to not run on master.
+kind: DaemonSet
+apiVersion: apps/v1
+metadata:
+  name: csi-gce-pd-node-win
+spec:
+  selector:
+    matchLabels:
+      app: gcp-compute-persistent-disk-csi-driver
+  template:
+    metadata:
+      labels:
+        app: gcp-compute-persistent-disk-csi-driver
+    spec:
+      # Host network must be used for interaction with Workload Identity in GKE
+      # since it replaces GCE Metadata Server with GKE Metadata Server. Remove
+      # this requirement when issue is resolved and before any exposure of
+      # metrics ports. But hostNetwork is not working for Windows, might be an issue
+      # when deploying on GKE Windows node.
+      # hostNetwork: true
+      priorityClassName: csi-gce-pd-node
+      serviceAccountName: csi-gce-pd-node-sa-win
+      nodeSelector:
+        kubernetes.io/os: windows
+      containers:
+        - name: csi-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar
+          args:
+            - --v=5
+            - --csi-address=unix://C:\\csi\\csi.sock
+            - --kubelet-registration-path=C:\\var\\lib\\kubelet\\plugins\\pd.csi.storage.gke.io\\csi.sock
+          env:
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+        - name: gce-pd-driver
+          # Don't change base image without changing pdImagePlaceholder in
+          # test/k8s-integration/main.go
+          image: gke.gcr.io/gcp-compute-persistent-disk-csi-driver
+          args:
+            - "--v=5"
+            - "--endpoint=unix:/csi/csi.sock"
+            - "--run-controller-service=false"
+          command:
+            - /gce-pd-csi-driver
+          volumeMounts:
+            - name: kubelet-plugin-dir
+              mountPath: C:\var\lib\kubelet\plugins\kubernetes.io\csi
+              mountPropagation: "None"
+            - name: kubelet-pods
+              mountPath: C:\var\lib\kubelet\pods
+              mountPropagation: "None"
+            - name: plugin-dir
+              mountPath: C:\csi
+            - name: csi-proxy-volume-v1
+              mountPath: \\.\pipe\csi-proxy-volume-v1
+            - name: csi-proxy-filesystem-v1
+              mountPath: \\.\pipe\csi-proxy-filesystem-v1
+            - name: csi-proxy-disk-v1
+              mountPath: \\.\pipe\csi-proxy-disk-v1
+            # these paths are still included for compatibility, they're used
+            # only if the node has still the beta version of the CSI proxy
+            - name: csi-proxy-volume-v1beta1
+              mountPath: \\.\pipe\csi-proxy-volume-v1beta1
+            - name: csi-proxy-filesystem-v1beta1
+              mountPath: \\.\pipe\csi-proxy-filesystem-v1beta1
+            - name: csi-proxy-disk-v1beta2
+              mountPath: \\.\pipe\csi-proxy-disk-v1beta2
+      volumes:
+      - name: csi-proxy-disk-v1
+        hostPath:
+          path: \\.\pipe\csi-proxy-disk-v1
+          type: ""
+      - name: csi-proxy-volume-v1
+        hostPath:
+          path: \\.\pipe\csi-proxy-volume-v1
+          type: ""
+      - name: csi-proxy-filesystem-v1
+        hostPath:
+          path: \\.\pipe\csi-proxy-filesystem-v1
+          type: ""
+      # these paths are still included for compatibility, they're used
+      # only if the node has still the beta version of the CSI proxy
+      - name: csi-proxy-disk-v1beta2
+        hostPath:
+          path: \\.\pipe\csi-proxy-disk-v1beta2
+          type: ""
+      - name: csi-proxy-volume-v1beta1
+        hostPath:
+          path: \\.\pipe\csi-proxy-volume-v1beta1
+          type: ""
+      - name: csi-proxy-filesystem-v1beta1
+        hostPath:
+          path: \\.\pipe\csi-proxy-filesystem-v1beta1
+          type: ""
+      - name: registration-dir
+        hostPath:
+          path: \var\lib\kubelet\plugins_registry
+          type: Directory
+      - name: kubelet-pods
+        hostPath:
+          path: \var\lib\kubelet\pods
+      - name: kubelet-plugin-dir
+        hostPath:
+          path: \var\lib\kubelet\plugins\kubernetes.io\csi
+          type: DirectoryOrCreate
+      - name: plugin-dir
+        hostPath:
+          path: \var\lib\kubelet\plugins\pd.csi.storage.gke.io
+          type: DirectoryOrCreate
+      tolerations:
+      - operator: Exists

@@ -1,0 +1,35 @@
+StorageClass:
+  FromFile: {{.StorageClassFile}}
+{{if .SnapshotClassFile }}
+SnapshotClass:
+  FromFile: {{ .SnapshotClassFile }}
+{{end}}
+{{if .VolumeAttributesClassFile }}
+VolumeAttributesClass:
+  FromFile: {{ .VolumeAttributesClassFile }}
+{{end}}
+{{if .Timeouts}}
+Timeouts:
+  {{ range $key, $value := .Timeouts }}{{ $key }}: {{ $value }}
+  {{ end }}
+{{end}}
+DriverInfo:
+  Name: csi-gcepd-{{.StorageClass}}--{{.SnapshotClass}}
+  SupportedFsType:
+  {{range .SupportedFsType}}  {{ . }}:
+  {{end}}
+  Capabilities:
+  {{range .Capabilities}}  {{ . }}: true
+  {{end}}
+  StressTestOptions:
+    NumPods: 10
+    NumRestarts: 10
+  SupportedMountOption:
+    debug:
+    noatime:
+  SupportedSizeRange:
+    Min: {{.MinimumVolumeSize}}
+    Max: 64Ti
+  TopologyKeys:
+    - topology.gke.io/zone
+  NumAllowedTopologies: {{.NumAllowedTopologies}}
