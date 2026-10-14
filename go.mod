@@ -23,7 +23,7 @@ require (
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.21.0
 	go.opentelemetry.io/otel/sdk v1.37.0
 	golang.org/x/oauth2 v0.30.0
-	golang.org/x/sys v0.33.0
+	golang.org/x/sys v0.35.0
 	golang.org/x/time v0.5.0
 	google.golang.org/api v0.183.0
 	google.golang.org/genproto v0.0.0-20240528184218-531527333157
@@ -96,13 +96,13 @@ require (
 	go.opentelemetry.io/otel/trace v1.37.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.0.0 // indirect
 	go4.org v0.0.0-20201209231011-d4a079459e60 // indirect
-	golang.org/x/crypto v0.39.0 // indirect
+	golang.org/x/crypto v0.41.0 // indirect
 	golang.org/x/exp v0.0.0-20241009180824-f66d83c29e7c // indirect
-	golang.org/x/net v0.41.0 // indirect
-	golang.org/x/sync v0.15.0 // indirect
-	golang.org/x/term v0.32.0 // indirect
-	golang.org/x/text v0.26.0 // indirect
-	golang.org/x/tools v0.33.0 // indirect
+	golang.org/x/net v0.42.0 // indirect
+	golang.org/x/sync v0.16.0 // indirect
+	golang.org/x/term v0.34.0 // indirect
+	golang.org/x/text v0.28.0 // indirect
+	golang.org/x/tools v0.35.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20250707201910-8d1bb00bc6a7 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250707201910-8d1bb00bc6a7 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
@@ -122,3 +122,5 @@ replace k8s.io/client-go => k8s.io/client-go v0.24.1
 // CVE-2026-33186: Use backported gRPC fix for authorization bypass
 // Backport of grpc-go v1.79.3 fix to v1.71 (compatible with Go 1.23)
 replace google.golang.org/grpc => github.com/openshift-sustaining/grpc-go v1.75.1-sec.1
+
+replace golang.org/x/net => github.com/openshift-sustaining/net v0.43.0-sec.3
