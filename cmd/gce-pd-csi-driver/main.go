@@ -36,6 +36,7 @@ import (
 	gce "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/compute"
 	metadataservice "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/metadata"
 	driver "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-pd-csi-driver"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/k8sclient"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/linkcache"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/metrics"
 	mountmanager "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/mount-manager"
@@ -56,7 +57,7 @@ var (
 	endpoint             = flag.String("endpoint", "unix:/tmp/csi.sock", "CSI endpoint")
 	runControllerService = flag.Bool("run-controller-service", true, "If set to false then the CSI driver does not activate its controller service (default: true)")
 	runNodeService       = flag.Bool("run-node-service", true, "If set to false then the CSI driver does not activate its node service (default: true)")
-	httpEndpoint         = flag.String("http-endpoint", "", "The TCP network address where the prometheus metrics endpoint will listen (example: `:8080`). The default is empty string, which means metrics endpoint is disabled.")
+	httpEndpoint         = flag.String("http-endpoint", "", "The TCP network address where the prometheus metrics endpoint will listen (example: `127.0.0.1:8080`). The default is empty string, which means metrics endpoint is disabled. The endpoint contains internal system state (go runtime), which can help attackers better understand system internals, so should not be publicly exposed")
 	metricsPath          = flag.String("metrics-path", "/metrics", "The HTTP path where prometheus metrics will be exposed. Default is `/metrics`.")
 	grpcLogCharCap       = flag.Int("grpc-log-char-cap", 10000, "The maximum amount of characters logged for every grpc responses")
 	enableOtelTracing    = flag.Bool("enable-otel-tracing", false, "If set, enable opentelemetry tracing for the driver. The tracing is disabled by default. Configure the exporter endpoint with OTEL_EXPORTER_OTLP_ENDPOINT and other env variables, see https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/#general-sdk-configuration.")
@@ -125,6 +126,10 @@ var (
 	runTaintWebhook    = flag.Bool("run-taint-webhook", false, "Enables the Mutating Admission Webhook (adds startup taints to Nodes to delay workloads until the CSINode resource is created)")
 	webhookPort        = flag.Int("webhook-port", 9443, "The port for the admission webhook to listen on")
 	taintMetricsAddr   = flag.String("taint-metrics-addr", ":8081", "The address the taint controller metrics endpoint binds to.")
+
+	enableNodeReadinessCondition = flag.Bool("enable-node-readiness-condition", false, "If set to true, the node driver sets the --node-readiness-condition-type condition to True on its Node once csi-driver-registrar is healthy.")
+	nodeReadinessConditionType   = flag.String("node-readiness-condition-type", "pd.csi.storage.gke.io/Ready", "The Node condition type set when --enable-node-readiness-condition is true.")
+	registrarHealthzEndpoint     = flag.String("registrar-healthz-endpoint", "127.0.0.1:9931", "The host:port of the csi-driver-registrar healthz endpoint polled by the node readiness reporter.")
 
 	version string
 )
@@ -195,6 +200,7 @@ func handle() {
 	runServiceWithMetrics := *runControllerService || *runNodeService
 	if runServiceWithMetrics && *httpEndpoint != "" {
 		mm := metrics.NewMetricsManager()
+		mm.RegisterRuntimeMetrics()
 		mm.InitializeHttpHandler(*httpEndpoint, *metricsPath)
 
 		switch {
@@ -368,6 +374,18 @@ func handle() {
 				}
 				go driver.StartWatcher(ctx, *nodeName)
 			}
+		}
+
+		if *enableNodeReadinessCondition {
+			kubeClient, err := k8sclient.GetClient()
+			if err != nil {
+				klog.Fatalf("Failed to create k8s client for node readiness reporter: %v", err.Error())
+			}
+			reporter, err := driver.NewNodeReadinessReporter(*nodeName, *nodeReadinessConditionType, *registrarHealthzEndpoint, kubeClient)
+			if err != nil {
+				klog.Fatalf("Failed to create node readiness reporter: %v", err.Error())
+			}
+			go reporter.Run(ctx)
 		}
 
 	}
